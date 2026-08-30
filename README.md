@@ -12,7 +12,7 @@ Stratum-1 NTP server running on ESPHome, good enough for home lab. A u-blox LEA-
 | ![Image01](docs/images/image01.jpg) | ![Image02](docs/images/image02.jpg) |
 |:-----------------------------------:|:-----------------------------------:|
 | ![Image03](docs/images/image03.jpg) | ![Image04](docs/images/image04.jpg) |
-
+Printables on [MakerWorld](https://makerworld.com/de/models/2774039-gps-box-clock-esphome-gps-pps-ntp-server) :)
 
 
 ## Components
