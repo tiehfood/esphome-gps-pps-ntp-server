@@ -20,6 +20,7 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   void set_gps_satellites_sensor(sensor::Sensor *sensor) { this->gps_satellites_sensor_ = sensor; }
   void set_glonass_satellites_sensor(sensor::Sensor *sensor) { this->glonass_satellites_sensor_ = sensor; }
   void set_galileo_satellites_sensor(sensor::Sensor *sensor) { this->galileo_satellites_sensor_ = sensor; }
+  void set_crash_info_sensor(text_sensor::TextSensor *sensor) { this->crash_info_sensor_ = sensor; }
 
   void setup() override;
   void loop() override;
@@ -34,7 +35,7 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
 
  protected:
   void apply_pps_correction_();
-  void set_pps_time_(time_t epoch, int32_t compensation_us = 0);
+  void set_pps_time_(time_t epoch, uint32_t pps_micros, int32_t compensation_us = 0);
 
   InternalGPIOPin *pps_pin_{nullptr};
   sensor::Sensor *satellites_sensor_{nullptr};
@@ -44,6 +45,11 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   sensor::Sensor *gps_satellites_sensor_{nullptr};
   sensor::Sensor *glonass_satellites_sensor_{nullptr};
   sensor::Sensor *galileo_satellites_sensor_{nullptr};
+  text_sensor::TextSensor *crash_info_sensor_{nullptr};
+
+  /// Pre-crash state from RTC NOINIT memory (populated in setup, published in first update)
+  std::string crash_report_;
+  bool crash_report_pending_{false};
 
   /// TinyGPSCustom objects for per-constellation satellite counts (GSV sentences)
   TinyGPSCustom *gp_gsv_sats_{nullptr};
@@ -61,8 +67,10 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   volatile bool gps_time_valid_{false};
   /// Flag set by ISR when PPS pulse detected
   volatile bool pps_flag_{false};
-  /// Microsecond timestamp of last PPS pulse (from micros())
+  /// Microsecond timestamp of last PPS pulse (from micros()) — used for interval/elapsed calc
   volatile uint32_t last_pps_micros_{0};
+  /// ISR guard anchor — re-anchored after hard-sync, separate from interval tracking
+  volatile uint32_t isr_anchor_micros_{0};
   /// Whether PPS-disciplined time has been applied at least once
   bool pps_synced_{false};
   /// Whether coarse GPS time has been set (once)

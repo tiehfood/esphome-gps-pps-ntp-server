@@ -68,6 +68,43 @@ time:
       icon: "mdi:satellite-variant"
       accuracy_decimals: 0
       state_class: measurement
+    crash_info:
+      id: last_crash_info
+      name: "Last Crash Info"
+      icon: "mdi:alert-circle-outline"
+      entity_category: "diagnostic"
+
+debug:
+  update_interval: 60s
+
+sensor:
+  - platform: debug
+    free:
+      name: "Heap Free"
+      icon: "mdi:memory"
+      entity_category: "diagnostic"
+    block:
+      name: "Heap Max Block"
+      icon: "mdi:memory"
+      entity_category: "diagnostic"
+    loop_time:
+      name: "Loop Time"
+      icon: "mdi:timer-outline"
+      entity_category: "diagnostic"
+    psram:
+      name: "PSRAM Free"
+      icon: "mdi:memory"
+      entity_category: "diagnostic"
+
+text_sensor:
+  - platform: debug
+    device:
+      name: "Device Info"
+      entity_category: "diagnostic"
+    reset_reason:
+      name: "Reset Reason"
+      icon: "mdi:restart-alert"
+      entity_category: "diagnostic"
 
 ntp_server:
   time_id: gps_pps
