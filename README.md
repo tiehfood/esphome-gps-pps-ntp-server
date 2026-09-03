@@ -44,8 +44,16 @@ Serves NTPv4 over UDP port 123 using BSD sockets (non-blocking). Reads system ti
 |-------|-------------|----------------|
 | LI (Leap Indicator) | 0 (no warning) | 3 (clock not synchronized) |
 | Stratum | 1 (primary reference) | 16 (unsynchronized) |
+| Version | echoed from request | echoed from request |
 | Reference ID | `GPS` | `GPS` |
-| Precision | 2^-20 (~1 µs) | 2^-20 |
+| Precision | measured at boot (RFC 5905 §11.1) | same |
+| Root delay | 0 (stratum 1 has no upstream) | 0 |
+| Root dispersion | 5 ms + 10 µs per second since last PPS | same |
+| Reference timestamp | last PPS correction | 0 |
+
+Root dispersion is deliberately non-zero. Zero would claim a perfect clock and
+shrink the correctness interval clients build around us (RFC 5905 §11.2.1), so
+honest peers would be rejected in our favour.
 
 The server transitions to unsynchronized when PPS is lost for >10 seconds (GPS unplugged, cable fault, etc.).
 
@@ -175,4 +183,21 @@ The PPS discipline loop automatically tracks temperature-induced drift changes. 
 | Antenna cable delay | ~5 ns/m | Compensated via UBX-CFG-TP5 |
 | GPS PPS accuracy (LEA-M8T) | ~30 ns RMS | Reference accuracy, not compensatable |
 
-**Resulting NTP server accuracy: ~10 µs** (bounded by crystal drift between PPS corrections). Does not accumulate over time.
+**Clock accuracy: ~5 µs**, bounded by crystal drift between PPS corrections and
+measured at ±5 µs over 100 days. Does not accumulate over time.
+
+### What clients actually get
+
+Clock accuracy is not served accuracy. The NTP receive timestamp is currently
+stamped when ESPHome's main loop dispatches the component rather than when the
+packet arrived, and ESPHome's loop sleeps out a 16 ms interval. Both server
+timestamps shift by that queueing delay, so the client's computed offset is wrong
+by the full delay — and the round-trip delay measurement is unchanged, so no
+client can detect or filter it.
+
+| | |
+|---|---|
+| Clock vs GPS | ~5 µs |
+| Added by serving | ~3.3 ms (measured 2026-09-03) |
+
+Work to close that gap is tracked in `docs/superpowers/plans/`.
