@@ -22,6 +22,14 @@ static const uint32_t NTP_UNIX_OFFSET = 2208988800UL;
 /// NTP packet size
 static const int NTP_PACKET_SIZE = 48;
 
+/// Root dispersion budget, seconds. Reflects measured server-added error;
+/// revise down once serving latency is fixed. Floor matches ntpd MINDISTANCE.
+static const float ROOT_DISP_BASE_S = 0.005f;
+/// Dispersion growth per second since last PPS (~10ppm crystal).
+static const float ROOT_DISP_RATE_S_PER_S = 10.0e-6f;
+/// NTP short format is 16.16 fixed point; 1 LSB = 15.259us.
+static const float NTP_SHORT_SCALE = 65536.0f;
+
 // ---- Platform-specific setup / loop ----
 
 #ifdef USE_ESP_IDF
@@ -53,7 +61,26 @@ void NTPServer::setup() {
     return;
   }
 
-  ESP_LOGI(TAG, "NTP server listening on port %u", this->port_);
+  // RFC 5905 11.1: precision is max(resolution, read cost). Smallest non-zero
+  // delta over repeated reads, as chrony does.
+  uint32_t best_us = UINT32_MAX;
+  for (int i = 0; i < 100; i++) {
+    struct timeval a, b;
+    gettimeofday(&a, nullptr);
+    gettimeofday(&b, nullptr);
+    int32_t d = static_cast<int32_t>((b.tv_sec - a.tv_sec) * 1000000 + (b.tv_usec - a.tv_usec));
+    if (d > 0 && static_cast<uint32_t>(d) < best_us)
+      best_us = static_cast<uint32_t>(d);
+  }
+  if (best_us == UINT32_MAX)
+    best_us = 1;
+  int8_t p = -20;
+  while (p < 0 && (1.0f / static_cast<float>(1u << -p)) < (best_us / 1000000.0f))
+    p++;
+  this->precision_ = p;
+
+  ESP_LOGI(TAG, "NTP server listening on port %u (clock read %uus, precision %d)", this->port_,
+           best_us, this->precision_);
 }
 
 void NTPServer::loop() {
@@ -125,22 +152,19 @@ void NTPServer::build_ntp_response_(const uint8_t *request, uint8_t *response) {
 
   memset(response, 0, NTP_PACKET_SIZE);
 
+  // Echo the client's version (RFC 5905 Fig 31: x.version <-- r.version).
+  const uint8_t vn = (request[0] >> 3) & 0x07;
   bool synced = this->is_time_synchronized_();
   if (synced) {
-    // LI=0 (no warning), VN=4, Mode=4 (server)
-    response[0] = 0x24;
-    // Stratum 1 (primary reference)
-    response[1] = 1;
+    response[0] = static_cast<uint8_t>((vn << 3) | 4);  // LI=0, Mode=4
+    response[1] = 1;                                    // stratum 1
   } else {
-    // LI=3 (clock unsynchronized), VN=4, Mode=4 (server)
-    response[0] = 0xE4;
-    // Stratum 16 (unsynchronized)
+    response[0] = static_cast<uint8_t>((3 << 6) | (vn << 3) | 4);  // LI=3, Mode=4
     response[1] = 16;
   }
   // Poll interval (copy from request)
   response[2] = request[2];
-  // Precision: ~1 microsecond = 2^-20 seconds
-  response[3] = static_cast<uint8_t>(-20 & 0xFF);
+  response[3] = static_cast<uint8_t>(this->precision_);
 
   // Reference ID: "GPS\0"
   response[12] = 'G';
@@ -148,15 +172,31 @@ void NTPServer::build_ntp_response_(const uint8_t *request, uint8_t *response) {
   response[14] = 'S';
   response[15] = 0;
 
-  // Reference timestamp (last sync time) = current time
-  response[16] = (receive_ts.seconds >> 24) & 0xFF;
-  response[17] = (receive_ts.seconds >> 16) & 0xFF;
-  response[18] = (receive_ts.seconds >> 8) & 0xFF;
-  response[19] = receive_ts.seconds & 0xFF;
-  response[20] = (receive_ts.fraction >> 24) & 0xFF;
-  response[21] = (receive_ts.fraction >> 16) & 0xFF;
-  response[22] = (receive_ts.fraction >> 8) & 0xFF;
-  response[23] = receive_ts.fraction & 0xFF;
+  // Reference timestamp: when the clock was last corrected (RFC 5905 7.3), not
+  // now. Also keeps reftime <= rec <= xmt, which chrony checks. PPS corrections
+  // land on a second boundary, so fraction stays 0.
+  uint32_t ref_seconds = 0;
+  if (this->time_source_ != nullptr) {
+    time_t last_sync = this->time_source_->get_last_sync_epoch();
+    if (last_sync > 0)
+      ref_seconds = static_cast<uint32_t>(last_sync) + NTP_UNIX_OFFSET;
+  }
+  response[16] = (ref_seconds >> 24) & 0xFF;
+  response[17] = (ref_seconds >> 16) & 0xFF;
+  response[18] = (ref_seconds >> 8) & 0xFF;
+  response[19] = ref_seconds & 0xFF;
+
+  // Root dispersion. Zero would claim a perfect clock, which shrinks the
+  // client's correctness interval (RFC 5905 11.2.1) and gets honest peers
+  // rejected in our favour. Root delay stays 0: stratum 1 has no upstream.
+  float disp_s = ROOT_DISP_BASE_S;
+  if (ref_seconds != 0)
+    disp_s += static_cast<float>(receive_ts.seconds - ref_seconds) * ROOT_DISP_RATE_S_PER_S;
+  uint32_t root_disp = static_cast<uint32_t>(disp_s * NTP_SHORT_SCALE);
+  response[8] = (root_disp >> 24) & 0xFF;
+  response[9] = (root_disp >> 16) & 0xFF;
+  response[10] = (root_disp >> 8) & 0xFF;
+  response[11] = root_disp & 0xFF;
 
   // Origin timestamp (copy client's transmit timestamp)
   memcpy(&response[24], &request[40], 8);

@@ -42,6 +42,9 @@ class NTPServer : public Component {
 
 #ifdef USE_ESP_IDF
   int socket_fd_{-1};
+
+  /// log2(s) of max(clock resolution, clock read cost), measured in setup (RFC 5905 11.1).
+  int8_t precision_{-20};
 #else
   WiFiUDP udp_;
 #endif

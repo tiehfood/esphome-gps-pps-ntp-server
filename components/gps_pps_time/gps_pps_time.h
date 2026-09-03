@@ -31,6 +31,12 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   /// Returns true if PPS-disciplined time is active and recent
   bool is_synchronized() const;
 
+  /// Epoch of the last PPS correction, 0 if never synced.
+  /// NTP reference timestamp (RFC 5905 7.3) — not the current time.
+  time_t get_last_sync_epoch() const {
+    return this->pps_synced_ ? static_cast<time_t>(this->last_gps_epoch_) : 0;
+  }
+
   void on_update(TinyGPSPlus &tiny_gps) override;
 
  protected:
