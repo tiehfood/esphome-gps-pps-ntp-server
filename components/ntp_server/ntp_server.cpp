@@ -292,7 +292,7 @@ NTPTimestamp NTPServer::get_ntp_timestamp_(int32_t offset_us) {
 
 bool NTPServer::is_time_synchronized_() {
   if (this->time_source_ == nullptr)
-    return true;  // No time source configured, assume synchronized
+    return false;  // misconfiguration: refuse to serve rather than serve unverified time
   return this->time_source_->is_synchronized();
 }
 

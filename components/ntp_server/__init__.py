@@ -17,7 +17,7 @@ CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(NTPServer),
         cv.Optional(CONF_PORT, default=123): cv.port,
-        cv.Optional(CONF_TIME_ID): cv.use_id(GPSPPSTime),
+        cv.Required(CONF_TIME_ID): cv.use_id(GPSPPSTime),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
