@@ -1,0 +1,92 @@
+# NTP baseline — BEFORE flashing Phase1+2+step9
+# date: 2026-09-03T23:14:52+02:00
+# client: 192.168.33.235 -> device 192.168.34.131 (ROUTED, different subnet)
+# firmware on device: ISR fix only (compiled Apr 3 2026 lineage, flashed 2026-08-30)
+
+## path characterisation BEFORE
+20 packets transmitted, 20 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 5.046/17.682/83.615/23.661 ms
+
+## samples (offset +/- error, seconds)
+apple +0.008576 +/- 0.013788 time.apple.com 17.253.14.37
+gwein +0.014411 +/- 0.016709 192.168.34.131 192.168.34.131
+apple +0.009308 +/- 0.015593 time.apple.com 17.253.14.37
+gwein +0.014508 +/- 0.018130 192.168.34.131 192.168.34.131
+apple +0.009104 +/- 0.013808 time.apple.com 17.253.14.45
+gwein +0.013091 +/- 0.015745 192.168.34.131 192.168.34.131
+apple +0.008841 +/- 0.013738 time.apple.com 17.253.14.45
+gwein +0.013826 +/- 0.015479 192.168.34.131 192.168.34.131
+apple +0.009207 +/- 0.013256 time.apple.com 17.253.14.37
+gwein +0.013815 +/- 0.016784 192.168.34.131 192.168.34.131
+apple +0.008978 +/- 0.014715 time.apple.com 17.253.14.45
+gwein +0.013693 +/- 0.016341 192.168.34.131 192.168.34.131
+apple +0.008741 +/- 0.014115 time.apple.com 17.253.14.37
+gwein +0.013553 +/- 0.016122 192.168.34.131 192.168.34.131
+apple +0.008719 +/- 0.013785 time.apple.com 17.253.14.37
+gwein +0.013300 +/- 0.015337 192.168.34.131 192.168.34.131
+apple +0.008813 +/- 0.014558 time.apple.com 17.253.14.37
+gwein +0.013233 +/- 0.015623 192.168.34.131 192.168.34.131
+apple +0.008857 +/- 0.014357 time.apple.com 17.253.14.45
+gwein +0.013593 +/- 0.016268 192.168.34.131 192.168.34.131
+apple +0.008767 +/- 0.013492 time.apple.com 17.253.14.45
+gwein +0.009546 +/- 0.007854 192.168.34.131 192.168.34.131
+apple +0.009280 +/- 0.013957 time.apple.com 17.253.14.45
+gwein +0.014720 +/- 0.016768 192.168.34.131 192.168.34.131
+apple +0.008961 +/- 0.013620 time.apple.com 17.253.14.45
+gwein +0.013577 +/- 0.018845 192.168.34.131 192.168.34.131
+apple +0.009139 +/- 0.014503 time.apple.com 17.253.14.45
+gwein +0.014603 +/- 0.016934 192.168.34.131 192.168.34.131
+apple +0.008881 +/- 0.013256 time.apple.com 17.253.14.45
+gwein +0.012914 +/- 0.015517 192.168.34.131 192.168.34.131
+apple +0.008775 +/- 0.013945 time.apple.com 17.253.14.45
+gwein +0.014202 +/- 0.017368 192.168.34.131 192.168.34.131
+apple +0.009159 +/- 0.013733 time.apple.com 17.253.14.45
+gwein +0.013452 +/- 0.016017 192.168.34.131 192.168.34.131
+apple +0.008722 +/- 0.014250 time.apple.com 17.253.14.45
+gwein +0.013037 +/- 0.014845 192.168.34.131 192.168.34.131
+apple +0.008729 +/- 0.014285 time.apple.com 17.253.14.45
+gwein +0.014495 +/- 0.016248 192.168.34.131 192.168.34.131
+apple +0.009425 +/- 0.012781 time.apple.com 17.253.14.45
+gwein +0.013285 +/- 0.015737 192.168.34.131 192.168.34.131
+apple +0.008646 +/- 0.014039 time.apple.com 17.253.14.45
+gwein +0.013313 +/- 0.015767 192.168.34.131 192.168.34.131
+apple +0.008934 +/- 0.013423 time.apple.com 17.253.14.45
+gwein +0.009932 +/- 0.008824 192.168.34.131 192.168.34.131
+apple +0.009057 +/- 0.013045 time.apple.com 17.253.14.45
+gwein +0.014837 +/- 0.017520 192.168.34.131 192.168.34.131
+apple +0.008800 +/- 0.013700 time.apple.com 17.253.14.37
+gwein +0.013644 +/- 0.016237 192.168.34.131 192.168.34.131
+apple +0.008766 +/- 0.014238 time.apple.com 17.253.14.37
+gwein +0.012875 +/- 0.015277 192.168.34.131 192.168.34.131
+apple +0.008918 +/- 0.013502 time.apple.com 17.253.14.45
+gwein +0.013962 +/- 0.016848 192.168.34.131 192.168.34.131
+apple +0.008778 +/- 0.013873 time.apple.com 17.253.14.37
+gwein +0.013667 +/- 0.016456 192.168.34.131 192.168.34.131
+apple +0.008703 +/- 0.013855 time.apple.com 17.253.14.37
+gwein +0.014171 +/- 0.017225 192.168.34.131 192.168.34.131
+apple +0.008914 +/- 0.013903 time.apple.com 17.253.14.37
+gwein +0.014319 +/- 0.017037 192.168.34.131 192.168.34.131
+apple +0.008861 +/- 0.014355 time.apple.com 17.253.14.45
+gwein +0.015469 +/- 0.018549 192.168.34.131 192.168.34.131
+
+## path characterisation AFTER
+20 packets transmitted, 20 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 5.330/17.396/96.676/26.289 ms
+
+## ANALYSIS (pre-flash)
+apple control  n=30  mean  +8.912 ms  sd 0.211
+device         n=30  mean +13.568 ms  sd 1.216
+device relative to apple: +4.656 ms      <-- the meaningful number; Mac clock error cancels
+spread ratio device/control: 5.75x
+
+MODEL CHECK
+  loop period 8.81 ms (63,915,806 loops / 563,300 s, crash context)
+  mean queueing delay q = 8.81/2 = 4.41 ms
+  RFC 5905 s8: both server stamps shift by q  =>  client error = q (NOT q/2)
+  predicted +4.41 ms   observed +4.656 ms   -> within 6%
+  predicted sd from uniform queueing = 8.81/sqrt(12) = 2.54 ms; observed 1.216 (sntp filters)
+
+PREDICTION FOR THE AFTER RUN
+  offset relative to apple: +4.66 ms -> near 0, possibly slightly negative (T3 residual)
+  sd: 1.216 -> toward the control's 0.211
+  path must match: min ~5 ms, avg ~17 ms, else conditions changed and the pair is invalid
