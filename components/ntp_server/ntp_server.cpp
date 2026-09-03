@@ -7,8 +7,9 @@
 #include <cstring>
 
 #ifdef USE_ESP_IDF
-#include <fcntl.h>
 #include <unistd.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #endif
 
 namespace esphome {
@@ -44,9 +45,9 @@ void NTPServer::setup() {
     return;
   }
 
-  // Set non-blocking
-  int flags = fcntl(this->socket_fd_, F_GETFL, 0);
-  fcntl(this->socket_fd_, F_SETFL, flags | O_NONBLOCK);
+  // Blocking socket, on purpose: recv_task_() parks in recvfrom() so T2 is
+  // stamped the instant a packet arrives, not on the next poll of the shared
+  // loop. No fcntl(O_NONBLOCK) here.
 
   struct sockaddr_in server_addr {};
   server_addr.sin_family = AF_INET;
@@ -81,34 +82,56 @@ void NTPServer::setup() {
 
   ESP_LOGI(TAG, "NTP server listening on port %u (clock read %uus, precision %d)", this->port_,
            best_us, this->precision_);
+
+  // Serving moves off the shared loop entirely: Application::loop() sleeps out a
+  // 16ms loop_interval_ between component polls, so stamping T2 there adds a mean
+  // ~4.4ms queueing delay to BOTH T2 and T3. That shifts the client's computed
+  // offset by the full delay (not half -- see the plan's RFC 5905 s8 algebra) and
+  // leaves round-trip delay untouched, so no client can detect or filter it.
+  //
+  // Core 1: ESPHome's main task is pinned to core 0 (CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0),
+  // so this task can never preempt gps_pps_time's apply_pps_correction_() between its
+  // gettimeofday() and micros() reads -- preemption there would inflate
+  // elapsed_since_edge_us and inject a spurious drift measurement, undoing the ISR fix.
+  // Priority 7, below lwIP's task at 18 (CONFIG_LWIP_TCPIP_TASK_PRIO): Espressif's
+  // guidance is that tasks doing socket I/O run below the TCP/IP task.
+  xTaskCreatePinnedToCore(&NTPServer::recv_task_, "ntp_recv", 4096, this, 7, nullptr, 1);
 }
 
 void NTPServer::loop() {
-  if (this->socket_fd_ < 0)
-    return;
+  // Nothing to do: recv_task_() serves every request on its own task, blocked
+  // in recvfrom(). Kept as a no-op because Component::loop() is pure virtual.
+}
 
+void NTPServer::recv_task_(void *param) {
+  auto *self = static_cast<NTPServer *>(param);
   uint8_t buffer[NTP_PACKET_SIZE];
-  struct sockaddr_in client_addr {};
-  socklen_t client_len = sizeof(client_addr);
-
-  int received = recvfrom(this->socket_fd_, buffer, sizeof(buffer), 0,
-                          (struct sockaddr *) &client_addr, &client_len);
-
-  if (received < NTP_PACKET_SIZE)
-    return;
-
-  if (!this->is_time_synchronized_()) {
-    ESP_LOGD(TAG, "NTP request dropped (time not synchronized)");
-    return;
-  }
-
   uint8_t response[NTP_PACKET_SIZE];
-  this->build_ntp_response_(buffer, response);
 
-  sendto(this->socket_fd_, response, NTP_PACKET_SIZE, 0,
-         (struct sockaddr *) &client_addr, client_len);
+  while (true) {
+    struct sockaddr_in client_addr {};
+    socklen_t client_len = sizeof(client_addr);
 
-  ESP_LOGD(TAG, "NTP response sent");
+    int received = recvfrom(self->socket_fd_, buffer, sizeof(buffer), 0,
+                            (struct sockaddr *) &client_addr, &client_len);
+    // T2: stamped the instant recvfrom() returns -- this replaces the shared-loop
+    // poll and is the entire reason this task exists.
+    NTPTimestamp receive_ts = self->get_ntp_timestamp_();
+
+    if (received < 0)
+      continue;  // blocking socket; transient error or spurious wakeup, keep serving
+    if (received < NTP_PACKET_SIZE)
+      continue;  // runt packet -- drop, keep serving
+
+    // No ESP_LOGD/publish_state here: ESPHome's logger and API are not task-safe
+    // from a non-main task. Drop silently rather than working around it.
+    if (!self->is_time_synchronized_())
+      continue;
+
+    self->build_ntp_response_(buffer, response, receive_ts);
+    sendto(self->socket_fd_, response, NTP_PACKET_SIZE, 0,
+           (struct sockaddr *) &client_addr, client_len);
+  }
 }
 
 #else  // Arduino platforms (RP2040, ESP32-Arduino, etc.)
@@ -132,9 +155,10 @@ void NTPServer::loop() {
 
   uint8_t buffer[NTP_PACKET_SIZE];
   this->udp_.read(buffer, NTP_PACKET_SIZE);
+  NTPTimestamp receive_ts = this->get_ntp_timestamp_();
 
   uint8_t response[NTP_PACKET_SIZE];
-  this->build_ntp_response_(buffer, response);
+  this->build_ntp_response_(buffer, response, receive_ts);
 
   this->udp_.beginPacket(this->udp_.remoteIP(), this->udp_.remotePort());
   this->udp_.write(response, NTP_PACKET_SIZE);
@@ -147,9 +171,8 @@ void NTPServer::loop() {
 
 // ---- Shared NTP logic ----
 
-void NTPServer::build_ntp_response_(const uint8_t *request, uint8_t *response) {
-  NTPTimestamp receive_ts = this->get_ntp_timestamp_();
-
+void NTPServer::build_ntp_response_(const uint8_t *request, uint8_t *response,
+                                    const NTPTimestamp &receive_ts) {
   memset(response, 0, NTP_PACKET_SIZE);
 
   // Echo the client's version (RFC 5905 Fig 31: x.version <-- r.version).

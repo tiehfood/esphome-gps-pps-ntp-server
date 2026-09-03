@@ -77,8 +77,12 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   volatile uint32_t last_pps_micros_{0};
   /// ISR guard anchor — re-anchored after hard-sync, separate from interval tracking
   volatile uint32_t isr_anchor_micros_{0};
-  /// Whether PPS-disciplined time has been applied at least once
-  bool pps_synced_{false};
+  /// Whether PPS-disciplined time has been applied at least once.
+  /// volatile: read cross-thread by NTPServer::recv_task_() via is_synchronized()
+  /// and get_last_sync_epoch() (single bool/word, atomic on Xtensa -- benign
+  /// without volatile, but this documents the cross-thread read and stops the
+  /// compiler from ever caching it across the loop() write path).
+  volatile bool pps_synced_{false};
   /// Whether coarse GPS time has been set (once)
   bool has_gps_time_{false};
   /// PPS pulse counter for throttling settimeofday calls
@@ -95,8 +99,9 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   uint32_t prev_pps_micros_{0};
   /// Running mean of drift in fixed-point x256 for display centering (ESP-IDF)
   int64_t drift_mean_x256_{0};
-  /// Millis timestamp of last processed PPS (for timeout detection)
-  uint32_t last_pps_millis_{0};
+  /// Millis timestamp of last processed PPS (for timeout detection).
+  /// volatile: read cross-thread by NTPServer::recv_task_() via is_synchronized().
+  volatile uint32_t last_pps_millis_{0};
   /// PPS timeout threshold in milliseconds
   static const uint32_t PPS_TIMEOUT_MS = 10000;
 
