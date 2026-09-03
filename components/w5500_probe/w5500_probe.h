@@ -1,0 +1,87 @@
+#pragma once
+
+// RESEARCH SPIKE (throwaway) -- NOT production code.
+//
+// Answers: with socket 0 in MACRAW mode (esp_eth's W5500 driver, presented to lwIP as
+// the netif) and socket 1 opened separately in UDP mode on port 123, does an incoming
+// NTP packet land in socket 1, socket 0's MACRAW buffer, or both? See
+// docs/superpowers/plans/2026-09-03-ntp-serving-latency.md for the question this feeds,
+// and .claude/tracker.md for the register-level facts this was built against.
+//
+// Everything here is triggered by a button/service, never at boot, so a plain reboot
+// always yields a clean, working ethernet device -- see the `recover()` action for the
+// non-reboot path back.
+
+#include "esphome/core/component.h"
+#include "esphome/components/button/button.h"
+#include "esphome/components/sensor/sensor.h"
+#include "esphome/components/text_sensor/text_sensor.h"
+#include "esphome/components/ethernet/ethernet_component.h"
+
+#ifdef USE_ESP32
+
+#include <driver/spi_master.h>
+
+namespace esphome {
+namespace w5500_probe {
+
+class W5500Probe : public Component {
+ public:
+  void set_ethernet(ethernet::EthernetComponent *ethernet) { this->ethernet_ = ethernet; }
+  void set_probe_button(button::Button *b) { this->probe_button_ = b; }
+  void set_recover_button(button::Button *b) { this->recover_button_ = b; }
+  void set_rx_bytes_sensor(sensor::Sensor *s) { this->rx_bytes_sensor_ = s; }
+  void set_socket_status_sensor(text_sensor::TextSensor *s) { this->socket_status_sensor_ = s; }
+
+  void setup() override;
+  void loop() override;
+  void dump_config() override;
+  // Must run after ethernet's own setup() (setup_priority::WIFI) -- we add a second SPI
+  // device to a bus that only exists once ethernet has called spi_bus_initialize().
+  float get_setup_priority() const override { return setup_priority::AFTER_CONNECTION; }
+
+  /// Button-triggered: stop -> rewrite buffer split -> start -> open socket 1 UDP:123.
+  void run_probe_sequence();
+  /// Button-triggered: undo run_probe_sequence() without a power cycle.
+  void recover();
+
+ protected:
+  // W5500 SPI framing (datasheet s4): 3-byte header (16-bit address, then a control
+  // byte encoding block-select + R/W + operation mode), followed by data bytes.
+  // Operation mode is always "variable length" (OM=00) here: the frame just ends when
+  // CS goes high, so one transaction can carry however many data bytes we pass in.
+  void spi_write_reg_(uint8_t block, uint16_t addr, uint8_t value);
+  void spi_write_reg16_(uint8_t block, uint16_t addr, uint16_t value);
+  uint8_t spi_read_reg_(uint8_t block, uint16_t addr);
+  // Sn_RX_RSR can tick over between the two bytes of a naive 16-bit read (W5500
+  // datasheet errata) -- retry until two consecutive reads agree.
+  uint16_t spi_read_reg16_stable_(uint8_t block, uint16_t addr);
+
+  void poll_socket1_();
+  void publish_status_(const char *status);
+
+  ethernet::EthernetComponent *ethernet_{nullptr};
+  spi_device_handle_t spi_dev_{nullptr};
+  button::Button *probe_button_{nullptr};
+  button::Button *recover_button_{nullptr};
+  sensor::Sensor *rx_bytes_sensor_{nullptr};
+  text_sensor::TextSensor *socket_status_sensor_{nullptr};
+
+  bool probing_active_{false};
+  uint32_t last_poll_ms_{0};
+};
+
+class ProbeButton : public button::Button, public Parented<W5500Probe> {
+ protected:
+  void press_action() override { this->parent_->run_probe_sequence(); }
+};
+
+class RecoverButton : public button::Button, public Parented<W5500Probe> {
+ protected:
+  void press_action() override { this->parent_->recover(); }
+};
+
+}  // namespace w5500_probe
+}  // namespace esphome
+
+#endif  // USE_ESP32

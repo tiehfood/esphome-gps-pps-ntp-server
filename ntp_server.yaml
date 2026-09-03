@@ -6,6 +6,28 @@ external_components:
       type: local
       path: components
 
+# RESEARCH SPIKE (throwaway) -- see components/w5500_probe/w5500_probe.h and
+# docs/superpowers/plans/2026-09-03-ntp-serving-latency.md. Overrides the built-in
+# `ethernet` component (same name, shadowed via external_components) purely to expose
+# an id and a couple of getters that w5500_probe needs; behaviour is unchanged.
+ethernet:
+  id: eth_component
+
+w5500_probe:
+  ethernet_id: eth_component
+  probe_button:
+    name: "W5500 Probe: Run Sequence"
+    entity_category: "diagnostic"
+  recover_button:
+    name: "W5500 Probe: Recover"
+    entity_category: "diagnostic"
+  rx_bytes:
+    name: "W5500 Probe: Socket 1 RX Bytes"
+    entity_category: "diagnostic"
+  socket_status:
+    name: "W5500 Probe: Socket 1 Status"
+    entity_category: "diagnostic"
+
 uart:
   id: gps_uart
   rx_pin: GPIO43
