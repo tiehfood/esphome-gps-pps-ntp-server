@@ -118,8 +118,12 @@ void NTPServer::recv_task_(void *param) {
     // poll and is the entire reason this task exists.
     NTPTimestamp receive_ts = self->get_ntp_timestamp_();
 
-    if (received < 0)
-      continue;  // blocking socket; transient error or spurious wakeup, keep serving
+    if (received < 0) {
+      // Back off. If the socket goes permanently bad (EBADF) an unguarded
+      // continue would spin this task forever and peg core 1.
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
     if (received < NTP_PACKET_SIZE)
       continue;  // runt packet -- drop, keep serving
 
