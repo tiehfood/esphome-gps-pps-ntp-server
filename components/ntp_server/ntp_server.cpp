@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <esp_timer.h>
 #endif
 
 namespace esphome {
@@ -30,6 +31,11 @@ static const float ROOT_DISP_BASE_S = 0.005f;
 static const float ROOT_DISP_RATE_S_PER_S = 10.0e-6f;
 /// NTP short format is 16.16 fixed point; 1 LSB = 15.259us.
 static const float NTP_SHORT_SCALE = 65536.0f;
+
+/// Bounds for learning the send-duration EWMA. Below the floor the packet was
+/// queued (ARP miss), above the ceiling something stalled; neither is typical.
+static const int32_t SEND_US_MIN = 50;
+static const int32_t SEND_US_MAX = 5000;
 
 // ---- Platform-specific setup / loop ----
 
@@ -133,8 +139,17 @@ void NTPServer::recv_task_(void *param) {
       continue;
 
     self->build_ntp_response_(buffer, response, receive_ts);
+
+    int64_t t0 = esp_timer_get_time();
     sendto(self->socket_fd_, response, NTP_PACKET_SIZE, 0,
            (struct sockaddr *) &client_addr, client_len);
+    int32_t dur = static_cast<int32_t>(esp_timer_get_time() - t0);
+
+    // Only learn from sends that actually reached the wire. On an ARP miss lwIP
+    // queues the packet and returns immediately, which would drag the estimate
+    // down even though that packet departs late.
+    if (dur > SEND_US_MIN && dur < SEND_US_MAX)
+      self->send_us_ += (dur - self->send_us_) / 8;
   }
 }
 
@@ -238,8 +253,9 @@ void NTPServer::build_ntp_response_(const uint8_t *request, uint8_t *response,
   response[38] = (receive_ts.fraction >> 8) & 0xFF;
   response[39] = receive_ts.fraction & 0xFF;
 
-  // Transmit timestamp
-  NTPTimestamp transmit_ts = this->get_ntp_timestamp_();
+  // Transmit timestamp, advanced by the measured send duration so it names the
+  // instant the packet actually leaves rather than when we built the response.
+  NTPTimestamp transmit_ts = this->get_ntp_timestamp_(this->send_us_);
   response[40] = (transmit_ts.seconds >> 24) & 0xFF;
   response[41] = (transmit_ts.seconds >> 16) & 0xFF;
   response[42] = (transmit_ts.seconds >> 8) & 0xFF;
@@ -250,9 +266,22 @@ void NTPServer::build_ntp_response_(const uint8_t *request, uint8_t *response,
   response[47] = transmit_ts.fraction & 0xFF;
 }
 
-NTPTimestamp NTPServer::get_ntp_timestamp_() {
+NTPTimestamp NTPServer::get_ntp_timestamp_(int32_t offset_us) {
   struct timeval tv;
   gettimeofday(&tv, nullptr);
+
+  time_t sec = tv.tv_sec;
+  int64_t usec = static_cast<int64_t>(tv.tv_usec) + offset_us;
+  while (usec >= 1000000) {
+    usec -= 1000000;
+    sec++;
+  }
+  while (usec < 0) {
+    usec += 1000000;
+    sec--;
+  }
+  tv.tv_sec = sec;
+  tv.tv_usec = static_cast<suseconds_t>(usec);
 
   NTPTimestamp ts;
   ts.seconds = static_cast<uint32_t>(tv.tv_sec) + NTP_UNIX_OFFSET;

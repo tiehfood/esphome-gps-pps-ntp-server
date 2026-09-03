@@ -37,7 +37,7 @@ class NTPServer : public Component {
   // not taken internally -- on the ESP-IDF path that call site is recv_task_(), and
   // T2 must reflect arrival, not whatever this function does first.
   void build_ntp_response_(const uint8_t *request, uint8_t *response, const NTPTimestamp &receive_ts);
-  NTPTimestamp get_ntp_timestamp_();
+  NTPTimestamp get_ntp_timestamp_(int32_t offset_us = 0);
   bool is_time_synchronized_();
 
   uint16_t port_{123};
@@ -48,6 +48,11 @@ class NTPServer : public Component {
 
   /// log2(s) of max(clock resolution, clock read cost), measured in setup (RFC 5905 11.1).
   int8_t precision_{-20};
+
+  /// EWMA of sendto() duration, us. LWIP_TCPIP_CORE_LOCKING + the W5500's
+  /// spi_device_polling_transmit mean sendto() runs the SPI write inline, so the
+  /// packet leaves this long after T3 is stamped. Added to T3 to compensate.
+  int32_t send_us_{0};
 
   /// Dedicated FreeRTOS task blocked in recvfrom() -- stamps T2 on return instead of
   /// whenever ESPHome's shared loop next polls us. Runs for the component's lifetime;
