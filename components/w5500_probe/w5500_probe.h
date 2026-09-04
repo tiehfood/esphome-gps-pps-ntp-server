@@ -75,6 +75,11 @@ class W5500Probe : public Component {
 
   bool probing_active_{false};
   uint32_t last_poll_ms_{0};
+  /// Dead-man timer. If opening socket 1 diverts UDP/123 away from MACRAW, lwIP stops
+  /// seeing NTP -- and possibly the API with it, leaving no way to press Recover. The
+  /// probe therefore closes socket 1 by itself after this long, no matter what.
+  uint32_t probe_started_ms_{0};
+  static const uint32_t PROBE_AUTO_RECOVER_MS = 60000;
 };
 
 class ProbeButton : public button::Button, public Parented<W5500Probe> {

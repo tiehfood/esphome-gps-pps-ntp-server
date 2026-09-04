@@ -79,6 +79,14 @@ void W5500Probe::loop() {
   if (!this->probing_active_)
     return;
   uint32_t now = millis();
+
+  // Dead-man timer first, before anything that could fail.
+  if (now - this->probe_started_ms_ > PROBE_AUTO_RECOVER_MS) {
+    ESP_LOGW(TAG, "probe window elapsed (%us) -- auto-recovering", PROBE_AUTO_RECOVER_MS / 1000);
+    this->recover();
+    return;
+  }
+
   if (now - this->last_poll_ms_ < 1000)
     return;
   this->last_poll_ms_ = now;
@@ -191,6 +199,7 @@ void W5500Probe::run_probe_sequence() {
 
   this->probing_active_ = true;
   this->last_poll_ms_ = 0;
+  this->probe_started_ms_ = millis();
   ESP_LOGI(TAG, "socket 1 open, UDP:123, SIMR=0x03 -- watch the rx_bytes / socket_status "
                 "entities now; send NTP requests to this device");
   this->publish_status_("open, watching");
