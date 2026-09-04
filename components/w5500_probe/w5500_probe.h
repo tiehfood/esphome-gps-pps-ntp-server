@@ -8,6 +8,12 @@
 // docs/superpowers/plans/2026-09-03-ntp-serving-latency.md for the question this feeds,
 // and .claude/tracker.md for the register-level facts this was built against.
 //
+// Register access goes through the ethernet driver's OWN spi_device_handle_t, shared
+// via ethernet::w5500_shared_spi() (components/ethernet/), never a second
+// spi_bus_add_device() -- an earlier revision of this file did that with the driver's
+// own spics_io_num, which re-routes the CS pad and took the device off the network
+// (cost one USB recovery). There must be exactly one SPI device for the W5500.
+//
 // Everything here is triggered by a button/service, never at boot, so a plain reboot
 // always yields a clean, working ethernet device -- see the `recover()` action for the
 // non-reboot path back.
@@ -19,8 +25,6 @@
 #include "esphome/components/ethernet/ethernet_component.h"
 
 #ifdef USE_ESP32
-
-#include <driver/spi_master.h>
 
 namespace esphome {
 namespace w5500_probe {
@@ -36,8 +40,9 @@ class W5500Probe : public Component {
   void setup() override;
   void loop() override;
   void dump_config() override;
-  // Must run after ethernet's own setup() (setup_priority::WIFI) -- we add a second SPI
-  // device to a bus that only exists once ethernet has called spi_bus_initialize().
+  // No SPI bus/device work happens in setup() anymore (the shared handle is the
+  // ethernet driver's own), but keep this after connection so dump_config()/logs are
+  // meaningful only once ethernet is actually up.
   float get_setup_priority() const override { return setup_priority::AFTER_CONNECTION; }
 
   /// Button-triggered: stop -> rewrite buffer split -> start -> open socket 1 UDP:123.
@@ -46,10 +51,12 @@ class W5500Probe : public Component {
   void recover();
 
  protected:
-  // W5500 SPI framing (datasheet s4): 3-byte header (16-bit address, then a control
-  // byte encoding block-select + R/W + operation mode), followed by data bytes.
-  // Operation mode is always "variable length" (OM=00) here: the frame just ends when
-  // CS goes high, so one transaction can carry however many data bytes we pass in.
+  // W5500 SPI framing (datasheet s4): 16-bit address phase + 8-bit control phase
+  // (block-select + R/W + operation mode), followed by data bytes. Sent through the
+  // ethernet driver's shared spi_device_handle_t, which is already configured with
+  // command_bits=16 / address_bits=8 for exactly this framing (see
+  // components/ethernet/ethernet_component.cpp). Operation mode is always "variable
+  // length" (OM=00): the frame just ends when CS goes high.
   void spi_write_reg_(uint8_t block, uint16_t addr, uint8_t value);
   void spi_write_reg16_(uint8_t block, uint16_t addr, uint16_t value);
   uint8_t spi_read_reg_(uint8_t block, uint16_t addr);
@@ -61,7 +68,6 @@ class W5500Probe : public Component {
   void publish_status_(const char *status);
 
   ethernet::EthernetComponent *ethernet_{nullptr};
-  spi_device_handle_t spi_dev_{nullptr};
   button::Button *probe_button_{nullptr};
   button::Button *recover_button_{nullptr};
   sensor::Sensor *rx_bytes_sensor_{nullptr};

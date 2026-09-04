@@ -3,10 +3,18 @@
 // Local copy of ESPHome 2025.12.7's built-in `ethernet` component, overriding it via
 // external_components (same component name shadows the core one). Pinned so the
 // w5500_probe research spike (components/w5500_probe/) can reach the driver's
-// esp_eth_handle_t and the SPI bus/CS it was configured with. The only changes vs.
-// upstream: a public get_eth_handle() getter and, under USE_ETHERNET_SPI, getters for
-// the SPI host/CS pin/clock speed used to build the driver's device. Do not add
-// anything else here — keep diffs against upstream reviewable.
+// esp_eth_handle_t, and so it can perform its own register-level SPI access through
+// the SAME spi_device_handle_t the driver uses (see w5500_shared_spi() below) rather
+// than creating a second device. The only changes vs. upstream: a public
+// get_eth_handle() getter and, under USE_ETHERNET_SPI + CONFIG_ETH_SPI_ETHERNET_W5500,
+// a custom_spi_driver hook (in ethernet_component.cpp) that stashes the resulting SPI
+// handle + mutex for w5500_shared_spi() to return. Do not add anything else here —
+// keep diffs against upstream reviewable.
+//
+// IMPORTANT: there must be exactly one spi_device_handle_t for the W5500 in the whole
+// tree. A second spi_bus_add_device() call with the driver's own spics_io_num
+// re-routes the CS pad to a different hardware CS signal and takes the W5500 off the
+// network (cost one USB recovery during development — see w5500_probe.cpp).
 
 #include "esphome/core/component.h"
 #include "esphome/core/defines.h"
@@ -22,6 +30,10 @@
 #include "esp_idf_version.h"
 #ifdef USE_ETHERNET_SPI
 #include <driver/spi_master.h>
+#if CONFIG_ETH_SPI_ETHERNET_W5500
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#endif
 #endif
 
 namespace esphome {
@@ -117,13 +129,6 @@ class EthernetComponent : public Component {
   /// Null until setup() runs. Callers MUST check for null and skip installing their hook
   /// rather than ever calling esp_netif_receive(nullptr, ...).
   esp_netif_t *get_eth_netif() const { return this->eth_netif_; }
-#ifdef USE_ETHERNET_SPI
-  /// RESEARCH SPIKE hook: SPI host/CS/clock the driver's own device was created with,
-  /// so the probe can open a second spi_device_handle_t on the same bus and CS.
-  spi_host_device_t get_spi_host() const { return this->spi_host_; }
-  uint8_t get_spi_cs_pin() const { return this->cs_pin_; }
-  int get_spi_clock_speed() const { return this->clock_speed_; }
-#endif
 
  protected:
   static void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
@@ -152,9 +157,10 @@ class EthernetComponent : public Component {
   int reset_pin_{-1};
   int phy_addr_spi_{-1};
   int clock_speed_;
-  // RESEARCH SPIKE: which SPI host setup() picked (SPI2_HOST on S3, SPI3_HOST
-  // elsewhere) — upstream keeps this as a local in setup(), we store it so
-  // w5500_probe can put a second device on the same bus.
+  // Which SPI host setup() picked (SPI2_HOST on S3, SPI3_HOST elsewhere) — upstream
+  // keeps this as a local in setup(); kept as a member only because it's convenient,
+  // not exposed outside this file (see w5500_shared_spi() for how the probe reaches
+  // the driver's SPI device instead).
   spi_host_device_t spi_host_{SPI2_HOST};
 #ifdef USE_ETHERNET_SPI_POLLING_SUPPORT
   uint32_t polling_interval_{0};
@@ -198,6 +204,20 @@ class EthernetComponent : public Component {
   // ONLY set from Python-generated code with string literals - never dynamic strings.
   const char *use_address_{""};
 };
+
+#if defined(USE_ETHERNET_SPI) && CONFIG_ETH_SPI_ETHERNET_W5500
+/// The W5500 driver's own SPI device handle + its access mutex, populated by the
+/// custom_spi_driver hook in ethernet_component.cpp's setup(). This is how other
+/// components (w5500_probe) perform register-level access on the SAME spi_device_handle_t
+/// the driver uses, instead of calling spi_bus_add_device() a second time — see the
+/// warning at the top of this file for why that is unsafe.
+/// Both fields are null until EthernetComponent::setup() has run.
+struct W5500SharedSpi {
+  spi_device_handle_t hdl{nullptr};
+  SemaphoreHandle_t lock{nullptr};
+};
+W5500SharedSpi w5500_shared_spi();
+#endif
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 extern EthernetComponent *global_eth_component;

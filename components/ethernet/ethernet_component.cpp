@@ -1,5 +1,7 @@
 // Local copy of ESPHome 2025.12.7's built-in `ethernet` component — see
-// ethernet_component.h for why. Only change here: store the SPI host setup() picks.
+// ethernet_component.h for why. Changes vs. upstream: store the SPI host setup()
+// picks, and (W5500 only) install a custom_spi_driver hook so w5500_probe can share
+// the driver's own spi_device_handle_t instead of creating a second one.
 #include "ethernet_component.h"
 #include "esphome/core/application.h"
 #include "esphome/core/log.h"
@@ -60,6 +62,123 @@ void EthernetComponent::log_error_and_mark_failed_(esp_err_t err, const char *me
     return ret; \
   }
 
+#if defined(USE_ETHERNET_SPI) && CONFIG_ETH_SPI_ETHERNET_W5500
+namespace {
+
+// Faithful copy of ESP-IDF's default W5500 custom-SPI-driver-shaped implementation
+// (esp_eth/src/spi/w5500/esp_eth_mac_w5500.c: w5500_spi_init/deinit/read/write, IDF
+// 5.5.1), wired in via eth_w5500_config_t::custom_spi_driver instead of left NULL (which
+// would make esp_eth_mac_new_w5500() create its own, unreachable, spi_device_handle_t).
+// The only behavioural addition: init() also stashes the resulting handle + mutex in
+// the file-static globals below, which w5500_shared_spi() returns. There must be
+// exactly one spi_device_handle_t for the W5500 in the whole tree — see
+// ethernet_component.h for why.
+struct EthSpiInfo {
+  spi_device_handle_t hdl{nullptr};
+  SemaphoreHandle_t lock{nullptr};
+};
+
+constexpr uint32_t W5500_SPI_LOCK_TIMEOUT_MS = 50;
+
+// NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
+spi_device_handle_t g_w5500_spi_hdl = nullptr;
+SemaphoreHandle_t g_w5500_spi_lock = nullptr;
+// NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
+
+void *w5500_shared_spi_init(const void *spi_config) {
+  const auto *w5500_config = static_cast<const eth_w5500_config_t *>(spi_config);
+  auto *spi = new EthSpiInfo();
+
+  spi_device_interface_config_t devcfg = *w5500_config->spi_devcfg;
+  if (w5500_config->spi_devcfg->command_bits == 0 && w5500_config->spi_devcfg->address_bits == 0) {
+    devcfg.command_bits = 16;  // W5500 SPI frame: address phase
+    devcfg.address_bits = 8;   // W5500 SPI frame: control phase
+  } else if (w5500_config->spi_devcfg->command_bits != 16 || w5500_config->spi_devcfg->address_bits != 8) {
+    ESP_LOGE(TAG, "incorrect SPI frame format (command_bits/address_bits) for W5500");
+    delete spi;
+    return nullptr;
+  }
+
+  if (spi_bus_add_device(w5500_config->spi_host_id, &devcfg, &spi->hdl) != ESP_OK) {
+    ESP_LOGE(TAG, "adding W5500 device to SPI host failed");
+    delete spi;
+    return nullptr;
+  }
+  spi->lock = xSemaphoreCreateMutex();
+  if (spi->lock == nullptr) {
+    spi_bus_remove_device(spi->hdl);
+    delete spi;
+    return nullptr;
+  }
+
+  g_w5500_spi_hdl = spi->hdl;
+  g_w5500_spi_lock = spi->lock;
+  return spi;
+}
+
+esp_err_t w5500_shared_spi_deinit(void *spi_ctx) {
+  auto *spi = static_cast<EthSpiInfo *>(spi_ctx);
+  spi_bus_remove_device(spi->hdl);
+  vSemaphoreDelete(spi->lock);
+  g_w5500_spi_hdl = nullptr;
+  g_w5500_spi_lock = nullptr;
+  delete spi;
+  return ESP_OK;
+}
+
+esp_err_t w5500_shared_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, const void *value, uint32_t len) {
+  auto *spi = static_cast<EthSpiInfo *>(spi_ctx);
+  spi_transaction_t trans = {};
+  trans.cmd = static_cast<uint16_t>(cmd);
+  trans.addr = addr;
+  trans.length = 8 * len;
+  trans.tx_buffer = value;
+
+  esp_err_t ret = ESP_OK;
+  if (xSemaphoreTake(spi->lock, pdMS_TO_TICKS(W5500_SPI_LOCK_TIMEOUT_MS)) == pdTRUE) {
+    if (spi_device_polling_transmit(spi->hdl, &trans) != ESP_OK) {
+      ESP_LOGE(TAG, "W5500 SPI write failed");
+      ret = ESP_FAIL;
+    }
+    xSemaphoreGive(spi->lock);
+  } else {
+    ret = ESP_ERR_TIMEOUT;
+  }
+  return ret;
+}
+
+esp_err_t w5500_shared_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void *value, uint32_t len) {
+  auto *spi = static_cast<EthSpiInfo *>(spi_ctx);
+  spi_transaction_t trans = {};
+  // Direct reads for len<=4 to avoid a 4-byte-boundary write overwriting a small
+  // register read (same rationale as upstream w5500_spi_read()).
+  trans.flags = len <= 4 ? SPI_TRANS_USE_RXDATA : 0;
+  trans.cmd = static_cast<uint16_t>(cmd);
+  trans.addr = addr;
+  trans.length = 8 * len;
+  trans.rx_buffer = value;
+
+  esp_err_t ret = ESP_OK;
+  if (xSemaphoreTake(spi->lock, pdMS_TO_TICKS(W5500_SPI_LOCK_TIMEOUT_MS)) == pdTRUE) {
+    if (spi_device_polling_transmit(spi->hdl, &trans) != ESP_OK) {
+      ESP_LOGE(TAG, "W5500 SPI read failed");
+      ret = ESP_FAIL;
+    }
+    xSemaphoreGive(spi->lock);
+  } else {
+    ret = ESP_ERR_TIMEOUT;
+  }
+  if ((trans.flags & SPI_TRANS_USE_RXDATA) && len <= 4) {
+    memcpy(value, trans.rx_data, len);
+  }
+  return ret;
+}
+
+}  // namespace
+
+W5500SharedSpi w5500_shared_spi() { return {g_w5500_spi_hdl, g_w5500_spi_lock}; }
+#endif  // USE_ETHERNET_SPI && CONFIG_ETH_SPI_ETHERNET_W5500
+
 EthernetComponent::EthernetComponent() { global_eth_component = this; }
 
 void EthernetComponent::setup() {
@@ -95,7 +214,7 @@ void EthernetComponent::setup() {
 #else
   auto host = SPI3_HOST;
 #endif
-  this->spi_host_ = host;  // RESEARCH SPIKE: exposed via get_spi_host() for w5500_probe
+  this->spi_host_ = host;
 
   err = spi_bus_initialize(host, &buscfg, SPI_DMA_CH_AUTO);
   ESPHL_ERROR_CHECK(err, "SPI bus initialize error");
@@ -133,6 +252,13 @@ void EthernetComponent::setup() {
 
 #if CONFIG_ETH_SPI_ETHERNET_W5500
   eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(host, &devcfg);
+  // Share the resulting spi_device_handle_t with w5500_shared_spi() instead of letting
+  // the driver create one we can't reach — see ethernet_component.h.
+  w5500_config.custom_spi_driver.config = &w5500_config;
+  w5500_config.custom_spi_driver.init = w5500_shared_spi_init;
+  w5500_config.custom_spi_driver.deinit = w5500_shared_spi_deinit;
+  w5500_config.custom_spi_driver.read = w5500_shared_spi_read;
+  w5500_config.custom_spi_driver.write = w5500_shared_spi_write;
 #endif
 #if CONFIG_ETH_SPI_ETHERNET_DM9051
   eth_dm9051_config_t dm9051_config = ETH_DM9051_DEFAULT_CONFIG(host, &devcfg);

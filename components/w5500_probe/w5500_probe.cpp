@@ -6,11 +6,41 @@
 
 #include "esp_eth.h"
 #include "esp_err.h"
+#include <driver/spi_master.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 namespace esphome {
 namespace w5500_probe {
 
 static const char *const TAG = "w5500_probe";
+
+namespace {
+// Runs one transaction on the ethernet driver's shared spi_device_handle_t, holding
+// its shared mutex for the duration -- the same lock the driver's own custom_spi_driver
+// read()/write() hold (components/ethernet/ethernet_component.cpp). This is the only
+// place in this file allowed to call spi_device_polling_transmit(); every register
+// access goes through here.
+bool w5500_shared_transact(spi_transaction_t *t) {
+  ethernet::W5500SharedSpi shared = ethernet::w5500_shared_spi();
+  if (shared.hdl == nullptr || shared.lock == nullptr) {
+    ESP_LOGE(TAG, "shared W5500 SPI handle not available -- ethernet not set up yet?");
+    return false;
+  }
+  bool ok = true;
+  if (xSemaphoreTake(shared.lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (spi_device_polling_transmit(shared.hdl, t) != ESP_OK) {
+      ESP_LOGE(TAG, "SPI transmit failed");
+      ok = false;
+    }
+    xSemaphoreGive(shared.lock);
+  } else {
+    ESP_LOGE(TAG, "failed to acquire shared W5500 SPI lock");
+    ok = false;
+  }
+  return ok;
+}
+}  // namespace
 
 // Block select bits (BSB), W5500 datasheet s4.1 "Address Phase". Common register
 // block is BSB=0; socket n's own register block is (n*4)+1 -- TX/RX buffer blocks
@@ -38,27 +68,9 @@ void W5500Probe::setup() {
     this->mark_failed();
     return;
   }
-
-  spi_device_interface_config_t devcfg = {};
-  devcfg.command_bits = 0;
-  devcfg.address_bits = 0;
-  devcfg.dummy_bits = 0;
-  devcfg.mode = 0;
-  devcfg.clock_speed_hz = this->ethernet_->get_spi_clock_speed();
-  devcfg.spics_io_num = this->ethernet_->get_spi_cs_pin();
-  devcfg.queue_size = 1;  // we only ever use spi_device_polling_transmit, one at a time
-
-  // Second device handle on the ethernet driver's own bus + CS. ESP-IDF's SPI master
-  // serializes access across device handles sharing a bus, so this is safe as long as
-  // we stick to spi_device_polling_transmit() (blocking, bus-locking) rather than the
-  // queued/async API.
-  esp_err_t err = spi_bus_add_device(this->ethernet_->get_spi_host(), &devcfg, &this->spi_dev_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "spi_bus_add_device failed: %s", esp_err_to_name(err));
-    this->mark_failed();
-    return;
-  }
-
+  // No SPI device is created here -- register access happens through the ethernet
+  // driver's own shared spi_device_handle_t (ethernet::w5500_shared_spi()), which only
+  // exists once EthernetComponent::setup() has run.
   ESP_LOGI(TAG, "w5500_probe ready -- RESEARCH SPIKE, trigger via button, nothing runs at boot");
 }
 
@@ -78,35 +90,41 @@ void W5500Probe::dump_config() {
   ESP_LOGCONFIG(TAG, "  Nothing runs automatically at boot; trigger via the probe button");
 }
 
+// cmd = the 16-bit register address (ESP-IDF's naming is inverted relative to the
+// W5500 datasheet -- see esp_eth_mac_w5500.c), addr = the 8-bit control byte. This
+// matches devcfg.command_bits=16 / address_bits=8, which the shared handle was created
+// with (components/ethernet/ethernet_component.cpp).
 void W5500Probe::spi_write_reg_(uint8_t block, uint16_t addr, uint8_t value) {
   uint8_t ctrl = static_cast<uint8_t>((block << 3) | 0x04);  // OM=00 variable length, RWB=1 write
-  uint8_t tx[4] = {static_cast<uint8_t>(addr >> 8), static_cast<uint8_t>(addr & 0xFF), ctrl, value};
   spi_transaction_t t = {};
-  t.length = sizeof(tx) * 8;
-  t.tx_buffer = tx;
-  spi_device_polling_transmit(this->spi_dev_, &t);
+  t.cmd = addr;
+  t.addr = ctrl;
+  t.length = 8;
+  t.tx_buffer = &value;
+  w5500_shared_transact(&t);
 }
 
 void W5500Probe::spi_write_reg16_(uint8_t block, uint16_t addr, uint16_t value) {
   uint8_t ctrl = static_cast<uint8_t>((block << 3) | 0x04);  // OM=00 variable length, RWB=1 write
-  uint8_t tx[5] = {static_cast<uint8_t>(addr >> 8), static_cast<uint8_t>(addr & 0xFF), ctrl,
-                    static_cast<uint8_t>(value >> 8), static_cast<uint8_t>(value & 0xFF)};
+  uint8_t tx[2] = {static_cast<uint8_t>(value >> 8), static_cast<uint8_t>(value & 0xFF)};
   spi_transaction_t t = {};
+  t.cmd = addr;
+  t.addr = ctrl;
   t.length = sizeof(tx) * 8;
   t.tx_buffer = tx;
-  spi_device_polling_transmit(this->spi_dev_, &t);
+  w5500_shared_transact(&t);
 }
 
 uint8_t W5500Probe::spi_read_reg_(uint8_t block, uint16_t addr) {
   uint8_t ctrl = static_cast<uint8_t>(block << 3);  // OM=00 variable length, RWB=0 read
-  uint8_t tx[4] = {static_cast<uint8_t>(addr >> 8), static_cast<uint8_t>(addr & 0xFF), ctrl, 0x00};
-  uint8_t rx[4] = {0, 0, 0, 0};
   spi_transaction_t t = {};
-  t.length = sizeof(tx) * 8;
-  t.tx_buffer = tx;
-  t.rx_buffer = rx;
-  spi_device_polling_transmit(this->spi_dev_, &t);
-  return rx[3];
+  t.flags = SPI_TRANS_USE_RXDATA;
+  t.cmd = addr;
+  t.addr = ctrl;
+  t.length = 8;
+  if (!w5500_shared_transact(&t))
+    return 0;
+  return t.rx_data[0];
 }
 
 uint16_t W5500Probe::spi_read_reg16_stable_(uint8_t block, uint16_t addr) {
@@ -125,7 +143,7 @@ uint16_t W5500Probe::spi_read_reg16_stable_(uint8_t block, uint16_t addr) {
 }
 
 void W5500Probe::run_probe_sequence() {
-  if (this->ethernet_ == nullptr || this->spi_dev_ == nullptr) {
+  if (this->ethernet_ == nullptr || ethernet::w5500_shared_spi().hdl == nullptr) {
     ESP_LOGE(TAG, "not set up, aborting probe");
     return;
   }
@@ -212,7 +230,7 @@ void W5500Probe::recover() {
   ESP_LOGI(TAG, "=== w5500_probe: recovering (no power cycle) ===");
   this->probing_active_ = false;
 
-  if (this->ethernet_ == nullptr || this->spi_dev_ == nullptr) {
+  if (this->ethernet_ == nullptr || ethernet::w5500_shared_spi().hdl == nullptr) {
     ESP_LOGE(TAG, "not set up -- power-cycle the device to recover");
     return;
   }
