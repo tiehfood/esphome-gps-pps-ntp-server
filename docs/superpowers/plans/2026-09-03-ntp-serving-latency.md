@@ -21,6 +21,40 @@
 - `loop_interval_` (16 ms) is **not** exposed in ESPHome YAML. There is no configuration lever for loop latency.
 - **`SO_TIMESTAMP` does not exist in lwIP** — not behind a Kconfig, not in Espressif's fork, not upstream. Verified in `esp-lwip/src/api/sockets.c`: the complete `SO_*` list has no timestamping option, and `recvmsg()` only ever emits `IP_PKTINFO`. Do not go looking for it.
 
+## RESULTS — measured 2026-09-04 (wired Pi, `/root/ntp/ntp_probe.py`)
+
+Phases 1 and 2 plus step 9 are **flashed and verified end to end**.
+
+| | pre-flash | after | note |
+|---|---|---|---|
+| offset | +3,286 µs (sd 2,405) | **~+670 µs** (min +607) | 5x better, scatter 26x tighter |
+| delay | 8,502 µs (sd 4,749) | **~1,700 µs** (min 1,213) | = network RTT; ping min 1,099 |
+| root dispersion | 0.000000 s | 0.004990 s | no longer claims a perfect clock |
+| reference time | = transmit | = last PPS sync | `time_id` fix confirmed on the wire |
+| precision | −20 hardcoded | −15 measured | `gettimeofday()` costs ~16–30 µs here |
+
+**`q/2` confirmed by measurement**, settling two wrong revisions of this plan:
+regression of offset on delay gives **slope 0.503, r = 0.993**; delay spread 15,362 µs
+(= the 16 ms `loop_interval_`) against offset spread 7,666 µs vs 7,681 predicted.
+
+**Residual ~670 µs** is our NTP task at priority 7 waking behind lwIP (18) and the eth
+driver task. That is what the input-path hook attacks — now implemented and compiled
+(`58194d8`), **not flashed**: it sits in the path of every received frame, so a mistake
+takes the network down and recovery is USB-only.
+
+## A one-second epoch bug was found, and it dwarfs all of the above
+
+While measuring, the device was caught serving **+1.002 s** — confirmed internally
+(it labelled the edge at 06:03:20.998 UTC as `06:03:22`) while reporting `drift: 5 us`.
+Intermittent, months old, and **structurally invisible**: `clock_offset` measures system
+time against the same epoch counter that is wrong, and the NMEA/PPS cross-check needs
+`|diff| > 2 s`. It only surfaced because an external reference was used for the first time.
+
+Now instrumented and corrected — see `.claude/tracker.md`. The lesson for this plan:
+**every microsecond here was chased with an instrument that could not see a whole second.**
+
+---
+
 ## Step summary and expected improvement
 
 Baseline today (wired Pi, 30 samples, 2026-09-03): offset **+3,286 µs** (sd 2,405), delay **8,502 µs** (sd 4,749). Clock vs GPS: **±5 µs**.
