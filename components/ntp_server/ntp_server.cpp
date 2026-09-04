@@ -535,8 +535,21 @@ void NTPServer::refresh_arp_entries_() {
     uint32_t addr = this->arp_clients_[i];
     if (addr == 0)
       continue;
+    // Only a client on our own subnet is reached by ARPing its address. An off-subnet
+    // client goes via the default gateway, so that is the entry the reply actually needs
+    // -- ARPing the client itself would never resolve and would broadcast forever.
+    // (Caught by the arp_primes counter refusing to settle: the test client sits on a
+    // different /24.)
     ip4_addr_t ip;
-    ip.addr = addr;
+    const uint32_t netmask = netif_ip4_netmask(netif)->addr;
+    const uint32_t our_ip = netif_ip4_addr(netif)->addr;
+    if (((addr ^ our_ip) & netmask) == 0) {
+      ip.addr = addr;
+    } else {
+      ip.addr = netif_ip4_gw(netif)->addr;
+      if (ip.addr == 0)
+        continue;  // no gateway configured; nothing sensible to resolve
+    }
 
     // etharp_* are not thread-safe; this runs on the ESPHome main task, not the tcpip
     // thread, so the core lock is required (CONFIG_LWIP_TCPIP_CORE_LOCKING=y).
