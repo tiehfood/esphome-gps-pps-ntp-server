@@ -192,16 +192,21 @@ void W5500Probe::run_probe_sequence() {
     return;
   }
 
-  // emac_w5500_start() (called from esp_eth_start() above) already wrote SIMR=0x01
-  // (socket 0 only). Widen it to both sockets so lwIP keeps getting interrupts for
-  // socket 0's MACRAW traffic throughout the test.
-  this->spi_write_reg_(BLOCK_COMMON, REG_SIMR, 0x03);
+  // SIMR is deliberately LEFT AT 0x01 (socket 0 only).
+  //
+  // An earlier run unmasked socket 1 (SIMR=0x03) and ALL networking stopped -- not just
+  // NTP: TCP/80 died too. W5500 INTn is level-triggered and stays asserted until the
+  // raising flag is cleared, and ESP-IDF's emac_w5500 only ever clears socket 0's. So
+  // socket 1's Sn_IR.RECV pins INTn low forever and the driver's RX path wedges.
+  //
+  // Reception does not need the interrupt: SIMR gates only INTn assertion, so socket 1
+  // still fills its RX buffer and Sn_RX_RSR still grows. Leaving SIMR alone separates
+  // "diverted away from MACRAW" from "interrupt wedge".
 
   this->probing_active_ = true;
   this->last_poll_ms_ = 0;
   this->probe_started_ms_ = millis();
-  ESP_LOGI(TAG, "socket 1 open, UDP:123, SIMR=0x03 -- watch the rx_bytes / socket_status "
-                "entities now; send NTP requests to this device");
+  ESP_LOGI(TAG, "socket 1 open, UDP:123, SIMR left at 0x01 -- watch rx_bytes; send NTP now");
   this->publish_status_("open, watching");
 }
 
