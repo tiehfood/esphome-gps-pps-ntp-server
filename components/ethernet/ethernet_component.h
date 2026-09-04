@@ -218,6 +218,10 @@ class EthernetComponent : public Component {
 struct W5500RxStamps {
   uint32_t size_read_us;
   uint32_t payload_us;
+  /// 1 when the size_read_us stamp belongs to the frame being delivered right now.
+  /// Greater than 1 means the driver drained several frames from one Sn_RX_RSR read,
+  /// and the stamp is too early for all but the first.
+  uint32_t payloads_since_size_read;
 };
 W5500RxStamps w5500_rx_stamps();
 

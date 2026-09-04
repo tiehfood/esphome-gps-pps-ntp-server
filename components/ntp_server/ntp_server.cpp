@@ -241,18 +241,26 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
         uint16_t dst_port = (static_cast<uint16_t>(buffer[udp_offset + 2]) << 8) | buffer[udp_offset + 3];
         uint32_t ntp_offset = udp_offset + UDP_HDR_LEN;
         if (dst_port == NTP_PORT && length >= ntp_offset + NTP_PACKET_SIZE) {
-          self->hook_record_(&buffer[ntp_offset + 40], t);
-          // Phase 3 Step 3 measurement: how much of T2 is SPI transfer + driver
-          // dispatch, i.e. how much earlier T2 could be stamped. micros() and
-          // esp_timer_get_time() share the same timebase, so the subtraction is valid.
+          // Phase 3 Step 3: stamp T2 at the Sn_RX_RSR read rather than here, after the
+          // frame has been clocked over SPI. Measured gap 287 +/- 16 us; a one-sided T2
+          // shift costs half in client-visible offset, so this recovers ~144 us.
+          //
+          // micros() and esp_timer_get_time() share a timebase, so the difference is
+          // valid; t - gap reconstructs the earlier instant in 64-bit without exposing
+          // the 32-bit wrap. Only trusted when the stamp provably belongs to THIS frame
+          // (exactly one payload read since that Sn_RX_RSR) and the gap is sane --
+          // otherwise fall back to stamping here, which is never worse than before.
+          int64_t t2 = t;
           ethernet::W5500RxStamps st = ethernet::w5500_rx_stamps();
-          if (st.size_read_us != 0) {
+          if (st.size_read_us != 0 && st.payloads_since_size_read == 1) {
             int32_t gap = static_cast<int32_t>(static_cast<uint32_t>(t) - st.size_read_us);
             if (gap > 0 && gap < 20000) {
+              t2 = t - gap;
               self->last_rx_stamp_gap_us_ = gap;
               self->rx_stamp_gap_pending_ = true;
             }
           }
+          self->hook_record_(&buffer[ntp_offset + 40], t2);
         }
       }
     }

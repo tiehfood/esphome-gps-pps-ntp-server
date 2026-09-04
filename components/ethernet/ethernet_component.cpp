@@ -245,6 +245,10 @@ esp_err_t w5500_shared_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, con
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
 volatile uint32_t g_w5500_rx_size_read_us = 0;
 volatile uint32_t g_w5500_rx_payload_us = 0;
+/// Payload reads since the last Sn_RX_RSR read. The driver may drain several frames from
+/// one "how much is waiting?" answer; only when this is 1 does the Sn_RX_RSR stamp belong
+/// to the frame now being delivered.
+volatile uint32_t g_w5500_rx_payloads_since_size_read = 0;
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
 esp_err_t w5500_shared_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void *value, uint32_t len) {
@@ -260,8 +264,10 @@ esp_err_t w5500_shared_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void
 
   if (addr == 0x08 && cmd == 0x0026) {
     g_w5500_rx_size_read_us = micros();  // driver is asking "how much is waiting?"
+    g_w5500_rx_payloads_since_size_read = 0;
   } else if (addr == 0x18 && len > 4) {
-    g_w5500_rx_payload_us = micros();    // about to clock the frame itself
+    g_w5500_rx_payload_us = micros();  // about to clock the frame itself
+    g_w5500_rx_payloads_since_size_read++;
   }
 
   esp_err_t ret = ESP_OK;
@@ -282,7 +288,9 @@ esp_err_t w5500_shared_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void
 
 }  // namespace
 
-W5500RxStamps w5500_rx_stamps() { return {g_w5500_rx_size_read_us, g_w5500_rx_payload_us}; }
+W5500RxStamps w5500_rx_stamps() {
+  return {g_w5500_rx_size_read_us, g_w5500_rx_payload_us, g_w5500_rx_payloads_since_size_read};
+}
 
 W5500SharedSpi w5500_shared_spi() { return {g_w5500_spi_hdl, g_w5500_spi_lock}; }
 #endif  // USE_ETHERNET_SPI && CONFIG_ETH_SPI_ETHERNET_W5500
