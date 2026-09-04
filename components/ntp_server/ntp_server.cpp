@@ -13,6 +13,7 @@
 #include <esp_timer.h>
 #include <atomic>
 #include "esphome/components/ethernet/ethernet_component.h"
+#include "esphome/components/ethernet/w5500_custom_spi.h"
 #include <lwip/etharp.h>
 #include <lwip/tcpip.h>
 #include <esp_netif_net_stack.h>
@@ -102,7 +103,7 @@ void NTPServer::setup() {
   // If the netif isn't available for any reason, skip installing it entirely --
   // serving must keep working without this, at the previous precision only.
   if (ethernet::global_eth_component != nullptr) {
-    this->eth_netif_ = ethernet::global_eth_component->get_eth_netif();
+    this->eth_netif_ = ethernet::global_eth_component->get_esp_netif();
   }
   if (this->eth_netif_ != nullptr) {
     esp_err_t err = esp_eth_update_input_path(ethernet::global_eth_component->get_eth_handle(),
