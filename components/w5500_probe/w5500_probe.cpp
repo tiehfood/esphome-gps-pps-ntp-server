@@ -62,6 +62,10 @@ static const uint8_t Sn_MR_UDP = 0x02;
 static const uint8_t Sn_CR_OPEN = 0x01;
 static const uint8_t Sn_CR_CLOSE = 0x10;
 static const uint8_t SOCK_UDP = 0x22;
+static const uint8_t Sn_MR_TCP = 0x01;
+static const uint8_t Sn_CR_LISTEN = 0x02;
+static const uint8_t SOCK_INIT = 0x13;
+static const uint8_t SOCK_LISTEN = 0x14;
 
 void W5500Probe::setup() {
   if (this->ethernet_ == nullptr) {
@@ -81,8 +85,8 @@ void W5500Probe::loop() {
   uint32_t now = millis();
 
   // Dead-man timer first, before anything that could fail.
-  if (now - this->probe_started_ms_ > PROBE_AUTO_RECOVER_MS) {
-    ESP_LOGW(TAG, "probe window elapsed (%us) -- auto-recovering", PROBE_AUTO_RECOVER_MS / 1000);
+  if (now - this->probe_started_ms_ > this->probe_window_ms_) {
+    ESP_LOGW(TAG, "probe window elapsed (%us) -- auto-recovering", this->probe_window_ms_ / 1000);
     this->recover();
     return;
   }
@@ -151,7 +155,8 @@ uint16_t W5500Probe::spi_read_reg16_stable_(uint8_t block, uint16_t addr) {
   return prev;
 }
 
-void W5500Probe::run_probe_sequence(uint16_t port, bool open_socket, bool set_simr) {
+void W5500Probe::run_probe_sequence(uint16_t port, bool open_socket, bool set_simr, bool tcp_mode,
+                                    uint32_t window_ms) {
   if (this->ethernet_ == nullptr || ethernet::w5500_shared_spi().hdl == nullptr) {
     ESP_LOGE(TAG, "not set up, aborting probe");
     return;
@@ -166,6 +171,7 @@ void W5500Probe::run_probe_sequence(uint16_t port, bool open_socket, bool set_si
   // which is the only point where W5500 buffer sizes may legally change. Everything
   // below only opens socket 1 and unmasks its interrupt; the network stays up.
   this->socket_opened_ = open_socket;
+  this->probe_window_ms_ = window_ms;
   if (!open_socket) {
     // CONTROL: poll only. Socket 1 is never opened; the loop still does its 1 Hz register
     // reads over the shared SPI bus. If networking dies anyway, the probe's own SPI
@@ -187,20 +193,28 @@ void W5500Probe::run_probe_sequence(uint16_t port, bool open_socket, bool set_si
   }
   ESP_LOGI(TAG, "socket 1 RX buffer = %uKB", rxbuf1);
 
-  this->spi_write_reg_(socket_reg_block(1), REG_Sn_MR, Sn_MR_UDP);
+  this->spi_write_reg_(socket_reg_block(1), REG_Sn_MR, tcp_mode ? Sn_MR_TCP : Sn_MR_UDP);
   this->spi_write_reg16_(socket_reg_block(1), REG_Sn_PORT, port);
   this->spi_write_reg_(socket_reg_block(1), REG_Sn_CR, Sn_CR_OPEN);
 
+  const uint8_t want = tcp_mode ? SOCK_INIT : SOCK_UDP;
   uint32_t start = millis();
   uint8_t sr = 0;
   while (millis() - start < 100) {
     sr = this->spi_read_reg_(socket_reg_block(1), REG_Sn_SR);
-    if (sr == SOCK_UDP)
+    if (sr == want)
       break;
     delay(1);
   }
-  if (sr != SOCK_UDP) {
-    ESP_LOGE(TAG, "socket 1 did not reach SOCK_UDP (0x22); read 0x%02X -- press recover", sr);
+  if (tcp_mode && sr == SOCK_INIT) {
+    // A TCP server socket only becomes interesting once it is listening.
+    this->spi_write_reg_(socket_reg_block(1), REG_Sn_CR, Sn_CR_LISTEN);
+    delay(5);
+    sr = this->spi_read_reg_(socket_reg_block(1), REG_Sn_SR);
+    ESP_LOGI(TAG, "TCP socket 1 after LISTEN: SR=0x%02X (0x14 = SOCK_LISTEN)", sr);
+  }
+  if (sr != want && !(tcp_mode && sr == SOCK_LISTEN)) {
+    ESP_LOGE(TAG, "socket 1 did not reach 0x%02X; read 0x%02X -- press recover", want, sr);
     this->publish_status_("open failed");
     return;
   }

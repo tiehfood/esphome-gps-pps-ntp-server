@@ -38,6 +38,8 @@ class W5500Probe : public Component {
   void set_poll_only_button(button::Button *b) { this->poll_only_button_ = b; }
   void set_dump_config_button(button::Button *b) { this->dump_config_button_ = b; }
   void set_simr_button(button::Button *b) { this->simr_button_ = b; }
+  void set_tcp_button(button::Button *b) { this->tcp_button_ = b; }
+  void set_sustained_button(button::Button *b) { this->sustained_button_ = b; }
   void set_rx_bytes_sensor(sensor::Sensor *s) { this->rx_bytes_sensor_ = s; }
   void set_socket_status_sensor(text_sensor::TextSensor *s) { this->socket_status_sensor_ = s; }
 
@@ -61,7 +63,13 @@ class W5500Probe : public Component {
   /// triggered and ESP-IDF's emac_w5500 only ever clears socket 0's flags, so socket 1's
   /// Sn_IR could pin INTn low and wedge the driver. Never actually verified -- the run
   /// that "showed" it was confounded by a spurious web failure.
-  void run_probe_sequence(uint16_t port, bool open_socket, bool set_simr);
+  void run_probe_sequence(uint16_t port, bool open_socket, bool set_simr) {
+    this->run_probe_sequence(port, open_socket, set_simr, false, PROBE_AUTO_RECOVER_MS);
+  }
+  /// tcp_mode: open socket 1 as TCP (Sn_MR=0x01) and LISTEN, instead of UDP.
+  /// window_ms: how long before the dead-man closes it again.
+  void run_probe_sequence(uint16_t port, bool open_socket, bool set_simr, bool tcp_mode,
+                          uint32_t window_ms);
   /// Read-only dump of the common register block. Answers whether the MACRAW driver ever
   /// programs the W5500's own IP identity, which hardware UDP transmit would need.
   void dump_w5500_config();
@@ -93,6 +101,8 @@ class W5500Probe : public Component {
   bool socket_opened_{false};
   button::Button *dump_config_button_{nullptr};
   button::Button *simr_button_{nullptr};
+  button::Button *tcp_button_{nullptr};
+  button::Button *sustained_button_{nullptr};
   sensor::Sensor *rx_bytes_sensor_{nullptr};
   text_sensor::TextSensor *socket_status_sensor_{nullptr};
 
@@ -103,6 +113,7 @@ class W5500Probe : public Component {
   /// probe therefore closes socket 1 by itself after this long, no matter what.
   uint32_t probe_started_ms_{0};
   static const uint32_t PROBE_AUTO_RECOVER_MS = 60000;
+  uint32_t probe_window_ms_{PROBE_AUTO_RECOVER_MS};
 };
 
 class ProbeButton : public button::Button, public Parented<W5500Probe> {
@@ -113,6 +124,20 @@ class ProbeButton : public button::Button, public Parented<W5500Probe> {
 /// CONTROL 1: bind socket 1 to a port nothing else uses. If MACRAW survives this but dies
 /// on 123, the interference is port-specific rather than "any open socket".
 /// Read-only: does the MACRAW driver set SIPR/GAR/SUBR at all?
+/// Socket 1 as a LISTENING TCP socket on an unused port: does TCP mode behave like UDP?
+class ProbeTcpButton : public button::Button, public Parented<W5500Probe> {
+ protected:
+  void press_action() override { this->parent_->run_probe_sequence(12345, true, false, true, 60000); }
+};
+
+/// Ten minutes with socket 1 diverting UDP/123 and its 2 KB RX buffer never drained.
+/// ~36 packets fill it; the question is whether an overflowing socket buffer
+/// back-pressures the shared RX memory and disturbs MACRAW.
+class ProbeSustainedButton : public button::Button, public Parented<W5500Probe> {
+ protected:
+  void press_action() override { this->parent_->run_probe_sequence(123, true, false, false, 600000); }
+};
+
 class DumpConfigButton : public button::Button, public Parented<W5500Probe> {
  protected:
   void press_action() override { this->parent_->dump_w5500_config(); }

@@ -155,6 +155,14 @@ w5500_probe:
     id: w5500_probe_simr
     name: "W5500 Probe: Open Socket 1 + SIMR"
     entity_category: "diagnostic"
+  tcp_button:
+    id: w5500_probe_tcp
+    name: "W5500 Probe: Socket 1 TCP LISTEN (12345)"
+    entity_category: "diagnostic"
+  sustained_button:
+    id: w5500_probe_sustained
+    name: "W5500 Probe: Sustained 10min (port 123)"
+    entity_category: "diagnostic"
   recover_button:
     id: w5500_probe_recover_button
     name: "W5500 Probe: Recover"

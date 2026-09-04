@@ -17,6 +17,8 @@ CONF_ALT_PORT_BUTTON = "alt_port_button"
 CONF_POLL_ONLY_BUTTON = "poll_only_button"
 CONF_DUMP_CONFIG_BUTTON = "dump_config_button"
 CONF_SIMR_BUTTON = "simr_button"
+CONF_TCP_BUTTON = "tcp_button"
+CONF_SUSTAINED_BUTTON = "sustained_button"
 CONF_RX_BYTES = "rx_bytes"
 CONF_SOCKET_STATUS = "socket_status"
 
@@ -39,6 +41,12 @@ DumpConfigButton = w5500_probe_ns.class_(
 )
 ProbeSimrButton = w5500_probe_ns.class_(
     "ProbeSimrButton", button.Button, cg.Parented.template(W5500Probe)
+)
+ProbeTcpButton = w5500_probe_ns.class_(
+    "ProbeTcpButton", button.Button, cg.Parented.template(W5500Probe)
+)
+ProbeSustainedButton = w5500_probe_ns.class_(
+    "ProbeSustainedButton", button.Button, cg.Parented.template(W5500Probe)
 )
 
 CONFIG_SCHEMA = cv.Schema(
@@ -67,6 +75,14 @@ CONFIG_SCHEMA = cv.Schema(
         ),
         cv.Optional(CONF_SIMR_BUTTON): button.button_schema(
             ProbeSimrButton,
+            icon="mdi:backup-restore",
+        ),
+        cv.Optional(CONF_TCP_BUTTON): button.button_schema(
+            ProbeTcpButton,
+            icon="mdi:backup-restore",
+        ),
+        cv.Optional(CONF_SUSTAINED_BUTTON): button.button_schema(
+            ProbeSustainedButton,
             icon="mdi:backup-restore",
         ),
         cv.Optional(CONF_RX_BYTES): sensor.sensor_schema(
@@ -116,6 +132,16 @@ async def to_code(config):
         b = await button.new_button(simr_conf)
         await cg.register_parented(b, config[CONF_ID])
         cg.add(var.set_simr_button(b))
+
+    if tcp_conf := config.get(CONF_TCP_BUTTON):
+        b = await button.new_button(tcp_conf)
+        await cg.register_parented(b, config[CONF_ID])
+        cg.add(var.set_tcp_button(b))
+
+    if sus_conf := config.get(CONF_SUSTAINED_BUTTON):
+        b = await button.new_button(sus_conf)
+        await cg.register_parented(b, config[CONF_ID])
+        cg.add(var.set_sustained_button(b))
 
     if recover_conf := config.get(CONF_RECOVER_BUTTON):
         b = await button.new_button(recover_conf)
