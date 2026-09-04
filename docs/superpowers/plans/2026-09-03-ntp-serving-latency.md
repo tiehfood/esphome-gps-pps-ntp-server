@@ -21,6 +21,47 @@
 - `loop_interval_` (16 ms) is **not** exposed in ESPHome YAML. There is no configuration lever for loop latency.
 - **`SO_TIMESTAMP` does not exist in lwIP** — not behind a Kconfig, not in Espressif's fork, not upstream. Verified in `esp-lwip/src/api/sockets.c`: the complete `SO_*` list has no timestamping option, and `recvmsg()` only ever emits `IP_PKTINFO`. Do not go looking for it.
 
+## PHASE 3 STEP 3 — DONE AND VERIFIED 2026-09-04 12:20
+
+T2 is now stamped at the driver's `Sn_RX_RSR` read instead of in the input hook, i.e.
+before the frame is clocked over SPI. The custom W5500 SPI driver already sees every
+transaction, so no extra wiring and no second ISR on the shared INT pin were needed.
+
+Measured gap between the two stamping points: **287.1 +/- 16.3 us** (n=40). A one-sided
+T2 shift costs half in client-visible offset, predicting **-143.6 us**.
+
+### How it was measured, and why the first attempt was wrong
+
+The naive before/after showed NOTHING: intercept +98.8 +/- 18.4 us against a recorded
++97 us baseline, while the device's own counters proved T2 had moved (hook latency
+646 -> 905 us). Both cannot be true.
+
+Cause: run-to-run network drift across the routed hop is larger than the effect. Two runs
+five minutes apart gave offset means of +244.7 and +388.3 us purely from delay conditions
+(577 vs 811 us). No regressed baseline had been captured in the same session either.
+
+Fix: a runtime switch (`NTP Early T2 Stamp`) allowing paired ON/OFF blocks, then ONE
+regression over the pooled data with delay as a covariate:
+
+    offset ~ 1 + delay + is_early        n = 160
+
+    intercept          +123.4 +/- 16.6 us   t = +7.42
+    delay coefficient    +0.4 +/-  0.0      t = +64.29
+    EARLY-T2 EFFECT    -106.7 +/- 21.3 us   t = -5.01     95% CI [-148.4, -65.0]
+
+**The predicted -143.6 us lies inside the confidence interval.** Effect confirmed at
+t = -5.01. Note the block means alone were misleading: the OFF blocks happened to land in
+a busier period (delay 1213 vs 585 us), so the raw -359 us difference was mostly delay.
+Controlling for delay is what makes this measurable at all.
+
+### Method note for whoever comes next
+
+Do not compare NTP offset across separate runs on this path -- delay drift swamps
+anything under ~200 us. Use the A/B switch, interleave short blocks, and regress with
+delay as a covariate. An unpaired before/after on this network is not evidence.
+
+---
+
 ## STATUS as of 2026-09-04 11:40 (the step checkboxes below were never ticked; this is the truth)
 
 | Phase | State |
@@ -41,9 +82,17 @@ Phase 3 detail:
 - Step 5 (prime ARP for known clients) — **NOT done.** No arp references in the component.
 
 Blockers on the remaining work:
-1. **IRAM is 16,384 / 16,384 — 0 bytes free** (re-measured 2026-09-04 with the probe excluded).
-   Step 1 and Step 3 both want ISR code; any new `IRAM_ATTR` fails at link. This must be
-   solved before, not during.
+1. ~~IRAM is full~~ **RETRACTED 2026-09-04 12:00 — this blocker never existed.**
+   PlatformIO's `IRAM 16384 / 100.0% / 0 free` row does NOT track `.iram0.text` on
+   ESP32-S3, where SRAM is unified and IRAM grows into the DIRAM pool. Measured directly
+   from the linker script and ELF:
+   `iram0_0_seg len = 358,144 B`, in use `64,256 B` -> **287 KB free.**
+   Verified empirically: a forced-retained `IRAM_ATTR` function grew `.iram0.text`
+   62,979 -> 76,087 B (+13 KB), symbol landed at `0x40375320` (IRAM range), linked clean.
+   Note the two earlier attempts that misled: `used` alone does not survive
+   `--gc-sections`; the function needs a real call site from live code or it vanishes and
+   the numbers look unchanged.
+   **Steps 1 and 3 are unblocked.**
 2. **Measurement ceiling.** The plan's own conclusion: ~97 us is at or below what this path
    resolves, the Pi being a routed hop away (~420 us one-way). Further gains are unverifiable
    without a host on the device's own subnet.
