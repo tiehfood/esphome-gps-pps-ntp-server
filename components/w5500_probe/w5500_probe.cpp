@@ -151,7 +151,7 @@ uint16_t W5500Probe::spi_read_reg16_stable_(uint8_t block, uint16_t addr) {
   return prev;
 }
 
-void W5500Probe::run_probe_sequence(uint16_t port, bool open_socket) {
+void W5500Probe::run_probe_sequence(uint16_t port, bool open_socket, bool set_simr) {
   if (this->ethernet_ == nullptr || ethernet::w5500_shared_spi().hdl == nullptr) {
     ESP_LOGE(TAG, "not set up, aborting probe");
     return;
@@ -216,10 +216,15 @@ void W5500Probe::run_probe_sequence(uint16_t port, bool open_socket) {
   // still fills its RX buffer and Sn_RX_RSR still grows. Leaving SIMR alone separates
   // "diverted away from MACRAW" from "interrupt wedge".
 
+  if (set_simr) {
+    this->spi_write_reg_(BLOCK_COMMON, REG_SIMR, 0x03);
+    ESP_LOGW(TAG, "SIMR=0x03: socket 1 interrupt UNMASKED -- watch whether MACRAW survives");
+  }
+
   this->probing_active_ = true;
   this->last_poll_ms_ = 0;
   this->probe_started_ms_ = millis();
-  ESP_LOGI(TAG, "socket 1 open, UDP:%u, SIMR left at 0x01 -- watch rx_bytes", port);
+  ESP_LOGI(TAG, "socket 1 open, UDP:%u, SIMR=%s -- watch rx_bytes", port, set_simr ? "0x03" : "0x01");
   this->publish_status_("open, watching");
 }
 
@@ -267,6 +272,31 @@ void W5500Probe::recover() {
 
   ESP_LOGI(TAG, "recovered: socket 1 closed, SIMR back to socket 0 only; network untouched");
   this->publish_status_("recovered");
+}
+
+void W5500Probe::dump_w5500_config() {
+  if (ethernet::w5500_shared_spi().hdl == nullptr) {
+    ESP_LOGE(TAG, "not set up");
+    return;
+  }
+  // Common register block (BSB=0): MR 0x0000, GAR 0x0001-04, SUBR 0x0005-08,
+  // SHAR 0x0009-0E, SIPR 0x000F-12, SIMR 0x0018.
+  uint8_t gar[4], subr[4], shar[6], sipr[4];
+  for (int i = 0; i < 4; i++) gar[i] = this->spi_read_reg_(BLOCK_COMMON, 0x0001 + i);
+  for (int i = 0; i < 4; i++) subr[i] = this->spi_read_reg_(BLOCK_COMMON, 0x0005 + i);
+  for (int i = 0; i < 6; i++) shar[i] = this->spi_read_reg_(BLOCK_COMMON, 0x0009 + i);
+  for (int i = 0; i < 4; i++) sipr[i] = this->spi_read_reg_(BLOCK_COMMON, 0x000F + i);
+  uint8_t mr = this->spi_read_reg_(BLOCK_COMMON, 0x0000);
+  uint8_t simr = this->spi_read_reg_(BLOCK_COMMON, REG_SIMR);
+
+  ESP_LOGI(TAG, "=== W5500 common registers ===");
+  ESP_LOGI(TAG, "  MR   = 0x%02X   SIMR = 0x%02X", mr, simr);
+  ESP_LOGI(TAG, "  SHAR = %02X:%02X:%02X:%02X:%02X:%02X", shar[0], shar[1], shar[2], shar[3], shar[4],
+           shar[5]);
+  ESP_LOGI(TAG, "  SIPR = %u.%u.%u.%u   <- 0.0.0.0 means the MACRAW driver never set an IP,"
+                " so hardware UDP TX would source from 0.0.0.0", sipr[0], sipr[1], sipr[2], sipr[3]);
+  ESP_LOGI(TAG, "  GAR  = %u.%u.%u.%u", gar[0], gar[1], gar[2], gar[3]);
+  ESP_LOGI(TAG, "  SUBR = %u.%u.%u.%u", subr[0], subr[1], subr[2], subr[3]);
 }
 
 }  // namespace w5500_probe

@@ -147,6 +147,14 @@ w5500_probe:
     id: w5500_probe_poll_only_button
     name: "W5500 Probe: Poll Only (control)"
     entity_category: "diagnostic"
+  dump_config_button:
+    id: w5500_probe_dump_config
+    name: "W5500 Probe: Dump Config"
+    entity_category: "diagnostic"
+  simr_button:
+    id: w5500_probe_simr
+    name: "W5500 Probe: Open Socket 1 + SIMR"
+    entity_category: "diagnostic"
   recover_button:
     id: w5500_probe_recover_button
     name: "W5500 Probe: Recover"

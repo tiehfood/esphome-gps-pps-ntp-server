@@ -36,6 +36,8 @@ class W5500Probe : public Component {
   void set_recover_button(button::Button *b) { this->recover_button_ = b; }
   void set_alt_port_button(button::Button *b) { this->alt_port_button_ = b; }
   void set_poll_only_button(button::Button *b) { this->poll_only_button_ = b; }
+  void set_dump_config_button(button::Button *b) { this->dump_config_button_ = b; }
+  void set_simr_button(button::Button *b) { this->simr_button_ = b; }
   void set_rx_bytes_sensor(sensor::Sensor *s) { this->rx_bytes_sensor_ = s; }
   void set_socket_status_sensor(text_sensor::TextSensor *s) { this->socket_status_sensor_ = s; }
 
@@ -52,7 +54,17 @@ class W5500Probe : public Component {
   /// port: UDP port to bind socket 1 to. open_socket: false runs the SPI polling
   /// loop WITHOUT opening socket 1 at all -- the control for whether the probe's own
   /// interleaved SPI traffic is what disturbs the driver.
-  void run_probe_sequence(uint16_t port, bool open_socket);
+  void run_probe_sequence(uint16_t port, bool open_socket) {
+    this->run_probe_sequence(port, open_socket, false);
+  }
+  /// set_simr: also unmask socket 1's interrupt in SIMR. The W5500's INTn is level
+  /// triggered and ESP-IDF's emac_w5500 only ever clears socket 0's flags, so socket 1's
+  /// Sn_IR could pin INTn low and wedge the driver. Never actually verified -- the run
+  /// that "showed" it was confounded by a spurious web failure.
+  void run_probe_sequence(uint16_t port, bool open_socket, bool set_simr);
+  /// Read-only dump of the common register block. Answers whether the MACRAW driver ever
+  /// programs the W5500's own IP identity, which hardware UDP transmit would need.
+  void dump_w5500_config();
   /// Button-triggered: undo run_probe_sequence() without a power cycle.
   void recover();
 
@@ -79,6 +91,8 @@ class W5500Probe : public Component {
   button::Button *alt_port_button_{nullptr};
   button::Button *poll_only_button_{nullptr};
   bool socket_opened_{false};
+  button::Button *dump_config_button_{nullptr};
+  button::Button *simr_button_{nullptr};
   sensor::Sensor *rx_bytes_sensor_{nullptr};
   text_sensor::TextSensor *socket_status_sensor_{nullptr};
 
@@ -98,6 +112,18 @@ class ProbeButton : public button::Button, public Parented<W5500Probe> {
 
 /// CONTROL 1: bind socket 1 to a port nothing else uses. If MACRAW survives this but dies
 /// on 123, the interference is port-specific rather than "any open socket".
+/// Read-only: does the MACRAW driver set SIPR/GAR/SUBR at all?
+class DumpConfigButton : public button::Button, public Parented<W5500Probe> {
+ protected:
+  void press_action() override { this->parent_->dump_w5500_config(); }
+};
+
+/// Socket 1 on 123 WITH its interrupt unmasked -- the properly-controlled interrupt test.
+class ProbeSimrButton : public button::Button, public Parented<W5500Probe> {
+ protected:
+  void press_action() override { this->parent_->run_probe_sequence(123, true, true); }
+};
+
 class ProbeAltPortButton : public button::Button, public Parented<W5500Probe> {
  protected:
   void press_action() override { this->parent_->run_probe_sequence(12345, true); }
