@@ -55,6 +55,13 @@ class NTPServer : public Component {
   /// edge would otherwise give a STALE stamp. Guarded by consuming each capture exactly
   /// once -- see use_int_edge_t2_ in eth_input_hook_.
   void set_use_int_edge_t2(bool enable) { this->use_int_edge_t2_ = enable; }
+  /// EWMA smoothing for the T3 send-time estimate, as a right-shift: 3 = alpha 1/8.
+  /// Tunable because t3_error (prediction minus the measured transmit instant) is a
+  /// network-independent quality metric -- the best shift is the one that minimises its
+  /// spread, and that can be measured directly rather than guessed.
+  void set_send_ewma_shift(uint8_t shift) {
+    this->send_ewma_shift_ = (shift < 1) ? 1 : (shift > 8 ? 8 : shift);
+  }
   bool get_use_early_t2() const { return this->use_early_t2_; }
 #endif
 
@@ -84,6 +91,7 @@ class NTPServer : public Component {
   /// spi_device_polling_transmit mean sendto() runs the SPI write inline, so the
   /// packet leaves this long after T3 is stamped. Added to T3 to compensate.
   int32_t send_us_{0};
+  volatile uint8_t send_ewma_shift_{3};
 
   /// Dedicated FreeRTOS task blocked in recvfrom() -- stamps T2 on return instead of
   /// whenever ESPHome's shared loop next polls us. Runs for the component's lifetime;

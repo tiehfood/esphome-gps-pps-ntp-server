@@ -265,7 +265,7 @@ void NTPServer::recv_task_(void *param) {
         self->last_t3_error_us_ = actual_us - self->send_us_;
         self->t3_error_pending_ = true;
         if (self->use_hw_t3_ && actual_us > SEND_US_MIN) {
-          self->send_us_ += (actual_us - self->send_us_) / 8;
+          self->send_us_ += (actual_us - self->send_us_) >> self->send_ewma_shift_;
           learned_from_hardware = true;
         }
       }
@@ -275,7 +275,7 @@ void NTPServer::recv_task_(void *param) {
     // sendto() duration. Same ARP-miss guard as before -- a queued packet returns
     // immediately and would drag the estimate down even though it departs late.
     if (!learned_from_hardware && dur > SEND_US_MIN && dur < SEND_US_MAX)
-      self->send_us_ += (dur - self->send_us_) / 8;
+      self->send_us_ += (dur - self->send_us_) >> self->send_ewma_shift_;
   }
 }
 
