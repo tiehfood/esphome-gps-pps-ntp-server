@@ -85,6 +85,12 @@ spi_device_handle_t g_w5500_spi_hdl = nullptr;
 SemaphoreHandle_t g_w5500_spi_lock = nullptr;
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
+// The W5500 socket-buffer split below serves only the socket-1 research spike, so it
+// is compiled in ONLY when the w5500_probe component is present (it defines
+// USE_W5500_SOCKET_SPLIT). With the probe absent these registers are never touched --
+// touching them is what cost three USB recoveries.
+#ifdef USE_W5500_SOCKET_SPLIT
+
 // Write one W5500 register through the shared handle. Used only for the one-time
 // socket-buffer split in setup(), which must happen before esp_eth_start().
 static void w5500_reg_write8(uint8_t block, uint16_t addr, uint8_t value) {
@@ -166,6 +172,8 @@ static bool w5500_apply_socket_buffer_split() {
   }
   return true;
 }
+
+#endif  // USE_W5500_SOCKET_SPLIT
 
 void *w5500_shared_spi_init(const void *spi_config) {
   const auto *w5500_config = static_cast<const eth_w5500_config_t *>(spi_config);
@@ -452,7 +460,7 @@ void EthernetComponent::setup() {
   err = esp_eth_driver_install(&eth_config, &this->eth_handle_);
   ESPHL_ERROR_CHECK(err, "ETH driver install error");
 
-#if CONFIG_ETH_SPI_ETHERNET_W5500
+#if defined(CONFIG_ETH_SPI_ETHERNET_W5500) && defined(USE_W5500_SOCKET_SPLIT)
   // Split the W5500 socket buffers so socket 1 has room for a hardware UDP listener.
   //
   // This is the only safe moment: esp_eth_driver_install() has just run

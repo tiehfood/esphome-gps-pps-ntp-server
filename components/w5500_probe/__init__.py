@@ -51,6 +51,9 @@ CONFIG_SCHEMA = cv.Schema(
 
 
 async def to_code(config):
+    # Enables the socket-buffer split in the ethernet component. Only defined when this
+    # probe is configured, so a build without the spike never writes those registers.
+    cg.add_define("USE_W5500_SOCKET_SPLIT")
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
