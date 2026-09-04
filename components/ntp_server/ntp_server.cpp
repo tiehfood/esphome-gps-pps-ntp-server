@@ -135,6 +135,12 @@ void NTPServer::loop() {
   // diagnostic: recv_task_() can only record the value (a single volatile int32_t,
   // atomic on this hardware -- see .claude/rules/firmware.md), publishing it is an
   // ESPHome API call and must happen from this main-thread loop() instead.
+  if (this->rx_stamp_gap_pending_) {
+    int32_t gap_us = this->last_rx_stamp_gap_us_;
+    this->rx_stamp_gap_pending_ = false;
+    if (this->rx_stamp_gap_sensor_ != nullptr)
+      this->rx_stamp_gap_sensor_->publish_state(gap_us);
+  }
   if (this->hook_latency_pending_) {
     int32_t latency_us = this->last_hook_latency_us_;
     this->hook_latency_pending_ = false;
@@ -236,6 +242,17 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
         uint32_t ntp_offset = udp_offset + UDP_HDR_LEN;
         if (dst_port == NTP_PORT && length >= ntp_offset + NTP_PACKET_SIZE) {
           self->hook_record_(&buffer[ntp_offset + 40], t);
+          // Phase 3 Step 3 measurement: how much of T2 is SPI transfer + driver
+          // dispatch, i.e. how much earlier T2 could be stamped. micros() and
+          // esp_timer_get_time() share the same timebase, so the subtraction is valid.
+          ethernet::W5500RxStamps st = ethernet::w5500_rx_stamps();
+          if (st.size_read_us != 0) {
+            int32_t gap = static_cast<int32_t>(static_cast<uint32_t>(t) - st.size_read_us);
+            if (gap > 0 && gap < 20000) {
+              self->last_rx_stamp_gap_us_ = gap;
+              self->rx_stamp_gap_pending_ = true;
+            }
+          }
         }
       }
     }

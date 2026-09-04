@@ -237,6 +237,16 @@ esp_err_t w5500_shared_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, con
   return ret;
 }
 
+// Earliest observable moments of a frame arrival, for NTP T2 (serving plan Phase 3
+// Step 3). emac_w5500_receive() first reads Sn_RX_RSR to learn how much is waiting
+// (socket 0 register block, BSB=1 -> read control byte 0x08, register 0x0026), and only
+// then clocks the payload out of the socket 0 RX buffer block (BSB=3 -> 0x18). The gap
+// between the two is the SPI transfer cost currently baked into T2.
+// NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
+volatile uint32_t g_w5500_rx_size_read_us = 0;
+volatile uint32_t g_w5500_rx_payload_us = 0;
+// NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
+
 esp_err_t w5500_shared_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void *value, uint32_t len) {
   auto *spi = static_cast<EthSpiInfo *>(spi_ctx);
   spi_transaction_t trans = {};
@@ -247,6 +257,12 @@ esp_err_t w5500_shared_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void
   trans.addr = addr;
   trans.length = 8 * len;
   trans.rx_buffer = value;
+
+  if (addr == 0x08 && cmd == 0x0026) {
+    g_w5500_rx_size_read_us = micros();  // driver is asking "how much is waiting?"
+  } else if (addr == 0x18 && len > 4) {
+    g_w5500_rx_payload_us = micros();    // about to clock the frame itself
+  }
 
   esp_err_t ret = ESP_OK;
   if (xSemaphoreTake(spi->lock, pdMS_TO_TICKS(W5500_SPI_LOCK_TIMEOUT_MS)) == pdTRUE) {
@@ -265,6 +281,8 @@ esp_err_t w5500_shared_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void
 }
 
 }  // namespace
+
+W5500RxStamps w5500_rx_stamps() { return {g_w5500_rx_size_read_us, g_w5500_rx_payload_us}; }
 
 W5500SharedSpi w5500_shared_spi() { return {g_w5500_spi_hdl, g_w5500_spi_lock}; }
 #endif  // USE_ETHERNET_SPI && CONFIG_ETH_SPI_ETHERNET_W5500

@@ -32,6 +32,7 @@ class NTPServer : public Component {
   void set_time_source(gps_pps_time::GPSPPSTime *source) { this->time_source_ = source; }
 #ifdef USE_ESP_IDF
   void set_hook_latency_sensor(sensor::Sensor *sensor) { this->hook_latency_sensor_ = sensor; }
+  void set_rx_stamp_gap_sensor(sensor::Sensor *sensor) { this->rx_stamp_gap_sensor_ = sensor; }
 #endif
 
   void setup() override;
@@ -100,6 +101,12 @@ class NTPServer : public Component {
   /// never from recv_task_() itself, which must make no ESPHome API calls.
   volatile int32_t last_hook_latency_us_{0};
   volatile bool hook_latency_pending_{false};
+  /// Phase 3 Step 3: microseconds between the driver reading Sn_RX_RSR and the input
+  /// hook stamping T2 -- the SPI transfer + dispatch cost currently inside T2, and so
+  /// the upper bound on what stamping T2 earlier could recover.
+  volatile int32_t last_rx_stamp_gap_us_{0};
+  volatile bool rx_stamp_gap_pending_{false};
+  sensor::Sensor *rx_stamp_gap_sensor_{nullptr};
   sensor::Sensor *hook_latency_sensor_{nullptr};
 
   /// Registered with esp_eth_update_input_path() as the driver's stack_input. Runs in

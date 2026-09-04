@@ -212,6 +212,15 @@ class EthernetComponent : public Component {
 /// the driver uses, instead of calling spi_bus_add_device() a second time — see the
 /// warning at the top of this file for why that is unsafe.
 /// Both fields are null until EthernetComponent::setup() has run.
+/// micros() stamps of the two earliest points in a W5500 frame receive: when the driver
+/// read Sn_RX_RSR, and when it began clocking the payload. Their difference is the SPI
+/// transfer cost that currently inflates NTP T2.
+struct W5500RxStamps {
+  uint32_t size_read_us;
+  uint32_t payload_us;
+};
+W5500RxStamps w5500_rx_stamps();
+
 struct W5500SharedSpi {
   spi_device_handle_t hdl{nullptr};
   SemaphoreHandle_t lock{nullptr};
