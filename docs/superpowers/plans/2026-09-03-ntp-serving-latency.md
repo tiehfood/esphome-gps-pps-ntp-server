@@ -21,6 +21,59 @@
 - `loop_interval_` (16 ms) is **not** exposed in ESPHome YAML. There is no configuration lever for loop latency.
 - **`SO_TIMESTAMP` does not exist in lwIP** — not behind a Kconfig, not in Espressif's fork, not upstream. Verified in `esp-lwip/src/api/sockets.c`: the complete `SO_*` list has no timestamping option, and `recvmsg()` only ever emits `IP_PKTINFO`. Do not go looking for it.
 
+## SOCKET-1 — CLOSED ON PHYSICS 2026-09-04 14:30
+
+**The W5500 has ONE `INTn` pin, shared by all eight sockets** (datasheet p.10 §1.1). A
+socket-1 interrupt is therefore *the same electrical edge* as socket 0's MACRAW interrupt
+for the same frame. **An "earlier socket-1 arrival interrupt" is physically impossible.**
+
+That was the entire reason to want socket 1. The line is closed — not on effort or risk,
+on physics.
+
+### Remaining test results (complete)
+
+| test | result |
+|---|---|
+| socket 1 **TCP LISTEN** on unused port 12345 | reaches `SR=0x14`, never accepts (`SIPR=0.0.0.0` cannot complete a handshake) — and **black-holes ALL TCP**: web 000, while UDP/NTP stayed 8/8 |
+| **sustained 10 min**, socket 1 diverting UDP/123, buffer never drained | `Sn_RX_RSR` saturates at **2016 B** (36 × 56) and stays there; further packets silently dropped |
+| MACRAW during that saturation | **unaffected** — web 200 at T+0, T+3 min, T+8 min; clock 5 µs; heap flat at 301 KB |
+| after the 10-min dead-man | full recovery: web 200, NTP 10/10, offset +214 µs sd 21 |
+
+So a saturated hardware socket does **not** back-pressure the shared RX memory. But TCP
+mode is unusable outright — it would kill OTA, the API and the web server.
+
+### Why unmasking the interrupt wedges everything (root cause confirmed)
+
+`esp_eth_mac_w5500.c` (IDF 5.5.1):
+- `:835` reads `Sn_IR(0)` — the *only* interrupt read in the RX task
+- `:838-840` clears `Sn_IR(0)` — the *only* interrupt clear
+- `:380` hard-codes `SIMR = 0x01`; `W5500_REG_SIR` is defined but **never referenced**
+- `:362` leaves `Sn_IMR(1..7)` at reset `0xFF`, so `Sn_IR(1)` does set on receive
+- `:887` `gpio_set_intr_type(..., GPIO_INTR_NEGEDGE)` — **ESP-IDF treats a level-asserted
+  line as an edge.** That mismatch is the wedge; a 1 Hz level recheck at `:826` is why the
+  device is "dead" rather than literally dead.
+- `:365` `INTLEVEL = 0xFFFF` = 1.748 ms re-assert blanking — which would contaminate any
+  `INTn`-derived timestamp on a busy link anyway.
+
+Minimal fix, if anyone ever needs socket-1 interrupts for another reason: read `SIR`
+before `:835` and write `Sn_IR(s) = 0xFF` for each asserted socket. That is precisely
+WIZnet's own `wizchip_clrinterrupt()` idiom (`setSIR()` is commented out in
+`ioLibrary_Driver`; writing SIR does not clear it).
+
+Applying it means vendoring `esp_eth_mac_w5500.c` + `w5500.h` into `components/ethernet/`
+and renaming `esp_eth_mac_new_w5500` (~1100 lines, re-diff on IDF bumps). **Our existing
+`custom_spi_driver` hook cannot do it** — it only fires when the driver is already doing
+SPI, and a wedged driver does SPI once per second, so the clear would arrive at 1 Hz.
+
+### Dual-stack ARP, for the record
+
+Programming `SIPR` would give the W5500's own engine an ARP responder for an address lwIP
+already answers for. Linux's `w5100.c` also writes only `SHAR` and deliberately leaves
+`SIPR` zeroed; a Raspberry Pi forum report describes the chip answering ARP for `0.0.0.0`
+in exactly that state. Moot now, but it was a real hazard.
+
+---
+
 ## SOCKET-1 SPIKE — FINAL 2026-09-04 14:00
 
 | experiment | NTP | web (TCP/80) |
