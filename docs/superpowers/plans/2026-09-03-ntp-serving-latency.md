@@ -21,6 +21,41 @@
 - `loop_interval_` (16 ms) is **not** exposed in ESPHome YAML. There is no configuration lever for loop latency.
 - **`SO_TIMESTAMP` does not exist in lwIP** — not behind a Kconfig, not in Espressif's fork, not upstream. Verified in `esp-lwip/src/api/sockets.c`: the complete `SO_*` list has no timestamping option, and `recvmsg()` only ever emits `IP_PKTINFO`. Do not go looking for it.
 
+## STATUS as of 2026-09-04 11:40 (the step checkboxes below were never ticked; this is the truth)
+
+| Phase | State |
+|---|---|
+| **Phase 1 — conformance** | **DONE 4/4.** All four verified on the wire today: `VN=4` echoed, `Reference ID=GPS`, `Root dispersion=0.004990 s` (non-zero), `Precision=-15` from the measured clock-read cost. |
+| **Phase 2 — serving latency** | **DONE 3/3.** Baseline captured, serving moved to a dedicated core-1 task, re-measured, gate opened. |
+| **Phase 3 — hardware-adjacent T2** | **Goal met by a different route; 2 of 5 steps remain and are blocked.** |
+| **Socket-1 spike** | **Unresolved.** Never produced a measurement. |
+
+Phase 3 detail:
+- Step 1 (wire `INTn` to a GPIO, stamp T2 in an ISR) — **superseded, not done as written.**
+  `esp_eth_update_input_path()` stamps T2 in the driver's input path before lwIP, which
+  reached the same goal with no extra wiring: device residual 659 -> 97 us.
+- Step 2 (seqlock on the 64-bit capture) — **DONE**, `std::atomic<uint32_t> seq` ring in ntp_server.h.
+- Step 3 (stamp on the cheap RX-size register read, before clocking the payload) — **NOT done.**
+  Needs driver-level W5500 access; this is the same territory as the socket-1 spike.
+- Step 4 (pre-correct T3 by an EWMA of send duration) — **DONE**, `send_us_`, SEND_US_MIN/MAX.
+- Step 5 (prime ARP for known clients) — **NOT done.** No arp references in the component.
+
+Blockers on the remaining work:
+1. **IRAM is 16,384 / 16,384 — 0 bytes free** (re-measured 2026-09-04 with the probe excluded).
+   Step 1 and Step 3 both want ISR code; any new `IRAM_ATTR` fails at link. This must be
+   solved before, not during.
+2. **Measurement ceiling.** The plan's own conclusion: ~97 us is at or below what this path
+   resolves, the Pi being a routed hop away (~420 us one-way). Further gains are unverifiable
+   without a host on the device's own subnet.
+3. **A reboot now costs ~1 h of service** — weak GPS signal (C/N0 ~26 dBHz) plus no V_BCKP
+   battery makes every power cycle a full cold start. Batch flashes accordingly.
+
+Delivered outside this plan, same period: the ISR `gettimeofday()` panic fix (26 reboots /
+149 days), the one-second epoch detector + self-corrector (validated live on hardware), and
+the illegal W5500 socket-buffer-size fix (`f40f99e`, `6bf6703`).
+
+---
+
 ## FINAL RESULTS — input-path hook flashed and measured 2026-09-04
 
 Regressing offset on delay separates our error from the network path. **The intercept
