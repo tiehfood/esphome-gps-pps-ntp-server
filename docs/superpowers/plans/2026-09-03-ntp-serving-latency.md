@@ -21,45 +21,42 @@
 - `loop_interval_` (16 ms) is **not** exposed in ESPHome YAML. There is no configuration lever for loop latency.
 - **`SO_TIMESTAMP` does not exist in lwIP** — not behind a Kconfig, not in Espressif's fork, not upstream. Verified in `esp-lwip/src/api/sockets.c`: the complete `SO_*` list has no timestamping option, and `recvmsg()` only ever emits `IP_PKTINFO`. Do not go looking for it.
 
-## SOCKET-1 SPIKE — ANSWERED, POSITIVE, VIABLE 2026-09-04 13:45
-
-Question: does a UDP/123 frame land on socket 1, on MACRAW socket 0, or both?
-**Answer: socket 1 only — and everything else keeps working.**
+## SOCKET-1 SPIKE — FINAL 2026-09-04 14:00
 
 | experiment | NTP | web (TCP/80) |
 |---|---|---|
 | baseline | 5/5 | 200 200 200 |
 | poll only, socket 1 never opened | 12/12 | 200 |
-| socket 1 open on unused port 12345 | 12/12 | 200 |
+| socket 1 on unused port 12345 | 12/12 | 200 |
 | …plus 12 UDP packets sent to 12345 | 10/10 | 200 |
-| **socket 1 open on port 123** | **0/8** | **200 200 200 before, 200 200 200 after** |
-| after closing socket 1 | restored | 200 |
+| socket 1 on 123, **`SIMR` = 0x01** | 0/8 (diverted) | **200 200 200 before, 200 200 200 after** |
+| socket 1 on 123, **`SIMR` = 0x03** | 0/8 | **000 before any socket-1 traffic — instant wedge** |
+| after dead-man closes socket 1 | 6/6 | 200 200 200 |
 
-`Sn_RX_RSR` grows in exact 56-byte steps (8-byte W5500 UDP header + 48-byte NTP payload),
-so the hardware socket receives NTP cleanly and completely.
+`Sn_RX_RSR` grows in exact 56-byte steps — the hardware socket receives NTP cleanly.
+`SIPR` / `GAR` / `SUBR` all read **0.0.0.0**: the MACRAW driver never gives the W5500 an
+IP identity.
 
-**A W5500 hardware UDP socket coexists with the ESP-IDF MACRAW driver.** It intercepts
-only its bound port; MACRAW carries everything else untouched. That is precisely the
-property a hardware-path NTP server requires.
+**Answer.** Socket 1 coexists with MACRAW and cleanly intercepts its bound port — *provided
+its interrupt stays masked*. Unmasking it wedges everything instantly, because `INTn` is
+level-triggered and `emac_w5500` clears only socket 0's `Sn_IR`.
 
-### Retracted: an earlier version of this section said the opposite
+**Value verdict — this is the part that matters.** The reason to want socket 1 was an early
+hardware arrival stamp for T2. That requires its interrupt, which requires patching
+ESP-IDF's `emac_w5500` (a component we do not fork). Polling socket 1 instead would be
+*slower* than the burst-start stamp already in place, which has removed ~400 µs of T2
+latency. Reception works and transmit is reachable, but **there is no cheap timing win
+here.** Anyone picking this up should budget for patching the MAC driver first, and should
+evaluate the dual-stack ARP question before building a hardware transmit path.
 
-It claimed opening socket 1 killed all networking and closed the line. That rested on two
-`web: 000` readings during the port-123 runs which were transient client-side failures and
-which I never retested. Three controls — poll-only, alt-port, alt-port-with-traffic — plus
-six web samples around a port-123 run refuted it. **A negative result resting on an
-untested incidental observation is not a result.**
+### This conclusion was wrong twice before it was right
 
-### What a hardware-path NTP server would now require
-
-1. Read the datagram from socket 1: 8-byte header (srcIP, srcPort, len) then payload.
-2. Build the NTP reply and send it back through socket 1's hardware UDP TX.
-3. Stamp T2 from socket 1's own arrival indication rather than the MACRAW path.
-4. Keep lwIP for OTA, API and web — they are unaffected, which is what makes this viable.
-
-Open question before committing: whether socket 1's arrival indication is materially
-earlier than the ~400 us already recovered via the MACRAW burst-start stamp. Worth
-measuring before building the send path.
+v1 "opening socket 1 kills all networking, line closed" — built on two `web: 000` readings
+that were never retested. v2 "coexists fine, fully viable" — correct for `SIMR=0x01`, but
+it had dismissed the interrupt wedge that v1 stumbled on for the wrong reason. Only after
+running the three controls (poll-only, alt-port, alt-port-with-traffic) *and* re-testing
+`SIMR=0x03` with proper web sampling did both halves line up. **Two of the three controls
+should have been run before writing v1 at all.**
 
 ---
 
