@@ -255,7 +255,7 @@ void NTPServer::recv_task_(void *param) {
       if (actual_us > 0 && actual_us < SEND_US_MAX) {
         self->last_t3_error_us_ = actual_us - self->send_us_;
         self->t3_error_pending_ = true;
-        if (actual_us > SEND_US_MIN) {
+        if (self->use_hw_t3_ && actual_us > SEND_US_MIN) {
           self->send_us_ += (actual_us - self->send_us_) / 8;
           learned_from_hardware = true;
         }

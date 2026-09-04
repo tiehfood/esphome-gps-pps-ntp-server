@@ -46,6 +46,9 @@ class NTPServer : public Component {
   /// Only meaningful while use_early_t2_ is set. Separate switch so it can be A/B'd on
   /// its own, since the expected effect (~57 us) is close to this path's resolution.
   void set_use_burst_start_t2(bool enable) { this->use_burst_start_t2_ = enable; }
+  /// A/B: learn the T3 pre-correction from the measured Sn_CR = SEND instant (true) or
+  /// from the sendto() return duration (false, the original behaviour).
+  void set_use_hw_t3(bool enable) { this->use_hw_t3_ = enable; }
   bool get_use_early_t2() const { return this->use_early_t2_; }
 #endif
 
@@ -136,6 +139,7 @@ class NTPServer : public Component {
 
   volatile bool use_early_t2_{true};
   volatile bool use_burst_start_t2_{true};
+  volatile bool use_hw_t3_{true};
   /// Microseconds between the first SPI transaction of a receive burst and the
   /// Sn_RX_RSR read -- the T2 headroom still unclaimed after Step 3.
   /// (actual Sn_CR=SEND instant) - (predicted send_us_). Positive means we stamped T3
