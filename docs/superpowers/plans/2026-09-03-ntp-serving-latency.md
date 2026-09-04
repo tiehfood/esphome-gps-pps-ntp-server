@@ -21,32 +21,45 @@
 - `loop_interval_` (16 ms) is **not** exposed in ESPHome YAML. There is no configuration lever for loop latency.
 - **`SO_TIMESTAMP` does not exist in lwIP** — not behind a Kconfig, not in Espressif's fork, not upstream. Verified in `esp-lwip/src/api/sockets.c`: the complete `SO_*` list has no timestamping option, and `recvmsg()` only ever emits `IP_PKTINFO`. Do not go looking for it.
 
-## SOCKET-1 SPIKE — ANSWERED, NEGATIVE, CLOSED 2026-09-04 13:25
+## SOCKET-1 SPIKE — ANSWERED, POSITIVE, VIABLE 2026-09-04 13:45
 
 Question: does a UDP/123 frame land on socket 1, on MACRAW socket 0, or both?
-**Answer: socket 1 only — and opening socket 1 stops ALL networking.**
+**Answer: socket 1 only — and everything else keeps working.**
 
-| observation | result |
-|---|---|
-| socket 1 opens UDP:123 | SR = 0x22 (SOCK_UDP), RX buffer 2 KB |
-| does it receive? | YES — `Sn_RX_RSR` 0,56,112,…,616 in exact 56-byte steps (8 B W5500 UDP header + 48 B NTP), 11 packets |
-| NTP while open | **0/12 replies** |
-| TCP/80 while open | **000 — down too** |
-| after closing socket 1 | NTP 6/6, web 200, instantly |
+| experiment | NTP | web (TCP/80) |
+|---|---|---|
+| baseline | 5/5 | 200 200 200 |
+| poll only, socket 1 never opened | 12/12 | 200 |
+| socket 1 open on unused port 12345 | 12/12 | 200 |
+| …plus 12 UDP packets sent to 12345 | 10/10 | 200 |
+| **socket 1 open on port 123** | **0/8** | **200 200 200 before, 200 200 200 after** |
+| after closing socket 1 | restored | 200 |
 
-Ruled out: interrupt wedge. Run 1 unmasked socket 1 (`SIMR=0x03`) and I assumed
-level-triggered `INTn` stayed asserted because `emac_w5500` only clears socket 0's flags.
-Run 2 left `SIMR` at `0x01` and the network died identically. Not the cause. The mechanism
-is undetermined; the operational fact is not.
+`Sn_RX_RSR` grows in exact 56-byte steps (8-byte W5500 UDP header + 48-byte NTP payload),
+so the hardware socket receives NTP cleanly and completely.
 
-**Consequence.** A W5500 hardware UDP socket cannot coexist with the ESP-IDF MACRAW
-driver. Using one for NTP means driving the W5500 as its native hardware TCP/IP stack and
-giving up MACRAW/lwIP — and with them OTA, the API, and the web server. That is a
-different device, not an optimisation. The line is closed.
+**A W5500 hardware UDP socket coexists with the ESP-IDF MACRAW driver.** It intercepts
+only its bound port; MACRAW carries everything else untouched. That is precisely the
+property a hardware-path NTP server requires.
 
-**Safety note that made this affordable.** The probe now auto-closes socket 1 after 60 s.
-This spike previously cost three USB recoveries; with the dead-man timer it self-healed
-twice with no intervention. Every future W5500 register experiment gets one first.
+### Retracted: an earlier version of this section said the opposite
+
+It claimed opening socket 1 killed all networking and closed the line. That rested on two
+`web: 000` readings during the port-123 runs which were transient client-side failures and
+which I never retested. Three controls — poll-only, alt-port, alt-port-with-traffic — plus
+six web samples around a port-123 run refuted it. **A negative result resting on an
+untested incidental observation is not a result.**
+
+### What a hardware-path NTP server would now require
+
+1. Read the datagram from socket 1: 8-byte header (srcIP, srcPort, len) then payload.
+2. Build the NTP reply and send it back through socket 1's hardware UDP TX.
+3. Stamp T2 from socket 1's own arrival indication rather than the MACRAW path.
+4. Keep lwIP for OTA, API and web — they are unaffected, which is what makes this viable.
+
+Open question before committing: whether socket 1's arrival indication is materially
+earlier than the ~400 us already recovered via the MACRAW burst-start stamp. Worth
+measuring before building the send path.
 
 ---
 
