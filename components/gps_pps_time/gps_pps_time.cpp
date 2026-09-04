@@ -398,9 +398,14 @@ void GPSPPSTime::on_update(TinyGPSPlus &tiny_gps) {
                        now_tv.tv_usec / 1000;
     this->nmea_clock_delta_ms_ = static_cast<int32_t>(delta_ms);
     this->nmea_clock_delta_valid_ = true;
-    if (this->pps_synced_ && (delta_ms < -150 || delta_ms > 1150)) {
-      ESP_LOGW(TAG, "NMEA/clock delta %lld ms (expect 0..1000): epoch counter looks %+d s out",
-               (long long) delta_ms, static_cast<int>((delta_ms - 350) / 1000));
+    // A correct clock always puts this in [0, 1000): NMEA describes an edge that has
+    // already passed and arrives before the next one. That bound is physical, not
+    // calibrated -- do not retune it to an assumed parse delay. Measured here: ~73 ms,
+    // so both +/-1 s land far outside the guard band.
+    if (this->pps_synced_ && (delta_ms < -100 || delta_ms > 900)) {
+      int epoch_err_s = static_cast<int>(delta_ms >= 0 ? delta_ms / 1000 : (delta_ms - 999) / 1000);
+      ESP_LOGW(TAG, "NMEA/clock delta %lld ms (expect 0..1000): epoch counter is %+d s out",
+               (long long) delta_ms, epoch_err_s);
     }
   }
 
