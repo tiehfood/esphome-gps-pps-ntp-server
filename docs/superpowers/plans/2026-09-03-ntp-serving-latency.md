@@ -21,6 +21,35 @@
 - `loop_interval_` (16 ms) is **not** exposed in ESPHome YAML. There is no configuration lever for loop latency.
 - **`SO_TIMESTAMP` does not exist in lwIP** — not behind a Kconfig, not in Espressif's fork, not upstream. Verified in `esp-lwip/src/api/sockets.c`: the complete `SO_*` list has no timestamping option, and `recvmsg()` only ever emits `IP_PKTINFO`. Do not go looking for it.
 
+## SOCKET-1 SPIKE — ANSWERED, NEGATIVE, CLOSED 2026-09-04 13:25
+
+Question: does a UDP/123 frame land on socket 1, on MACRAW socket 0, or both?
+**Answer: socket 1 only — and opening socket 1 stops ALL networking.**
+
+| observation | result |
+|---|---|
+| socket 1 opens UDP:123 | SR = 0x22 (SOCK_UDP), RX buffer 2 KB |
+| does it receive? | YES — `Sn_RX_RSR` 0,56,112,…,616 in exact 56-byte steps (8 B W5500 UDP header + 48 B NTP), 11 packets |
+| NTP while open | **0/12 replies** |
+| TCP/80 while open | **000 — down too** |
+| after closing socket 1 | NTP 6/6, web 200, instantly |
+
+Ruled out: interrupt wedge. Run 1 unmasked socket 1 (`SIMR=0x03`) and I assumed
+level-triggered `INTn` stayed asserted because `emac_w5500` only clears socket 0's flags.
+Run 2 left `SIMR` at `0x01` and the network died identically. Not the cause. The mechanism
+is undetermined; the operational fact is not.
+
+**Consequence.** A W5500 hardware UDP socket cannot coexist with the ESP-IDF MACRAW
+driver. Using one for NTP means driving the W5500 as its native hardware TCP/IP stack and
+giving up MACRAW/lwIP — and with them OTA, the API, and the web server. That is a
+different device, not an optimisation. The line is closed.
+
+**Safety note that made this affordable.** The probe now auto-closes socket 1 after 60 s.
+This spike previously cost three USB recoveries; with the dead-man timer it self-healed
+twice with no intervention. Every future W5500 register experiment gets one first.
+
+---
+
 ## PHASE 3 COMPLETE — 2026-09-04 13:00
 
 | step | change | verified effect |
