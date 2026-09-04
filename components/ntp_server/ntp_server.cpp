@@ -295,7 +295,16 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
             }
           }
           if (self->use_early_t2_ && st.size_read_us != 0 && st.payloads_since_size_read == 1) {
-            int32_t gap = static_cast<int32_t>(static_cast<uint32_t>(t) - st.size_read_us);
+            uint32_t stamp = st.size_read_us;
+            // Earlier still: the interrupt-service transaction that opened this burst.
+            // Requires a plausible lead, so a stale or misdetected burst start cannot
+            // back-date T2 by an arbitrary amount.
+            if (self->use_burst_start_t2_ && st.burst_start_us != 0) {
+              int32_t lead = static_cast<int32_t>(st.size_read_us - st.burst_start_us);
+              if (lead > 0 && lead < 1000)
+                stamp = st.burst_start_us;
+            }
+            int32_t gap = static_cast<int32_t>(static_cast<uint32_t>(t) - stamp);
             if (gap > 0 && gap < 20000) {
               t2 = t - gap;
               self->last_rx_stamp_gap_us_ = gap;

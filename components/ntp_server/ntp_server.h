@@ -40,6 +40,11 @@ class NTPServer : public Component {
   /// the run-to-run network drift is larger than the effect, so the only way to measure
   /// it is to flip this between paired runs minutes apart and compare.
   void set_use_early_t2(bool enable) { this->use_early_t2_ = enable; }
+  /// Stamp T2 at the FIRST SPI transaction of the receive burst (the driver servicing the
+  /// W5500 interrupt) rather than at the Sn_RX_RSR read -- measured 114 us earlier again.
+  /// Only meaningful while use_early_t2_ is set. Separate switch so it can be A/B'd on
+  /// its own, since the expected effect (~57 us) is close to this path's resolution.
+  void set_use_burst_start_t2(bool enable) { this->use_burst_start_t2_ = enable; }
   bool get_use_early_t2() const { return this->use_early_t2_; }
 #endif
 
@@ -129,6 +134,7 @@ class NTPServer : public Component {
   void refresh_arp_entries_();
 
   volatile bool use_early_t2_{true};
+  volatile bool use_burst_start_t2_{false};
   /// Microseconds between the first SPI transaction of a receive burst and the
   /// Sn_RX_RSR read -- the T2 headroom still unclaimed after Step 3.
   volatile int32_t last_rx_burst_lead_us_{0};
