@@ -6,10 +6,11 @@ external_components:
       type: local
       path: components
 
-# RECOVERY BUILD: w5500_probe and the `ethernet` fork are disabled.
-# spi_bus_add_device() with the SAME spics_io_num as the ethernet driver's device
-# re-routes the CS pad to a different hardware CS signal, which kills the W5500's
-# chip select and takes the network down. Do not re-enable without fixing that.
+# The local `ethernet` component shadows ESPHome's built-in one. It is REQUIRED:
+# ntp_server's receive-timestamp hook needs get_eth_handle()/get_eth_netif() from it.
+# Only w5500_probe is inert -- it is not instantiated below. Do not re-enable it
+# without redesigning it: spi_bus_add_device() with the same spics_io_num as the
+# ethernet driver re-routes the CS pad and takes the network down.
 
 uart:
   id: gps_uart
