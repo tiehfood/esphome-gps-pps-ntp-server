@@ -252,7 +252,7 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
           // otherwise fall back to stamping here, which is never worse than before.
           int64_t t2 = t;
           ethernet::W5500RxStamps st = ethernet::w5500_rx_stamps();
-          if (st.size_read_us != 0 && st.payloads_since_size_read == 1) {
+          if (self->use_early_t2_ && st.size_read_us != 0 && st.payloads_since_size_read == 1) {
             int32_t gap = static_cast<int32_t>(static_cast<uint32_t>(t) - st.size_read_us);
             if (gap > 0 && gap < 20000) {
               t2 = t - gap;
