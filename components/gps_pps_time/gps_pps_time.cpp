@@ -28,6 +28,10 @@ namespace gps_pps_time {
 
 static const char *const TAG = "gps_pps_time";
 
+/// Consecutive NMEA sentences that must agree before stepping the clock a whole
+/// second. Guards against one glitched sentence causing the fault it prevents.
+static const int8_t EPOCH_FIX_STREAK = 3;
+
 void IRAM_ATTR GPSPPSTime::pps_isr(GPSPPSTime *self) {
   uint32_t now = micros();
 
@@ -402,10 +406,35 @@ void GPSPPSTime::on_update(TinyGPSPlus &tiny_gps) {
     // already passed and arrives before the next one. That bound is physical, not
     // calibrated -- do not retune it to an assumed parse delay. Measured here: ~73 ms,
     // so both +/-1 s land far outside the guard band.
-    if (this->pps_synced_ && (delta_ms < -100 || delta_ms > 900)) {
-      int epoch_err_s = static_cast<int>(delta_ms >= 0 ? delta_ms / 1000 : (delta_ms - 999) / 1000);
-      ESP_LOGW(TAG, "NMEA/clock delta %lld ms (expect 0..1000): epoch counter is %+d s out",
-               (long long) delta_ms, epoch_err_s);
+    int8_t epoch_err_s = 0;
+    if (delta_ms > 900)
+      epoch_err_s = static_cast<int8_t>((delta_ms + 500) / 1000);
+    else if (delta_ms < -100)
+      epoch_err_s = static_cast<int8_t>(-((-delta_ms + 500) / 1000));
+
+    if (!this->pps_synced_ || epoch_err_s == 0) {
+      this->epoch_error_streak_ = 0;
+    } else {
+      this->epoch_error_streak_ = (epoch_err_s == this->epoch_error_last_) ? this->epoch_error_streak_ + 1 : 1;
+      this->epoch_error_last_ = epoch_err_s;
+      ESP_LOGW(TAG, "NMEA/clock delta %lld ms: epoch %+d s out (%d/%d)", (long long) delta_ms, epoch_err_s,
+               this->epoch_error_streak_, EPOCH_FIX_STREAK);
+
+      if (this->epoch_error_streak_ >= EPOCH_FIX_STREAK) {
+        // Step the epoch counter and the system clock together so drift stays
+        // valid and PPS discipline continues from the corrected second.
+        this->last_gps_epoch_ -= epoch_err_s;
+        struct timeval fix_tv;
+        gettimeofday(&fix_tv, nullptr);
+        fix_tv.tv_sec -= epoch_err_s;
+        settimeofday(&fix_tv, nullptr);
+#ifdef USE_ESP_IDF
+        struct timeval zero_adj = {0, 0};
+        adjtime(&zero_adj, nullptr);
+#endif
+        ESP_LOGW(TAG, "Epoch corrected by %+d s from NMEA", -epoch_err_s);
+        this->epoch_error_streak_ = 0;
+      }
     }
   }
 

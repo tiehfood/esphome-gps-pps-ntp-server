@@ -61,6 +61,10 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   /// which last_drift_us_ cannot see, because drift is measured against that counter.
   int32_t nmea_clock_delta_ms_{0};
   bool nmea_clock_delta_valid_{false};
+  /// Consecutive NMEA updates agreeing on the same integer-second epoch error.
+  /// Requiring several stops a single glitched sentence from stepping the clock.
+  int8_t epoch_error_streak_{0};
+  int8_t epoch_error_last_{0};
 
   /// Pre-crash state from RTC NOINIT memory (populated in setup, published in first update)
   std::string crash_report_;
