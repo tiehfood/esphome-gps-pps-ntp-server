@@ -245,18 +245,27 @@ void NTPServer::recv_task_(void *param) {
     // transmit when the driver wrote Sn_CR = SEND. Measure how wrong the prediction was;
     // a non-zero mean here is a systematic, correctable error in every reply we serve.
     ethernet::W5500SendStamp after = ethernet::w5500_send_stamp();
+    bool learned_from_hardware = false;
     if (after.seq != before.seq) {
+      // Time from t0 to the Sn_CR = SEND write: when the chip was actually told to
+      // transmit. That is what T3 should predict -- NOT how long sendto() took to
+      // return, which is strictly later and made send_us_ over-predict by ~180 us,
+      // writing T3 that much too late on every reply.
       int32_t actual_us = static_cast<int32_t>(after.send_cmd_us - static_cast<uint32_t>(t0));
       if (actual_us > 0 && actual_us < SEND_US_MAX) {
         self->last_t3_error_us_ = actual_us - self->send_us_;
         self->t3_error_pending_ = true;
+        if (actual_us > SEND_US_MIN) {
+          self->send_us_ += (actual_us - self->send_us_) / 8;
+          learned_from_hardware = true;
+        }
       }
     }
 
-    // Only learn from sends that actually reached the wire. On an ARP miss lwIP
-    // queues the packet and returns immediately, which would drag the estimate
-    // down even though that packet departs late.
-    if (dur > SEND_US_MIN && dur < SEND_US_MAX)
+    // Fallback only: if the hardware stamp was unavailable this round, fall back to the
+    // sendto() duration. Same ARP-miss guard as before -- a queued packet returns
+    // immediately and would drag the estimate down even though it departs late.
+    if (!learned_from_hardware && dur > SEND_US_MIN && dur < SEND_US_MAX)
       self->send_us_ += (dur - self->send_us_) / 8;
   }
 }
