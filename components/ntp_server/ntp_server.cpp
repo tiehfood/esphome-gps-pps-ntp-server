@@ -164,6 +164,13 @@ void NTPServer::loop() {
       this->t3_error_sensor_->publish_state(err_us);
   }
 
+  if (this->int_lead_pending_) {
+    int32_t v = this->last_int_lead_us_;
+    this->int_lead_pending_ = false;
+    if (this->int_lead_sensor_ != nullptr)
+      this->int_lead_sensor_->publish_state(v);
+  }
+
   if (this->rx_burst_lead_pending_) {
     int32_t lead_us = this->last_rx_burst_lead_us_;
     this->rx_burst_lead_pending_ = false;
@@ -315,6 +322,17 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
           // otherwise fall back to stamping here, which is never worse than before.
           int64_t t2 = t;
           ethernet::W5500RxStamps st = ethernet::w5500_rx_stamps();
+          // The W5500 asserted INTn before any of this: hardware timestamp vs our stamp.
+          // This is the last unmeasured piece of T2 -- GPIO ISR plus driver task wake.
+          ethernet::W5500IntStamp ist = ethernet::w5500_int_stamp();
+          if (ist.seq != 0 && st.burst_start_us != 0) {
+            int32_t int_lead = static_cast<int32_t>(st.burst_start_us - ist.edge_us);
+            if (int_lead > 0 && int_lead < 20000) {
+              self->last_int_lead_us_ = int_lead;
+              self->int_lead_pending_ = true;
+            }
+          }
+
           // How much earlier still the burst began. This is the remaining T2 headroom
           // after Step 3 -- the driver touches SIR/Sn_IR before asking Sn_RX_RSR.
           if (st.burst_start_us != 0 && st.size_read_us != 0) {

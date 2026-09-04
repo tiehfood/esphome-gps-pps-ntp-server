@@ -5,6 +5,9 @@
 #include "ethernet_component.h"
 #include "esphome/core/application.h"
 #include "esphome/core/log.h"
+#if defined(USE_ESP32) && defined(CONFIG_SOC_MCPWM_SUPPORTED)
+#include <driver/mcpwm_cap.h>
+#endif
 #include "esphome/core/util.h"
 
 #ifdef USE_ESP32
@@ -321,6 +324,69 @@ esp_err_t w5500_shared_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void
 
 }  // namespace
 
+#if defined(USE_ESP32) && defined(CONFIG_SOC_MCPWM_SUPPORTED)
+// HARDWARE ARRIVAL TIMESTAMP.
+//
+// The W5500 asserts INTn the moment a frame is in its buffer. Everything we stamp today
+// happens later: GPIO ISR -> driver task wake -> first SPI transaction. MCPWM capture
+// records the edge in HARDWARE, so the gap to our burst-start stamp is the last
+// unmeasured piece of T2.
+//
+// This is safe to attach to the pin the ethernet driver already interrupts on:
+// mcpwm_new_capture_channel() only calls gpio_func_sel(PIN_FUNC_GPIO),
+// gpio_input_enable() and esp_rom_gpio_connect_in_signal() -- it never calls
+// gpio_config() and never touches intr_type. One pad can drive several peripheral
+// inputs through the GPIO matrix, so the driver's own GPIO interrupt is untouched.
+// NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
+volatile uint32_t g_w5500_int_edge_us = 0;
+volatile uint32_t g_w5500_int_edge_seq = 0;
+// NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
+
+static bool IRAM_ATTR w5500_int_capture_cb(mcpwm_cap_channel_handle_t chan,
+                                           const mcpwm_capture_event_data_t *edata, void *user) {
+  // ISR context: micros() maps to esp_timer_get_time(), which is IRAM_ATTR and lock-free.
+  // Nothing else is safe here -- see .claude/rules/firmware.md.
+  g_w5500_int_edge_us = micros();
+  g_w5500_int_edge_seq++;
+  return false;
+}
+
+W5500IntStamp w5500_int_stamp() { return {g_w5500_int_edge_us, g_w5500_int_edge_seq}; }
+
+void w5500_start_int_capture(int gpio_num) {
+  if (gpio_num < 0)
+    return;
+  mcpwm_cap_timer_handle_t timer = nullptr;
+  mcpwm_capture_timer_config_t tcfg = {};
+  tcfg.group_id = 0;
+  tcfg.clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT;
+  if (mcpwm_new_capture_timer(&tcfg, &timer) != ESP_OK) {
+    ESP_LOGW(TAG, "MCPWM capture timer unavailable; no hardware INT timestamp");
+    return;
+  }
+  mcpwm_cap_channel_handle_t chan = nullptr;
+  mcpwm_capture_channel_config_t ccfg = {};
+  ccfg.gpio_num = gpio_num;
+  ccfg.prescale = 1;
+  ccfg.flags.neg_edge = true;  // INTn is active low
+  ccfg.flags.pull_up = true;
+  if (mcpwm_new_capture_channel(timer, &ccfg, &chan) != ESP_OK) {
+    ESP_LOGW(TAG, "MCPWM capture channel on GPIO%d failed", gpio_num);
+    return;
+  }
+  mcpwm_capture_event_callbacks_t cbs = {};
+  cbs.on_cap = w5500_int_capture_cb;
+  mcpwm_capture_channel_register_event_callbacks(chan, &cbs, nullptr);
+  mcpwm_capture_channel_enable(chan);
+  mcpwm_capture_timer_enable(timer);
+  mcpwm_capture_timer_start(timer);
+  ESP_LOGI(TAG, "hardware INT capture armed on GPIO%d (MCPWM)", gpio_num);
+}
+#else
+W5500IntStamp w5500_int_stamp() { return {0, 0}; }
+void w5500_start_int_capture(int) {}
+#endif
+
 W5500SendStamp w5500_send_stamp() { return {g_w5500_send_cmd_us, g_w5500_send_cmd_seq}; }
 
 W5500RxStamps w5500_rx_stamps() {
@@ -580,6 +646,8 @@ void EthernetComponent::setup() {
 #endif /* USE_NETWORK_IPV6 */
 
   /* start Ethernet driver state machine */
+  w5500_start_int_capture(this->interrupt_pin_);
+
   err = esp_eth_start(this->eth_handle_);
   ESPHL_ERROR_CHECK(err, "ETH start error");
 }

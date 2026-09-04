@@ -36,6 +36,7 @@ class NTPServer : public Component {
   void set_arp_primes_sensor(sensor::Sensor *sensor) { this->arp_primes_sensor_ = sensor; }
   void set_rx_burst_lead_sensor(sensor::Sensor *sensor) { this->rx_burst_lead_sensor_ = sensor; }
   void set_t3_error_sensor(sensor::Sensor *sensor) { this->t3_error_sensor_ = sensor; }
+  void set_int_lead_sensor(sensor::Sensor *sensor) { this->int_lead_sensor_ = sensor; }
   /// A/B control for Phase 3 Step 3. Stamping T2 at the Sn_RX_RSR read moves it ~287 us
   /// earlier, which should cut client-visible offset by half that. Across a routed hop
   /// the run-to-run network drift is larger than the effect, so the only way to measure
@@ -144,6 +145,11 @@ class NTPServer : public Component {
   /// Sn_RX_RSR read -- the T2 headroom still unclaimed after Step 3.
   /// (actual Sn_CR=SEND instant) - (predicted send_us_). Positive means we stamped T3
   /// EARLIER than the packet really departed, i.e. we under-predict the send cost.
+  /// Microseconds from the hardware INTn edge to our burst-start T2 stamp: GPIO ISR
+  /// latency plus driver task wake. The last unclaimed part of T2.
+  volatile int32_t last_int_lead_us_{0};
+  volatile bool int_lead_pending_{false};
+  sensor::Sensor *int_lead_sensor_{nullptr};
   volatile int32_t last_t3_error_us_{0};
   volatile bool t3_error_pending_{false};
   sensor::Sensor *t3_error_sensor_{nullptr};

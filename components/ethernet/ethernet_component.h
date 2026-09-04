@@ -229,6 +229,16 @@ W5500RxStamps w5500_rx_stamps();
 
 /// micros() at the Sn_CR = SEND write for socket 0 -- when the chip was actually told to
 /// transmit -- plus a counter so a reader can tell a fresh stamp from a stale one.
+/// micros() taken in the MCPWM capture ISR for the W5500 INTn falling edge -- the chip's
+/// own "a frame is here" signal, timestamped in hardware rather than after the driver's
+/// ISR and task wake. seq lets a reader spot a stale stamp.
+struct W5500IntStamp {
+  uint32_t edge_us;
+  uint32_t seq;
+};
+W5500IntStamp w5500_int_stamp();
+void w5500_start_int_capture(int gpio_num);
+
 struct W5500SendStamp {
   uint32_t send_cmd_us;
   uint32_t seq;
