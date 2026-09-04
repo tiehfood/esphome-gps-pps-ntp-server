@@ -50,6 +50,11 @@ class NTPServer : public Component {
   /// A/B: learn the T3 pre-correction from the measured Sn_CR = SEND instant (true) or
   /// from the sendto() return duration (false, the original behaviour).
   void set_use_hw_t3(bool enable) { this->use_hw_t3_ = enable; }
+  /// A/B: use the MCPWM-captured INTn edge as T2 instead of the burst-start stamp.
+  /// Only ~21 us is available and INTLEVEL blanks re-assertion for 1.748 ms, so a missed
+  /// edge would otherwise give a STALE stamp. Guarded by consuming each capture exactly
+  /// once -- see use_int_edge_t2_ in eth_input_hook_.
+  void set_use_int_edge_t2(bool enable) { this->use_int_edge_t2_ = enable; }
   bool get_use_early_t2() const { return this->use_early_t2_; }
 #endif
 
@@ -141,6 +146,8 @@ class NTPServer : public Component {
   volatile bool use_early_t2_{true};
   volatile bool use_burst_start_t2_{true};
   volatile bool use_hw_t3_{true};
+  volatile bool use_int_edge_t2_{false};
+  volatile uint32_t int_edge_seq_used_{0};
   /// Microseconds between the first SPI transaction of a receive burst and the
   /// Sn_RX_RSR read -- the T2 headroom still unclaimed after Step 3.
   /// (actual Sn_CR=SEND instant) - (predicted send_us_). Positive means we stamped T3

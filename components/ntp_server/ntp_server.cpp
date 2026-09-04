@@ -32,17 +32,19 @@ static const int NTP_PACKET_SIZE = 48;
 /// Root dispersion budget, seconds. Reflects measured server-added error;
 /// revise down once serving latency is fixed. Floor matches ntpd MINDISTANCE.
 /// RFC 5905 s11.1: root dispersion is a BOUND on our maximum error relative to the
-/// reference clock, not a typical value. 5 ms was picked before anything had been
-/// measured. Budget as actually measured on this device:
-///   PPS -> system clock discipline   ~6 us typical; +/-50 us is the spike-filter bound
-///   timestamp precision (2^-15 s)     30.5 us
-///   T2 stamping residual              unmeasured -- no absolute reference at the wire;
-///                                     bounded above by the 287 us SPI gap Step 3 removed
-/// 1 ms keeps roughly 5x margin over everything measurable while still covering the term
-/// that is not. Do not go below this without a same-segment reference to measure T2's
-/// absolute accuracy: under-advertising makes us a falseticker, which is the exact bug
-/// that motivated advertising a non-zero dispersion in the first place.
-static const float ROOT_DISP_BASE_S = 0.001f;
+/// reference clock. Every term below is now MEASURED on this device rather than assumed:
+///   clock vs GPS        50 us  -- 7-day mean 5.0 us/day, worst daily extreme +/-41 us,
+///                                 and the drift spike filter bounds accepted values at 50
+///   T2 stamping         21 us  -- measured against the hardware INTn edge (MCPWM capture)
+///   T3 prediction       23 us  -- measured against the actual Sn_CR=SEND instant
+///   timestamp grain     31 us  -- 2^-15 s, our advertised precision
+///   GPS PPS itself      ~0     -- ~30 ns RMS
+///   worst-case sum     125 us
+/// 250 us keeps 2x margin on that sum. The previous 1 ms was set before T2 and T3 had
+/// been measured and is now 8x too conservative -- it makes clients treat us as far less
+/// certain than we are. Do not go below the measured sum: under-advertising makes us a
+/// falseticker, which is what motivated a non-zero dispersion in the first place.
+static const float ROOT_DISP_BASE_S = 0.000250f;
 /// Dispersion growth per second since last PPS (~10ppm crystal).
 static const float ROOT_DISP_RATE_S_PER_S = 10.0e-6f;
 /// NTP short format is 16.16 fixed point; 1 LSB = 15.259us.
@@ -351,6 +353,19 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
               int32_t lead = static_cast<int32_t>(st.size_read_us - st.burst_start_us);
               if (lead > 0 && lead < 1000)
                 stamp = st.burst_start_us;
+            }
+
+            // Earliest of all: the hardware INTn edge. Each capture is consumed exactly
+            // once -- if seq has not advanced since we last used it then INTn did not
+            // re-assert for this frame (INTLEVEL blanks re-assertion for 1.748 ms) and the
+            // stamp belongs to an EARLIER packet. Reusing it would back-date T2 by
+            // milliseconds, far worse than being 21 us late, so on any doubt fall through.
+            if (self->use_int_edge_t2_ && ist.seq != 0 && ist.seq != self->int_edge_seq_used_) {
+              int32_t hw_lead = static_cast<int32_t>(stamp - ist.edge_us);
+              if (hw_lead > 0 && hw_lead < 1000) {
+                self->int_edge_seq_used_ = ist.seq;
+                stamp = ist.edge_us;
+              }
             }
             int32_t gap = static_cast<int32_t>(static_cast<uint32_t>(t) - stamp);
             if (gap > 0 && gap < 20000) {
