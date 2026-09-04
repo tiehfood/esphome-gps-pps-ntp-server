@@ -21,6 +21,46 @@
 - `loop_interval_` (16 ms) is **not** exposed in ESPHome YAML. There is no configuration lever for loop latency.
 - **`SO_TIMESTAMP` does not exist in lwIP** — not behind a Kconfig, not in Espressif's fork, not upstream. Verified in `esp-lwip/src/api/sockets.c`: the complete `SO_*` list has no timestamping option, and `recvmsg()` only ever emits `IP_PKTINFO`. Do not go looking for it.
 
+## FINAL RESULTS — input-path hook flashed and measured 2026-09-04
+
+Regressing offset on delay separates our error from the network path. **The intercept
+(offset extrapolated to zero delay) is the device's own contribution.**
+
+| stage | n | slope | device residual |
+|---|---|---|---|
+| pre-everything (16 ms loop queueing) | 30 | 0.503 | — |
+| pre-hook (our task stamps T2) | 20 | 0.007 | **+659 µs** |
+| post-hook (eth driver stamps T2) | 60 | 0.456 | **+97 µs** |
+
+**The hook removed 562 µs of device-attributable error.** `NTP Hook Latency` reads
+**684 µs** — the gap between frame delivery and our task waking — and a one-sided T2
+shift of that costs half in offset, predicting 342 µs. Observed 562 µs, so the hook
+also removes part of the SPI read, not just task-wake latency.
+
+The slopes tell the story on their own: **0.503** is the q/2 queueing signature;
+**0.007** means offset had gone flat, decoupled from the path, because the residual was
+a fixed internal latency; **0.456** means what remains tracks the network again.
+
+Cumulative: device offset **~3,290 µs → ~97 µs (~34x)**, delay **8,502 → 847 µs**.
+
+**~97 µs is at or below what this path can resolve** — the Pi is a routed hop away and
+one-way is ~420 µs. Further optimisation is unverifiable without a host on the device's
+own subnet. Serving latency is done.
+
+### Constraint for whoever comes next
+
+**IRAM is at 100.0% (16,384 / 16,384 bytes, zero free.)** It links today. The next thing
+needing `IRAM_ATTR` fails at link time. On a project whose central bug was an ISR calling
+non-IRAM-safe code, know this before writing, not after.
+
+### Operational note
+
+`esphome logs ... | head -N` does NOT stop `esphome logs` — `head` exits, the producer
+keeps running and holds an API connection. Two such strays stalled an OTA for ~50 minutes.
+macOS has no `timeout`; use a background job with an explicit kill.
+
+---
+
 ## RESULTS — measured 2026-09-04 (wired Pi, `/root/ntp/ntp_probe.py`)
 
 Phases 1 and 2 plus step 9 are **flashed and verified end to end**.
