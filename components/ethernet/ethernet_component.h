@@ -1,20 +1,19 @@
 #pragma once
 
 // Local copy of ESPHome 2025.12.7's built-in `ethernet` component, overriding it via
-// external_components (same component name shadows the core one). Pinned so the
-// w5500_probe research spike (components/w5500_probe/) can reach the driver's
-// esp_eth_handle_t, and so it can perform its own register-level SPI access through
-// the SAME spi_device_handle_t the driver uses (see w5500_shared_spi() below) rather
-// than creating a second device. The only changes vs. upstream: a public
-// get_eth_handle() getter and, under USE_ETHERNET_SPI + CONFIG_ETH_SPI_ETHERNET_W5500,
-// a custom_spi_driver hook (in ethernet_component.cpp) that stashes the resulting SPI
-// handle + mutex for w5500_shared_spi() to return. Do not add anything else here —
-// keep diffs against upstream reviewable.
+// external_components (same component name shadows the core one). Two changes vs.
+// upstream, both needed for NTP timestamping:
+//   - a public get_eth_handle() getter, so ntp_server can install its receive-path hook
+//   - under USE_ETHERNET_SPI + CONFIG_ETH_SPI_ETHERNET_W5500, a custom_spi_driver hook
+//     (in ethernet_component.cpp) that makes every SPI transaction observable. T2 is
+//     stamped at the first transaction of a receive burst and T3 is checked against the
+//     Sn_CR = SEND write, neither of which is visible through the stock driver.
+// Do not add anything else here — keep diffs against upstream reviewable.
 //
 // IMPORTANT: there must be exactly one spi_device_handle_t for the W5500 in the whole
 // tree. A second spi_bus_add_device() call with the driver's own spics_io_num
 // re-routes the CS pad to a different hardware CS signal and takes the W5500 off the
-// network (cost one USB recovery during development — see w5500_probe.cpp).
+// network (this cost a USB recovery during development).
 
 #include "esphome/core/component.h"
 #include "esphome/core/defines.h"
@@ -120,9 +119,8 @@ class EthernetComponent : public Component {
   eth_speed_t get_link_speed();
   bool powerdown();
 
-  /// RESEARCH SPIKE hook (w5500_probe): the driver's handle, needed to esp_eth_stop()/
-  /// esp_eth_start() around a register rewrite. Do not call esp_eth_* teardown on this
-  /// from anywhere except the probe's own button-triggered flow.
+  /// The driver's handle, so ntp_server can install its receive-path hook via
+  /// esp_eth_update_input_path(). Never call esp_eth_* teardown on this.
   esp_eth_handle_t get_eth_handle() const { return this->eth_handle_; }
   /// NTP input-path hook: the esp_netif every received frame must be forwarded to via
   /// esp_netif_receive() by any replacement stack_input callback (esp_eth_update_input_path()).
@@ -159,8 +157,7 @@ class EthernetComponent : public Component {
   int clock_speed_;
   // Which SPI host setup() picked (SPI2_HOST on S3, SPI3_HOST elsewhere) — upstream
   // keeps this as a local in setup(); kept as a member only because it's convenient,
-  // not exposed outside this file (see w5500_shared_spi() for how the probe reaches
-  // the driver's SPI device instead).
+  // not exposed outside this file.
   spi_host_device_t spi_host_{SPI2_HOST};
 #ifdef USE_ETHERNET_SPI_POLLING_SUPPORT
   uint32_t polling_interval_{0};
@@ -206,12 +203,8 @@ class EthernetComponent : public Component {
 };
 
 #if defined(USE_ETHERNET_SPI) && CONFIG_ETH_SPI_ETHERNET_W5500
-/// The W5500 driver's own SPI device handle + its access mutex, populated by the
-/// custom_spi_driver hook in ethernet_component.cpp's setup(). This is how other
-/// components (w5500_probe) perform register-level access on the SAME spi_device_handle_t
-/// the driver uses, instead of calling spi_bus_add_device() a second time — see the
-/// warning at the top of this file for why that is unsafe.
-/// Both fields are null until EthernetComponent::setup() has run.
+/// Populated by the custom_spi_driver hook in ethernet_component.cpp's setup().
+/// Null until EthernetComponent::setup() has run.
 /// micros() stamps of the two earliest points in a W5500 frame receive: when the driver
 /// read Sn_RX_RSR, and when it began clocking the payload. Their difference is the SPI
 /// transfer cost that currently inflates NTP T2.
@@ -245,11 +238,6 @@ struct W5500SendStamp {
 };
 W5500SendStamp w5500_send_stamp();
 
-struct W5500SharedSpi {
-  spi_device_handle_t hdl{nullptr};
-  SemaphoreHandle_t lock{nullptr};
-};
-W5500SharedSpi w5500_shared_spi();
 #endif
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)

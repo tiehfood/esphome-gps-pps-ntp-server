@@ -8,11 +8,8 @@ external_components:
 
 # The local `ethernet` component shadows ESPHome's built-in one. It is REQUIRED:
 # ntp_server's receive-timestamp hook needs get_eth_handle()/get_eth_netif() from it,
-# and w5500_probe below shares its spi_device_handle_t via ethernet::w5500_shared_spi()
 # rather than creating a second SPI device (see components/ethernet/ethernet_component.h
-# and components/w5500_probe/ for why exactly one device must exist).
 #
-# id: added here (merges with config_example.yaml's pins/type) so w5500_probe can
 # reference this instance via `use_id`; config_example.yaml itself stays untouched.
 ethernet:
   id: eth_component
@@ -133,45 +130,3 @@ ntp_server:
     icon: "mdi:timer-sand"
     entity_category: "diagnostic"
 
-w5500_probe:
-  ethernet_id: eth_component
-  probe_button:
-    id: w5500_probe_button
-    name: "W5500 Probe: Open Socket 1"
-    entity_category: "diagnostic"
-  alt_port_button:
-    id: w5500_probe_alt_port_button
-    name: "W5500 Probe: Open Socket 1 (port 12345)"
-    entity_category: "diagnostic"
-  poll_only_button:
-    id: w5500_probe_poll_only_button
-    name: "W5500 Probe: Poll Only (control)"
-    entity_category: "diagnostic"
-  dump_config_button:
-    id: w5500_probe_dump_config
-    name: "W5500 Probe: Dump Config"
-    entity_category: "diagnostic"
-  simr_button:
-    id: w5500_probe_simr
-    name: "W5500 Probe: Open Socket 1 + SIMR"
-    entity_category: "diagnostic"
-  tcp_button:
-    id: w5500_probe_tcp
-    name: "W5500 Probe: Socket 1 TCP LISTEN (12345)"
-    entity_category: "diagnostic"
-  sustained_button:
-    id: w5500_probe_sustained
-    name: "W5500 Probe: Sustained 10min (port 123)"
-    entity_category: "diagnostic"
-  recover_button:
-    id: w5500_probe_recover_button
-    name: "W5500 Probe: Recover"
-    entity_category: "diagnostic"
-  rx_bytes:
-    id: w5500_probe_rx_bytes
-    name: "W5500 Probe RX Bytes"
-    entity_category: "diagnostic"
-  socket_status:
-    id: w5500_probe_socket_status
-    name: "W5500 Probe Socket Status"
-    entity_category: "diagnostic"

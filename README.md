@@ -83,17 +83,6 @@ What remains is roughly 60–100 µs of path asymmetry — the difference betwee
 return transit time. NTP cannot separate that from a genuine clock offset, and measuring
 below it requires a client on the same network segment.
 
-## Components
-
-- **`gps_pps_time`** — PPS-disciplined time source. The interrupt handler only reads
-  `micros()`; wall-clock time is reconstructed in the main loop and corrected with
-  `adjtime()` each second. Detects and corrects whole-second errors against NMEA.
-- **`ntp_server`** — RFC 5905 server on a dedicated core-1 task. Stamps T2 in the driver's
-  receive path, pre-corrects T3 from the measured transmit trigger, keeps client ARP entries
-  warm, and drops requests entirely while unsynchronised rather than serve a wrong time.
-- **`ethernet`** — fork of ESPHome's, supplying the custom SPI driver that the timestamping
-  depends on.
-
 ## Accuracy budget
 
 | Source | Magnitude | Handling |
@@ -123,3 +112,11 @@ own regression.
 source virtenv/bin/activate
 esphome compile ntp_server.yaml
 ```
+
+## Components
+
+| Component | Purpose |
+|---|---|
+| `gps_pps_time` | PPS-disciplined time source. The ISR only reads `micros()`; wall-clock time is reconstructed in the main loop and corrected with `adjtime()` each second. Detects and corrects whole-second errors against NMEA. |
+| `ntp_server` | RFC 5905 server on a dedicated core-1 task. Stamps T2 in the Ethernet driver's receive path, pre-corrects T3 from the measured transmit trigger, keeps client ARP entries warm, and drops requests while unsynchronised rather than serve a wrong time. |
+| `ethernet` | Fork of ESPHome's Ethernet component. Supplies the custom W5500 SPI driver that the T2/T3 timestamping depends on, and captures the W5500 interrupt edge in hardware via MCPWM. |
