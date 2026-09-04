@@ -214,7 +214,10 @@ source virtenv/bin/activate
 esphome compile ntp_server.yaml
 ```
 
-Temperature is handled implicitly: the crystal follows a parabola with its turnover near
-25 °C, drifting roughly 22 ppm at 50 °C against 10 ppm at 25 °C. The discipline loop simply
-measures whatever the drift currently is and corrects it, so no explicit temperature
-compensation is needed.
+Temperature is handled implicitly rather than modelled. The discipline loop measures
+whatever the drift currently is and corrects it every second, so no explicit compensation
+is needed — which is fortunate, because the textbook crystal curve does not match what this
+board actually does. Measured over seven days the residual drift is a steady **5 µs/s
+(5 ppm)**, while the board has only ever lived between 43 and 46 °C. That window is far too
+narrow to fit a temperature coefficient to, so any number quoted for behaviour at 0 °C or
+70 °C would be borrowed from a datasheet, not measured here.
