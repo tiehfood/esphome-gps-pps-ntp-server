@@ -6,27 +6,10 @@ external_components:
       type: local
       path: components
 
-# RESEARCH SPIKE (throwaway) -- see components/w5500_probe/w5500_probe.h and
-# docs/superpowers/plans/2026-09-03-ntp-serving-latency.md. Overrides the built-in
-# `ethernet` component (same name, shadowed via external_components) purely to expose
-# an id and a couple of getters that w5500_probe needs; behaviour is unchanged.
-ethernet:
-  id: eth_component
-
-w5500_probe:
-  ethernet_id: eth_component
-  probe_button:
-    name: "W5500 Probe: Run Sequence"
-    entity_category: "diagnostic"
-  recover_button:
-    name: "W5500 Probe: Recover"
-    entity_category: "diagnostic"
-  rx_bytes:
-    name: "W5500 Probe: Socket 1 RX Bytes"
-    entity_category: "diagnostic"
-  socket_status:
-    name: "W5500 Probe: Socket 1 Status"
-    entity_category: "diagnostic"
+# RECOVERY BUILD: w5500_probe and the `ethernet` fork are disabled.
+# spi_bus_add_device() with the SAME spics_io_num as the ethernet driver's device
+# re-routes the CS pad to a different hardware CS signal, which kills the W5500's
+# chip select and takes the network down. Do not re-enable without fixing that.
 
 uart:
   id: gps_uart
@@ -90,6 +73,14 @@ time:
       icon: "mdi:satellite-variant"
       accuracy_decimals: 0
       state_class: measurement
+    nmea_clock_delta:
+      id: nmea_clock_delta
+      name: "NMEA Clock Delta"
+      icon: "mdi:clock-alert"
+      unit_of_measurement: "ms"
+      accuracy_decimals: 0
+      state_class: measurement
+      entity_category: "diagnostic"
     crash_info:
       id: last_crash_info
       name: "Last Crash Info"

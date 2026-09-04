@@ -21,6 +21,7 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   void set_glonass_satellites_sensor(sensor::Sensor *sensor) { this->glonass_satellites_sensor_ = sensor; }
   void set_galileo_satellites_sensor(sensor::Sensor *sensor) { this->galileo_satellites_sensor_ = sensor; }
   void set_crash_info_sensor(text_sensor::TextSensor *sensor) { this->crash_info_sensor_ = sensor; }
+  void set_nmea_clock_delta_sensor(sensor::Sensor *sensor) { this->nmea_clock_delta_sensor_ = sensor; }
 
   void setup() override;
   void loop() override;
@@ -52,6 +53,14 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   sensor::Sensor *glonass_satellites_sensor_{nullptr};
   sensor::Sensor *galileo_satellites_sensor_{nullptr};
   text_sensor::TextSensor *crash_info_sensor_{nullptr};
+  sensor::Sensor *nmea_clock_delta_sensor_{nullptr};
+
+  /// System clock minus the NMEA epoch, ms. NMEA carries absolute time and always
+  /// arrives a sub-second delay AFTER the edge it describes, so a correct clock puts
+  /// this in (0, 1000). An integer-second value means the PPS epoch counter is off --
+  /// which last_drift_us_ cannot see, because drift is measured against that counter.
+  int32_t nmea_clock_delta_ms_{0};
+  bool nmea_clock_delta_valid_{false};
 
   /// Pre-crash state from RTC NOINIT memory (populated in setup, published in first update)
   std::string crash_report_;

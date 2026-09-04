@@ -387,6 +387,23 @@ void GPSPPSTime::on_update(TinyGPSPlus &tiny_gps) {
 
   this->gps_time_valid_ = true;
 
+  // Epoch sanity: compare the free-running clock against NMEA's absolute time.
+  // Expected range is (0, 1000) ms -- the NMEA parse delay. An integer-second
+  // excursion is a wrong PPS epoch counter, which drift reports as ~0 because it
+  // measures against that same counter.
+  {
+    struct timeval now_tv;
+    gettimeofday(&now_tv, nullptr);
+    int64_t delta_ms = (static_cast<int64_t>(now_tv.tv_sec) - static_cast<int64_t>(val.timestamp)) * 1000 +
+                       now_tv.tv_usec / 1000;
+    this->nmea_clock_delta_ms_ = static_cast<int32_t>(delta_ms);
+    this->nmea_clock_delta_valid_ = true;
+    if (this->pps_synced_ && (delta_ms < -150 || delta_ms > 1150)) {
+      ESP_LOGW(TAG, "NMEA/clock delta %lld ms (expect 0..1000): epoch counter looks %+d s out",
+               (long long) delta_ms, static_cast<int>((delta_ms - 350) / 1000));
+    }
+  }
+
   // Once PPS is synced, it manages the epoch counter via incrementing.
   // NMEA must not overwrite it, as stale timestamps would reset the counter backward.
   // Skip update when a PPS ISR is pending — prevents race where NMEA for the next
@@ -452,6 +469,10 @@ void GPSPPSTime::update() {
   }
   if (this->galileo_satellites_sensor_ != nullptr && this->ga_gsv_sats_ != nullptr && this->ga_gsv_sats_->isValid()) {
     this->galileo_satellites_sensor_->publish_state(this->last_galileo_sat_count_);
+  }
+
+  if (this->nmea_clock_delta_sensor_ != nullptr && this->nmea_clock_delta_valid_) {
+    this->nmea_clock_delta_sensor_->publish_state(static_cast<float>(this->nmea_clock_delta_ms_));
   }
 
   if (this->clock_offset_sensor_ != nullptr && this->pps_synced_) {
