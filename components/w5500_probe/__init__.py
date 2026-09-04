@@ -13,6 +13,8 @@ AUTO_LOAD = ["sensor", "text_sensor", "button"]
 CONF_ETHERNET_ID = "ethernet_id"
 CONF_PROBE_BUTTON = "probe_button"
 CONF_RECOVER_BUTTON = "recover_button"
+CONF_ALT_PORT_BUTTON = "alt_port_button"
+CONF_POLL_ONLY_BUTTON = "poll_only_button"
 CONF_RX_BYTES = "rx_bytes"
 CONF_SOCKET_STATUS = "socket_status"
 
@@ -23,6 +25,12 @@ ProbeButton = w5500_probe_ns.class_(
 )
 RecoverButton = w5500_probe_ns.class_(
     "RecoverButton", button.Button, cg.Parented.template(W5500Probe)
+)
+ProbeAltPortButton = w5500_probe_ns.class_(
+    "ProbeAltPortButton", button.Button, cg.Parented.template(W5500Probe)
+)
+ProbePollOnlyButton = w5500_probe_ns.class_(
+    "ProbePollOnlyButton", button.Button, cg.Parented.template(W5500Probe)
 )
 
 CONFIG_SCHEMA = cv.Schema(
@@ -35,6 +43,14 @@ CONFIG_SCHEMA = cv.Schema(
         ),
         cv.Optional(CONF_RECOVER_BUTTON): button.button_schema(
             RecoverButton,
+            icon="mdi:backup-restore",
+        ),
+        cv.Optional(CONF_ALT_PORT_BUTTON): button.button_schema(
+            ProbeAltPortButton,
+            icon="mdi:backup-restore",
+        ),
+        cv.Optional(CONF_POLL_ONLY_BUTTON): button.button_schema(
+            ProbePollOnlyButton,
             icon="mdi:backup-restore",
         ),
         cv.Optional(CONF_RX_BYTES): sensor.sensor_schema(
@@ -64,6 +80,16 @@ async def to_code(config):
         b = await button.new_button(probe_conf)
         await cg.register_parented(b, config[CONF_ID])
         cg.add(var.set_probe_button(b))
+
+    if alt_conf := config.get(CONF_ALT_PORT_BUTTON):
+        b = await button.new_button(alt_conf)
+        await cg.register_parented(b, config[CONF_ID])
+        cg.add(var.set_alt_port_button(b))
+
+    if poll_conf := config.get(CONF_POLL_ONLY_BUTTON):
+        b = await button.new_button(poll_conf)
+        await cg.register_parented(b, config[CONF_ID])
+        cg.add(var.set_poll_only_button(b))
 
     if recover_conf := config.get(CONF_RECOVER_BUTTON):
         b = await button.new_button(recover_conf)

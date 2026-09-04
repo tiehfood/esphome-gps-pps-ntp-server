@@ -151,12 +151,12 @@ uint16_t W5500Probe::spi_read_reg16_stable_(uint8_t block, uint16_t addr) {
   return prev;
 }
 
-void W5500Probe::run_probe_sequence() {
+void W5500Probe::run_probe_sequence(uint16_t port, bool open_socket) {
   if (this->ethernet_ == nullptr || ethernet::w5500_shared_spi().hdl == nullptr) {
     ESP_LOGE(TAG, "not set up, aborting probe");
     return;
   }
-  ESP_LOGI(TAG, "=== w5500_probe: opening socket 1 (RESEARCH SPIKE) ===");
+  ESP_LOGI(TAG, "=== w5500_probe: port=%u open_socket=%s (RESEARCH SPIKE) ===", port, YESNO(open_socket));
 
   // NO esp_eth_stop()/esp_eth_start() here, deliberately. An earlier revision did that
   // and the device never came back -- and because stop() drops the network first, we
@@ -165,6 +165,19 @@ void W5500Probe::run_probe_sequence() {
   // EthernetComponent::setup(), between esp_eth_driver_install() and esp_eth_start(),
   // which is the only point where W5500 buffer sizes may legally change. Everything
   // below only opens socket 1 and unmasks its interrupt; the network stays up.
+  this->socket_opened_ = open_socket;
+  if (!open_socket) {
+    // CONTROL: poll only. Socket 1 is never opened; the loop still does its 1 Hz register
+    // reads over the shared SPI bus. If networking dies anyway, the probe's own SPI
+    // traffic is the culprit and the socket is exonerated.
+    ESP_LOGI(TAG, "CONTROL: polling only, socket 1 NOT opened");
+    this->probing_active_ = true;
+    this->last_poll_ms_ = 0;
+    this->probe_started_ms_ = millis();
+    this->publish_status_("poll-only control");
+    return;
+  }
+
   uint8_t rxbuf1 = this->spi_read_reg_(socket_reg_block(1), REG_Sn_RXBUF_SIZE);
   if (rxbuf1 == 0) {
     ESP_LOGE(TAG, "socket 1 has no RX buffer (Sn_RXBUF_SIZE=0) -- the boot-time split in "
@@ -175,7 +188,7 @@ void W5500Probe::run_probe_sequence() {
   ESP_LOGI(TAG, "socket 1 RX buffer = %uKB", rxbuf1);
 
   this->spi_write_reg_(socket_reg_block(1), REG_Sn_MR, Sn_MR_UDP);
-  this->spi_write_reg16_(socket_reg_block(1), REG_Sn_PORT, 123);
+  this->spi_write_reg16_(socket_reg_block(1), REG_Sn_PORT, port);
   this->spi_write_reg_(socket_reg_block(1), REG_Sn_CR, Sn_CR_OPEN);
 
   uint32_t start = millis();
@@ -206,7 +219,7 @@ void W5500Probe::run_probe_sequence() {
   this->probing_active_ = true;
   this->last_poll_ms_ = 0;
   this->probe_started_ms_ = millis();
-  ESP_LOGI(TAG, "socket 1 open, UDP:123, SIMR left at 0x01 -- watch rx_bytes; send NTP now");
+  ESP_LOGI(TAG, "socket 1 open, UDP:%u, SIMR left at 0x01 -- watch rx_bytes", port);
   this->publish_status_("open, watching");
 }
 
@@ -248,7 +261,8 @@ void W5500Probe::recover() {
   // MACRAW -- and a reboot restores the driver's defaults regardless, since every W5500
   // register is volatile. Restarting ethernet from here is what previously bricked the
   // network with no telemetry to explain it.
-  this->spi_write_reg_(socket_reg_block(1), REG_Sn_CR, Sn_CR_CLOSE);
+  if (this->socket_opened_)
+    this->spi_write_reg_(socket_reg_block(1), REG_Sn_CR, Sn_CR_CLOSE);
   this->spi_write_reg_(BLOCK_COMMON, REG_SIMR, 0x01);
 
   ESP_LOGI(TAG, "recovered: socket 1 closed, SIMR back to socket 0 only; network untouched");

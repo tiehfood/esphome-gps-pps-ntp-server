@@ -34,6 +34,8 @@ class W5500Probe : public Component {
   void set_ethernet(ethernet::EthernetComponent *ethernet) { this->ethernet_ = ethernet; }
   void set_probe_button(button::Button *b) { this->probe_button_ = b; }
   void set_recover_button(button::Button *b) { this->recover_button_ = b; }
+  void set_alt_port_button(button::Button *b) { this->alt_port_button_ = b; }
+  void set_poll_only_button(button::Button *b) { this->poll_only_button_ = b; }
   void set_rx_bytes_sensor(sensor::Sensor *s) { this->rx_bytes_sensor_ = s; }
   void set_socket_status_sensor(text_sensor::TextSensor *s) { this->socket_status_sensor_ = s; }
 
@@ -46,7 +48,11 @@ class W5500Probe : public Component {
   float get_setup_priority() const override { return setup_priority::AFTER_CONNECTION; }
 
   /// Button-triggered: stop -> rewrite buffer split -> start -> open socket 1 UDP:123.
-  void run_probe_sequence();
+  void run_probe_sequence() { this->run_probe_sequence(123, true); }
+  /// port: UDP port to bind socket 1 to. open_socket: false runs the SPI polling
+  /// loop WITHOUT opening socket 1 at all -- the control for whether the probe's own
+  /// interleaved SPI traffic is what disturbs the driver.
+  void run_probe_sequence(uint16_t port, bool open_socket);
   /// Button-triggered: undo run_probe_sequence() without a power cycle.
   void recover();
 
@@ -70,6 +76,9 @@ class W5500Probe : public Component {
   ethernet::EthernetComponent *ethernet_{nullptr};
   button::Button *probe_button_{nullptr};
   button::Button *recover_button_{nullptr};
+  button::Button *alt_port_button_{nullptr};
+  button::Button *poll_only_button_{nullptr};
+  bool socket_opened_{false};
   sensor::Sensor *rx_bytes_sensor_{nullptr};
   text_sensor::TextSensor *socket_status_sensor_{nullptr};
 
@@ -84,7 +93,21 @@ class W5500Probe : public Component {
 
 class ProbeButton : public button::Button, public Parented<W5500Probe> {
  protected:
-  void press_action() override { this->parent_->run_probe_sequence(); }
+  void press_action() override { this->parent_->run_probe_sequence(123, true); }
+};
+
+/// CONTROL 1: bind socket 1 to a port nothing else uses. If MACRAW survives this but dies
+/// on 123, the interference is port-specific rather than "any open socket".
+class ProbeAltPortButton : public button::Button, public Parented<W5500Probe> {
+ protected:
+  void press_action() override { this->parent_->run_probe_sequence(12345, true); }
+};
+
+/// CONTROL 2: run only the 1 Hz register polling, never opening socket 1. If MACRAW dies
+/// here too, the probe's own SPI traffic is the cause and the socket is exonerated.
+class ProbePollOnlyButton : public button::Button, public Parented<W5500Probe> {
+ protected:
+  void press_action() override { this->parent_->run_probe_sequence(0, false); }
 };
 
 class RecoverButton : public button::Button, public Parented<W5500Probe> {
