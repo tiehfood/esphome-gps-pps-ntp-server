@@ -55,8 +55,14 @@ volatile uint32_t g_int_edge_us = 0;
 volatile uint32_t g_int_edge_seq = 0;
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
-/// Marks the start of a receive burst. Called on every transaction, read or write.
-inline void note_transaction() {
+/// Marks the start of a receive burst. READS ONLY -- deliberately.
+///
+/// Transmit writes must not touch this. If they do, the writes of one reply land within
+/// W5500_BURST_GAP_US of the next request's first read, that read stops looking like a new
+/// burst, and g_burst_start_us stays pointing at the previous exchange's TX. T2 is then
+/// back-dated to a stale timestamp: offset goes negative, rx_stamp_gap inflates, and the
+/// packet-size sweep slope rises because the error tracks how long the exchange took.
+inline void note_read_transaction() {
   const uint32_t now_us = micros();
   if (now_us - g_last_txn_us > W5500_BURST_GAP_US) {
     g_burst_start_us = now_us;
@@ -115,7 +121,6 @@ esp_err_t w5500_custom_spi_transfer(W5500CustomSpiContext *ctx, spi_transaction_
 
 esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, const void *data, uint32_t len) {
   auto *ctx = static_cast<W5500CustomSpiContext *>(spi_ctx);
-  note_transaction();
   // LOCAL DELTA: NTP T3. Stamp the instant the chip is told to transmit -- strictly earlier
   // than sendto() returns, which is what the estimate used to learn from and why T3 ran late.
   if (addr == W5500_CTRL_S0_REG_WRITE && cmd == W5500_REG_SN_CR && len == 1 && data != nullptr &&
@@ -133,7 +138,7 @@ esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, con
 
 esp_err_t w5500_custom_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void *data, uint32_t len) {
   auto *ctx = static_cast<W5500CustomSpiContext *>(spi_ctx);
-  note_transaction();
+  note_read_transaction();
   // LOCAL DELTA: NTP T2. The driver asks Sn_RX_RSR how much is waiting, then clocks the
   // payload out; stamping the former keeps the SPI transfer out of T2.
   if (addr == W5500_CTRL_S0_REG_READ && cmd == W5500_REG_SN_RX_RSR) {
