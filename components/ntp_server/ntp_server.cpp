@@ -181,13 +181,6 @@ void NTPServer::loop() {
       this->int_lead_sensor_->publish_state(v);
   }
 
-  if (this->rx_burst_lead_pending_) {
-    int32_t lead_us = this->last_rx_burst_lead_us_;
-    this->rx_burst_lead_pending_ = false;
-    if (this->rx_burst_lead_sensor_ != nullptr)
-      this->rx_burst_lead_sensor_->publish_state(lead_us);
-  }
-
   if (this->rx_stamp_gap_pending_) {
     int32_t gap_us = this->last_rx_stamp_gap_us_;
     this->rx_stamp_gap_pending_ = false;
@@ -272,13 +265,27 @@ void NTPServer::recv_task_(void *param) {
       if (actual_us > 0 && actual_us < SEND_US_MAX) {
         self->last_t3_error_us_ = actual_us - self->send_us_;
         self->t3_error_pending_ = true;
-        if (self->use_hw_t3_ && actual_us > SEND_US_MIN) {
-          int32_t innov = actual_us - self->send_us_;
-          if (innov > SEND_STEP_MAX_US)
-            innov = SEND_STEP_MAX_US;
-          else if (innov < -SEND_STEP_MAX_US)
-            innov = -SEND_STEP_MAX_US;
-          self->send_us_ += innov >> self->send_ewma_shift_;
+        if (actual_us > SEND_US_MIN) {
+          if (self->send_us_ == 0) {
+            // Cold start: seed from the first real measurement rather than creeping up
+            // from zero.
+            self->send_us_ = actual_us;
+            self->send_reject_run_ = 0;
+          } else {
+            const int32_t innov = actual_us - self->send_us_;
+            if (innov > -SEND_STEP_MAX_US && innov < SEND_STEP_MAX_US) {
+              self->send_us_ += innov >> SEND_EWMA_SHIFT;
+              self->send_reject_run_ = 0;
+            } else if (++self->send_reject_run_ >= SEND_RESEED_AFTER) {
+              // Several measurements in a row disagree with the estimate by more than an
+              // outlier ever should. The estimate is wrong, not the samples -- this is how
+              // a slow first request after boot, or a genuine change in the send path,
+              // gets corrected instead of persisting.
+              self->send_us_ = actual_us;
+              self->send_reject_run_ = 0;
+            }
+            // A single outlier is simply ignored: clamping would still drag the estimate.
+          }
           learned_from_hardware = true;
         }
       }
@@ -288,7 +295,7 @@ void NTPServer::recv_task_(void *param) {
     // sendto() duration. Same ARP-miss guard as before -- a queued packet returns
     // immediately and would drag the estimate down even though it departs late.
     if (!learned_from_hardware && dur > SEND_US_MIN && dur < SEND_US_MAX)
-      self->send_us_ += (dur - self->send_us_) >> self->send_ewma_shift_;
+      self->send_us_ += (dur - self->send_us_) >> SEND_EWMA_SHIFT;
   }
 }
 
@@ -348,38 +355,17 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
             }
           }
 
-          // How much earlier still the burst began. This is the remaining T2 headroom
-          // after Step 3 -- the driver touches SIR/Sn_IR before asking Sn_RX_RSR.
-          if (st.burst_start_us != 0 && st.size_read_us != 0) {
-            int32_t lead = static_cast<int32_t>(st.size_read_us - st.burst_start_us);
-            if (lead >= 0 && lead < 20000) {
-              self->last_rx_burst_lead_us_ = lead;
-              self->rx_burst_lead_pending_ = true;
-            }
-          }
-          if (self->use_early_t2_ && st.size_read_us != 0 && st.payloads_since_size_read == 1) {
+          if (st.size_read_us != 0 && st.payloads_since_size_read == 1) {
             uint32_t stamp = st.size_read_us;
             // Earlier still: the interrupt-service transaction that opened this burst.
             // Requires a plausible lead, so a stale or misdetected burst start cannot
             // back-date T2 by an arbitrary amount.
-            if (self->use_burst_start_t2_ && st.burst_start_us != 0) {
+            if (st.burst_start_us != 0) {
               int32_t lead = static_cast<int32_t>(st.size_read_us - st.burst_start_us);
               if (lead > 0 && lead < 1000)
                 stamp = st.burst_start_us;
             }
 
-            // Earliest of all: the hardware INTn edge. Each capture is consumed exactly
-            // once -- if seq has not advanced since we last used it then INTn did not
-            // re-assert for this frame (INTLEVEL blanks re-assertion for 1.748 ms) and the
-            // stamp belongs to an EARLIER packet. Reusing it would back-date T2 by
-            // milliseconds, far worse than being 21 us late, so on any doubt fall through.
-            if (self->use_int_edge_t2_ && ist.seq != 0 && ist.seq != self->int_edge_seq_used_) {
-              int32_t hw_lead = static_cast<int32_t>(stamp - ist.edge_us);
-              if (hw_lead > 0 && hw_lead < 1000) {
-                self->int_edge_seq_used_ = ist.seq;
-                stamp = ist.edge_us;
-              }
-            }
             int32_t gap = static_cast<int32_t>(static_cast<uint32_t>(t) - stamp);
             if (gap > 0 && gap < 20000) {
               t2 = t - gap;

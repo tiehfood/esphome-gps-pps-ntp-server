@@ -34,35 +34,8 @@ class NTPServer : public Component {
   void set_hook_latency_sensor(sensor::Sensor *sensor) { this->hook_latency_sensor_ = sensor; }
   void set_rx_stamp_gap_sensor(sensor::Sensor *sensor) { this->rx_stamp_gap_sensor_ = sensor; }
   void set_arp_primes_sensor(sensor::Sensor *sensor) { this->arp_primes_sensor_ = sensor; }
-  void set_rx_burst_lead_sensor(sensor::Sensor *sensor) { this->rx_burst_lead_sensor_ = sensor; }
   void set_t3_error_sensor(sensor::Sensor *sensor) { this->t3_error_sensor_ = sensor; }
   void set_int_lead_sensor(sensor::Sensor *sensor) { this->int_lead_sensor_ = sensor; }
-  /// A/B control for Phase 3 Step 3. Stamping T2 at the Sn_RX_RSR read moves it ~287 us
-  /// earlier, which should cut client-visible offset by half that. Across a routed hop
-  /// the run-to-run network drift is larger than the effect, so the only way to measure
-  /// it is to flip this between paired runs minutes apart and compare.
-  void set_use_early_t2(bool enable) { this->use_early_t2_ = enable; }
-  /// Stamp T2 at the FIRST SPI transaction of the receive burst (the driver servicing the
-  /// W5500 interrupt) rather than at the Sn_RX_RSR read -- measured 114 us earlier again.
-  /// Only meaningful while use_early_t2_ is set. Separate switch so it can be A/B'd on
-  /// its own, since the expected effect (~57 us) is close to this path's resolution.
-  void set_use_burst_start_t2(bool enable) { this->use_burst_start_t2_ = enable; }
-  /// A/B: learn the T3 pre-correction from the measured Sn_CR = SEND instant (true) or
-  /// from the sendto() return duration (false, the original behaviour).
-  void set_use_hw_t3(bool enable) { this->use_hw_t3_ = enable; }
-  /// A/B: use the MCPWM-captured INTn edge as T2 instead of the burst-start stamp.
-  /// Only ~21 us is available and INTLEVEL blanks re-assertion for 1.748 ms, so a missed
-  /// edge would otherwise give a STALE stamp. Guarded by consuming each capture exactly
-  /// once -- see use_int_edge_t2_ in eth_input_hook_.
-  void set_use_int_edge_t2(bool enable) { this->use_int_edge_t2_ = enable; }
-  /// EWMA smoothing for the T3 send-time estimate, as a right-shift: 3 = alpha 1/8.
-  /// Tunable because t3_error (prediction minus the measured transmit instant) is a
-  /// network-independent quality metric -- the best shift is the one that minimises its
-  /// spread, and that can be measured directly rather than guessed.
-  void set_send_ewma_shift(uint8_t shift) {
-    this->send_ewma_shift_ = (shift < 1) ? 1 : (shift > 8 ? 8 : shift);
-  }
-  bool get_use_early_t2() const { return this->use_early_t2_; }
 #endif
 
   void setup() override;
@@ -91,7 +64,17 @@ class NTPServer : public Component {
   /// spi_device_polling_transmit mean sendto() runs the SPI write inline, so the
   /// packet leaves this long after T3 is stamped. Added to T3 to compensate.
   int32_t send_us_{0};
-  volatile uint8_t send_ewma_shift_{3};
+  /// EWMA smoothing for the T3 send estimate, as a right-shift. 3 (alpha 1/8) measured
+  /// best: settled error RMS 9.85 us, against 11.12 at 1/4, 11.91 at 1/16 and 15.27 at
+  /// 1/64 where the slow filter lags into a +11 us bias.
+  static const uint8_t SEND_EWMA_SHIFT = 3;
+  /// Consecutive out-of-band measurements before the estimate is re-seeded. Clamping a
+  /// large innovation instead of rejecting it drags the estimate toward a bad sample, and
+  /// recovers at only SEND_STEP_MAX_US >> SHIFT = 12 us per request; a bad seed then
+  /// persists for hundreds of requests. Rejecting isolated outliers and re-seeding on a
+  /// sustained run recovers in a handful.
+  static const uint8_t SEND_RESEED_AFTER = 4;
+  uint8_t send_reject_run_{0};
 
   /// Dedicated FreeRTOS task blocked in recvfrom() -- stamps T2 on return instead of
   /// whenever ESPHome's shared loop next polls us. Runs for the component's lifetime;
@@ -151,13 +134,6 @@ class NTPServer : public Component {
   void note_arp_client_(uint32_t addr);
   void refresh_arp_entries_();
 
-  volatile bool use_early_t2_{true};
-  volatile bool use_burst_start_t2_{true};
-  volatile bool use_hw_t3_{true};
-  volatile bool use_int_edge_t2_{false};
-  volatile uint32_t int_edge_seq_used_{0};
-  /// Microseconds between the first SPI transaction of a receive burst and the
-  /// Sn_RX_RSR read -- the T2 headroom still unclaimed after Step 3.
   /// (actual Sn_CR=SEND instant) - (predicted send_us_). Positive means we stamped T3
   /// EARLIER than the packet really departed, i.e. we under-predict the send cost.
   /// Microseconds from the hardware INTn edge to our burst-start T2 stamp: GPIO ISR
@@ -168,9 +144,6 @@ class NTPServer : public Component {
   volatile int32_t last_t3_error_us_{0};
   volatile bool t3_error_pending_{false};
   sensor::Sensor *t3_error_sensor_{nullptr};
-  volatile int32_t last_rx_burst_lead_us_{0};
-  volatile bool rx_burst_lead_pending_{false};
-  sensor::Sensor *rx_burst_lead_sensor_{nullptr};
   volatile int32_t last_rx_stamp_gap_us_{0};
   volatile bool rx_stamp_gap_pending_{false};
   sensor::Sensor *rx_stamp_gap_sensor_{nullptr};

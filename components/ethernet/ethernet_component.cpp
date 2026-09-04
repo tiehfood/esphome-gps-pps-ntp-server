@@ -379,7 +379,7 @@ void EthernetComponent::setup() {
 
 #if CONFIG_ETH_SPI_ETHERNET_W5500
   eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(host, &devcfg);
-  // Share the resulting spi_device_handle_t with w5500_shared_spi() instead of letting
+  // Route the driver through our own SPI callbacks instead of letting
   // the driver create one we can't reach — see ethernet_component.h.
   w5500_config.custom_spi_driver.config = &w5500_config;
   w5500_config.custom_spi_driver.init = w5500_shared_spi_init;
