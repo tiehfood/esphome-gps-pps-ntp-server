@@ -21,6 +21,39 @@
 - `loop_interval_` (16 ms) is **not** exposed in ESPHome YAML. There is no configuration lever for loop latency.
 - **`SO_TIMESTAMP` does not exist in lwIP** — not behind a Kconfig, not in Espressif's fork, not upstream. Verified in `esp-lwip/src/api/sockets.c`: the complete `SO_*` list has no timestamping option, and `recvmsg()` only ever emits `IP_PKTINFO`. Do not go looking for it.
 
+## PHASE 3 COMPLETE — 2026-09-04 13:00
+
+| step | change | verified effect |
+|---|---|---|
+| 7 (plan #3) | T2 at the `Sn_RX_RSR` read | shift 287 us; **-222.3 +/- 21.0** (t -10.6) |
+| — | T2 at the receive burst's first SPI transaction | shift 115 us; **-53.2 +/- 18.6** (t -2.85), predicted -57.5 |
+| 8 | `INTn` ISR stamp | **superseded** by the input-path hook (-562 us, no wiring) |
+| 8b | seqlock | done |
+| 9 | T3 pre-correction EWMA | done |
+| 10 | ARP priming | counter 11 per 4 min -> 0 per 5 cycles |
+| 11 | honest root dispersion | 5 ms -> 1 ms, on the wire `0.000992 s` |
+
+Cumulative T2 stamping latency removed: **~400 us**. Root dispersion now bounds our error
+5x tighter while staying non-zero.
+
+### THE METHODOLOGY TRAP — read this before A/B-ing anything
+
+`delta = (T4-T1) - (T3-T2)`. Moving T2 earlier by X reduces the MEASURED DELAY by exactly
+X. **Delay is a post-treatment variable.** Regressing offset on delay with a treatment
+indicator therefore absorbs part of the effect being estimated.
+
+This nearly caused a working change to be discarded: the burst-start stamp first measured
+**-12.0 +/- 19.2 us (t = -0.62)** -- a clean null. Adding the known 115 us shift back to
+delay before fitting recovered **-53.2 +/- 18.6 us (t = -2.85)**, right on the predicted
+-57.5. The change was fine; the analysis was not.
+
+Rule: when A/B-ing anything that moves T2 or T3, either correct delay by the measured
+shift before using it as a covariate, or interleave many short blocks and compare raw
+means. And never compare unpaired runs on this path -- run-to-run delay drift alone moved
+offset by 143 us between two runs five minutes apart.
+
+---
+
 ## PHASE 3 STEP 3 — DONE AND VERIFIED 2026-09-04 12:20
 
 T2 is now stamped at the driver's `Sn_RX_RSR` read instead of in the input hook, i.e.
