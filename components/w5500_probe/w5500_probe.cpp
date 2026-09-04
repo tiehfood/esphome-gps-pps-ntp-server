@@ -153,7 +153,7 @@ void W5500Probe::run_probe_sequence() {
   // NO esp_eth_stop()/esp_eth_start() here, deliberately. An earlier revision did that
   // and the device never came back -- and because stop() drops the network first, we
   // lost the API connection and every log line at exactly the moment it failed, so the
-  // cause was unobservable. The 14KB/2KB buffer split now happens once at boot in
+  // cause was unobservable. The 8KB/2KB buffer split now happens once at boot in
   // EthernetComponent::setup(), between esp_eth_driver_install() and esp_eth_start(),
   // which is the only point where W5500 buffer sizes may legally change. Everything
   // below only opens socket 1 and unmasks its interrupt; the network stays up.
@@ -230,7 +230,7 @@ void W5500Probe::recover() {
   }
   // Close socket 1 and re-mask its interrupt. Deliberately does NOT touch the buffer
   // split or restart ethernet: buffer sizes may only change while sockets are closed,
-  // which is true exactly once, at boot. Socket 0 keeps its 14KB either way -- ample for
+  // which is true exactly once, at boot. Socket 0 keeps its 8KB either way -- ample for
   // MACRAW -- and a reboot restores the driver's defaults regardless, since every W5500
   // register is volatile. Restarting ethernet from here is what previously bricked the
   // network with no telemetry to explain it.

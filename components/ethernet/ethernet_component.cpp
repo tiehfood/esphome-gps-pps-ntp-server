@@ -101,6 +101,72 @@ static void w5500_reg_write8(uint8_t block, uint16_t addr, uint8_t value) {
   }
 }
 
+// Read one W5500 register through the shared handle. Only used to verify the writes
+// below actually took -- see w5500_apply_socket_buffer_split().
+static uint8_t w5500_reg_read8(uint8_t block, uint16_t addr) {
+  if (g_w5500_spi_hdl == nullptr || g_w5500_spi_lock == nullptr)
+    return 0xFF;
+  spi_transaction_t t = {};
+  t.flags = SPI_TRANS_USE_RXDATA;
+  t.cmd = addr;
+  t.addr = static_cast<uint8_t>(block << 3);  // control phase: BSB + RWB=read
+  t.length = 8;
+  uint8_t out = 0xFF;
+  if (xSemaphoreTake(g_w5500_spi_lock, pdMS_TO_TICKS(W5500_SPI_LOCK_TIMEOUT_MS)) == pdTRUE) {
+    if (spi_device_polling_transmit(g_w5500_spi_hdl, &t) == ESP_OK)
+      out = t.rx_data[0];
+    xSemaphoreGive(g_w5500_spi_lock);
+  }
+  return out;
+}
+
+// Socket register blocks: common = 0, socket n = (n*4)+1.
+static const uint8_t W5500_BLOCK_S0 = 1;
+static const uint8_t W5500_BLOCK_S1 = 5;
+static const uint16_t W5500_REG_RXBUF_SIZE = 0x001E;
+static const uint16_t W5500_REG_TXBUF_SIZE = 0x001F;
+
+// Reserve 2KB of the W5500's 16KB RX/TX for socket 1 so a hardware UDP listener can be
+// opened later without touching the network.
+//
+// Sn_RXBUF_SIZE / Sn_TXBUF_SIZE accept ONLY 0, 1, 2, 4, 8 or 16 (KB) -- powers of two,
+// summing to at most 16 per direction. An earlier revision wrote 14, which is not a legal
+// value: the allocation goes undefined, MACRAW stops receiving, and the board drops off
+// the network with no way back but USB. That cost three recoveries. 8 + 2 = 10KB here;
+// the remaining 6KB simply stays unallocated, and 8KB is still ~5 full frames of MACRAW.
+//
+// Every write is read back. If the chip does not report exactly what we asked for, we
+// restore the driver's own defaults (socket 0 = 16KB, socket 1 = 0) and report failure,
+// so a bad split degrades to "socket 1 unavailable" instead of "device needs USB".
+static bool w5500_apply_socket_buffer_split() {
+  struct RegWrite {
+    uint8_t block;
+    uint16_t reg;
+    uint8_t kb;
+  };
+  static const RegWrite WRITES[] = {
+      {W5500_BLOCK_S0, W5500_REG_RXBUF_SIZE, 8}, {W5500_BLOCK_S0, W5500_REG_TXBUF_SIZE, 8},
+      {W5500_BLOCK_S1, W5500_REG_RXBUF_SIZE, 2}, {W5500_BLOCK_S1, W5500_REG_TXBUF_SIZE, 2},
+  };
+
+  for (const auto &w : WRITES)
+    w5500_reg_write8(w.block, w.reg, w.kb);
+
+  for (const auto &w : WRITES) {
+    uint8_t got = w5500_reg_read8(w.block, w.reg);
+    if (got == w.kb)
+      continue;
+    ESP_LOGE(TAG, "W5500 buffer split rejected: block %u reg 0x%04X = %u, wanted %u -- reverting",
+             w.block, w.reg, got, w.kb);
+    w5500_reg_write8(W5500_BLOCK_S0, W5500_REG_RXBUF_SIZE, 16);
+    w5500_reg_write8(W5500_BLOCK_S0, W5500_REG_TXBUF_SIZE, 16);
+    w5500_reg_write8(W5500_BLOCK_S1, W5500_REG_RXBUF_SIZE, 0);
+    w5500_reg_write8(W5500_BLOCK_S1, W5500_REG_TXBUF_SIZE, 0);
+    return false;
+  }
+  return true;
+}
+
 void *w5500_shared_spi_init(const void *spi_config) {
   const auto *w5500_config = static_cast<const eth_w5500_config_t *>(spi_config);
   auto *spi = new EthSpiInfo();
@@ -387,23 +453,22 @@ void EthernetComponent::setup() {
   ESPHL_ERROR_CHECK(err, "ETH driver install error");
 
 #if CONFIG_ETH_SPI_ETHERNET_W5500
-  // RESEARCH: reserve 2KB of the W5500's 16KB RX/TX for socket 1, so a hardware UDP
-  // listener can be opened later WITHOUT touching the network.
+  // Split the W5500 socket buffers so socket 1 has room for a hardware UDP listener.
   //
   // This is the only safe moment: esp_eth_driver_install() has just run
-  // w5500_setup_default() (which gives socket 0 all 16KB and zeroes sockets 1-7), and
-  // esp_eth_start() -- which opens socket 0 -- has not run yet. W5500 buffer sizes must
-  // not change while a socket is open.
+  // w5500_setup_default() (socket 0 gets all 16KB, sockets 1-7 get zero), and
+  // esp_eth_start() -- which opens socket 0 -- has not run yet. Buffer sizes must not
+  // change while a socket is open, which is also why the probe never restarts ethernet:
+  // esp_eth_stop() drops the network, and with it the API connection and every log line,
+  // at exactly the moment something goes wrong.
   //
-  // Doing it here is what lets the probe avoid esp_eth_stop(): that call drops the
-  // network, and with it the API connection and every bit of telemetry, at exactly the
-  // moment something goes wrong. An earlier revision did that and cost a USB recovery.
+  // Failure here is not fatal: the split reverts itself and socket 1 stays unavailable.
   if (this->type_ == ETHERNET_TYPE_W5500) {
-    w5500_reg_write8(1, 0x001E, 14);  // Sn_RXBUF_SIZE(0) = 14KB
-    w5500_reg_write8(1, 0x001F, 14);  // Sn_TXBUF_SIZE(0) = 14KB
-    w5500_reg_write8(5, 0x001E, 2);   // Sn_RXBUF_SIZE(1) = 2KB
-    w5500_reg_write8(5, 0x001F, 2);   // Sn_TXBUF_SIZE(1) = 2KB
-    ESP_LOGD(TAG, "W5500 socket buffers split 14KB/2KB for socket 0/1");
+    if (w5500_apply_socket_buffer_split()) {
+      ESP_LOGD(TAG, "W5500 socket buffers: socket 0 = 8KB, socket 1 = 2KB (verified)");
+    } else {
+      ESP_LOGW(TAG, "W5500 socket buffers left at driver defaults; socket 1 unavailable");
+    }
   }
 #endif
 
