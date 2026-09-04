@@ -227,6 +227,14 @@ struct W5500RxStamps {
 };
 W5500RxStamps w5500_rx_stamps();
 
+/// micros() at the Sn_CR = SEND write for socket 0 -- when the chip was actually told to
+/// transmit -- plus a counter so a reader can tell a fresh stamp from a stale one.
+struct W5500SendStamp {
+  uint32_t send_cmd_us;
+  uint32_t seq;
+};
+W5500SendStamp w5500_send_stamp();
+
 struct W5500SharedSpi {
   spi_device_handle_t hdl{nullptr};
   SemaphoreHandle_t lock{nullptr};

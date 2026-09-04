@@ -15,6 +15,7 @@ CONF_HOOK_LATENCY = "hook_latency"
 CONF_RX_STAMP_GAP = "rx_stamp_gap"
 CONF_ARP_PRIMES = "arp_primes"
 CONF_RX_BURST_LEAD = "rx_burst_lead"
+CONF_T3_ERROR = "t3_error"
 
 gps_pps_time_ns = cg.esphome_ns.namespace("gps_pps_time")
 GPSPPSTime = gps_pps_time_ns.class_("GPSPPSTime", time_.RealTimeClock)
@@ -44,6 +45,12 @@ CONFIG_SCHEMA = cv.Schema(
             state_class=STATE_CLASS_MEASUREMENT,
         ),
         cv.Optional(CONF_RX_BURST_LEAD): sensor.sensor_schema(
+            unit_of_measurement="µs",
+            icon="mdi:timer-sand",
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+        cv.Optional(CONF_T3_ERROR): sensor.sensor_schema(
             unit_of_measurement="µs",
             icon="mdi:timer-sand",
             accuracy_decimals=0,
@@ -79,6 +86,10 @@ async def to_code(config):
     if rx_burst_lead_config := config.get(CONF_RX_BURST_LEAD):
         sens = await sensor.new_sensor(rx_burst_lead_config)
         cg.add(var.set_rx_burst_lead_sensor(sens))
+
+    if t3_error_config := config.get(CONF_T3_ERROR):
+        sens = await sensor.new_sensor(t3_error_config)
+        cg.add(var.set_t3_error_sensor(sens))
 
     if arp_primes_config := config.get(CONF_ARP_PRIMES):
         sens = await sensor.new_sensor(arp_primes_config)

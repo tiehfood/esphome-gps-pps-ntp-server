@@ -216,6 +216,14 @@ esp_err_t w5500_shared_spi_deinit(void *spi_ctx) {
   return ESP_OK;
 }
 
+/// micros() at the instant the driver writes Sn_CR = SEND for socket 0 -- the moment the
+/// W5500 is actually told to transmit. NTP's T3 is currently a PREDICTION (now + an EWMA
+/// of sendto() duration) that has never been checked against reality; this is the truth
+/// to check it against. Socket 0 register block is BSB=1, so a write carries control byte
+/// (1<<3)|0x04 = 0x0C, register Sn_CR = 0x0001, value SEND = 0x20.
+volatile uint32_t g_w5500_send_cmd_us = 0;
+volatile uint32_t g_w5500_send_cmd_seq = 0;
+
 esp_err_t w5500_shared_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, const void *value, uint32_t len) {
   auto *spi = static_cast<EthSpiInfo *>(spi_ctx);
   spi_transaction_t trans = {};
@@ -224,8 +232,18 @@ esp_err_t w5500_shared_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, con
   trans.length = 8 * len;
   trans.tx_buffer = value;
 
+  const bool is_send_cmd =
+      (addr == 0x0C && cmd == 0x0001 && len == 1 && value != nullptr &&
+       *static_cast<const uint8_t *>(value) == 0x20);
+
   esp_err_t ret = ESP_OK;
   if (xSemaphoreTake(spi->lock, pdMS_TO_TICKS(W5500_SPI_LOCK_TIMEOUT_MS)) == pdTRUE) {
+    if (is_send_cmd) {
+      // Stamp as close to the transmit trigger as possible: after the bus is ours, just
+      // before the command actually goes out.
+      g_w5500_send_cmd_us = micros();
+      g_w5500_send_cmd_seq++;
+    }
     if (spi_device_polling_transmit(spi->hdl, &trans) != ESP_OK) {
       ESP_LOGE(TAG, "W5500 SPI write failed");
       ret = ESP_FAIL;
@@ -302,6 +320,8 @@ esp_err_t w5500_shared_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void
 }
 
 }  // namespace
+
+W5500SendStamp w5500_send_stamp() { return {g_w5500_send_cmd_us, g_w5500_send_cmd_seq}; }
 
 W5500RxStamps w5500_rx_stamps() {
   return {g_w5500_rx_size_read_us, g_w5500_rx_payload_us, g_w5500_rx_payloads_since_size_read,

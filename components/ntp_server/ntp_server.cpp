@@ -157,6 +157,13 @@ void NTPServer::loop() {
       this->arp_primes_sensor_->publish_state(this->arp_primes_);
   }
 
+  if (this->t3_error_pending_) {
+    int32_t err_us = this->last_t3_error_us_;
+    this->t3_error_pending_ = false;
+    if (this->t3_error_sensor_ != nullptr)
+      this->t3_error_sensor_->publish_state(err_us);
+  }
+
   if (this->rx_burst_lead_pending_) {
     int32_t lead_us = this->last_rx_burst_lead_us_;
     this->rx_burst_lead_pending_ = false;
@@ -227,10 +234,24 @@ void NTPServer::recv_task_(void *param) {
 
     self->build_ntp_response_(buffer, response, receive_ts);
 
+    ethernet::W5500SendStamp before = ethernet::w5500_send_stamp();
     int64_t t0 = esp_timer_get_time();
     sendto(self->socket_fd_, response, NTP_PACKET_SIZE, 0,
            (struct sockaddr *) &client_addr, client_len);
-    int32_t dur = static_cast<int32_t>(esp_timer_get_time() - t0);
+    int64_t t_after = esp_timer_get_time();
+    int32_t dur = static_cast<int32_t>(t_after - t0);
+
+    // T3 was written as t0 + send_us_, a prediction. The W5500 was actually told to
+    // transmit when the driver wrote Sn_CR = SEND. Measure how wrong the prediction was;
+    // a non-zero mean here is a systematic, correctable error in every reply we serve.
+    ethernet::W5500SendStamp after = ethernet::w5500_send_stamp();
+    if (after.seq != before.seq) {
+      int32_t actual_us = static_cast<int32_t>(after.send_cmd_us - static_cast<uint32_t>(t0));
+      if (actual_us > 0 && actual_us < SEND_US_MAX) {
+        self->last_t3_error_us_ = actual_us - self->send_us_;
+        self->t3_error_pending_ = true;
+      }
+    }
 
     // Only learn from sends that actually reached the wire. On an ARP miss lwIP
     // queues the packet and returns immediately, which would drag the estimate
