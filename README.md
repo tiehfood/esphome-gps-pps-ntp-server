@@ -1,4 +1,4 @@
-# A Stratum-1 NTP Server That Was Right and Still Wrong
+# ESPHome GPS/PPS Stratum-1 NTP Server
 
 **Hardware**: Waveshare ESP32-S3-ETH + WD22UGRC (u-blox LEA-M8T) · **Framework**: ESPHome on ESP-IDF
 
@@ -8,154 +8,93 @@
 
 > –\> Printables on [MakerWorld](https://makerworld.com/de/models/2774039-gps-box-clock-esphome-gps-pps-ntp-server) :)
 
-The GPS module hands the ESP32 two things: the current time as text, and a wire that
-twitches once a second, exactly on the second. Discipline the system clock to that wire and
-you have a very good clock. Ours held **5 µs** against GPS, and kept holding it for a
-hundred days.
+A GPS module supplies UTC over NMEA and a 1 PPS pulse on a GPIO. The PPS edge disciplines
+the ESP32 system clock; an NTP server on the device serves that clock to the LAN.
 
-Then I measured what clients actually received. Every answer was **3.3 milliseconds** wrong.
+Clock accuracy is **~5 µs** against GPS, stable over 100 days. Client-visible accuracy is
+**~60–100 µs**, limited by network path asymmetry rather than by the device.
 
-## Why that is a correctness problem
+## The gap between clock accuracy and served accuracy
 
-An NTP exchange has four timestamps. The client notes when it sent (T1) and when the reply
-came back (T4). The server fills in when the request arrived (T2) and when the reply left
-(T3).
+These are not the same number, and the difference was originally 3.3 ms.
 
-The server's timestamps only have to be **honest, not fast**. A server that takes a full
-second to reply is fine, as long as T2 and T3 truthfully say when things happened — the
-client subtracts the server's own processing time and it cancels.
+An NTP exchange uses four timestamps: the client's send (T1) and receive (T4), the server's
+receive (T2) and transmit (T3). The server's timestamps need to be *accurate*, not early —
+however long the server takes between T2 and T3 cancels out in the client's calculation.
 
-What does not cancel is stamping at the wrong moment. If T2 claims a packet arrived later
-than it did, that error lands in the client's answer at half its size, and the round-trip
-measurement looks perfectly normal, so nothing downstream can detect or filter it.
+An error in *when* T2 or T3 is stamped does not cancel. It enters the client's computed
+offset at half its size, and the round-trip delay measurement is unaffected, so no client
+can detect or filter it. Serving latency is therefore a correctness problem, not a
+performance one.
 
-3.3 ms was not slowness. It was a silent, systematic lie.
+## Changes and measured effect
 
-## Out of the queue
+| Change | Effect |
+|---|---|
+| Serve from a dedicated FreeRTOS task instead of ESPHome's 16 ms main loop | −3,300 µs |
+| Stamp T2 in the Ethernet driver's receive path, before the network stack | 659 → 97 µs device residual |
+| Stamp T2 at the driver's `Sn_RX_RSR` read, before the SPI payload transfer | −107 … −222 µs |
+| Stamp T2 at the first SPI transaction of the receive burst | −53 ± 19 µs |
+| Learn the T3 pre-correction from the measured transmit trigger | −154 ± 20 µs |
+| Clamp how far one outlier can move the T3 estimate | removes a 156 µs step lasting 8 samples |
+| Prime ARP for recent clients | removes a rare stall between T2 and T3 |
+| Root dispersion from a measured budget (5 ms → 250 µs) | honest error bound |
+| Remove `gettimeofday()` from the PPS interrupt handler | ends 26 reboots per 149 days |
 
-The original code stamped T2 when ESPHome's main loop reached the component, and that loop
-sleeps out a 16 ms interval. Moving serving into its own FreeRTOS task, pinned to the second
-core, removed it:
+T3 is worth a note. It is a prediction — current time plus an estimate of the send cost —
+and the estimate originally learned from how long `sendto()` took to return. The packet is
+already in flight before that call returns, so the estimate ran long and every reply carried
+a T3 that was too late by roughly 180 µs. Because the custom SPI driver sees every
+transaction, the actual instant the chip is told to transmit is available, and the prediction
+error can be measured directly: it moved from a systematic −180 µs to zero ±23 µs.
 
-```
-                        slope    device error
-16 ms loop queueing     0.503    —
-own task                0.007    +659 µs
-```
+## Measurement notes
 
-That slope became the main instrument for everything after. Plot the client's offset against
-round-trip delay: if the error is packets waiting in a queue, offset rises with delay at
-exactly **half** the slope — a one-sided delay landing in a two-sided formula. 0.5 is a
-queue. Near zero means what remains is a fixed internal latency.
+These cost more time than the code did.
 
-## Stamp it where it arrives
+**Unpaired before/after comparisons are not evidence on a routed path.** Two runs five
+minutes apart differed by 143 µs from network conditions alone. Every change above is
+switchable at runtime so it can be measured in interleaved blocks.
 
-659 µs is the distance between a frame landing in the Ethernet chip and our task waking to
-look at it. That has to be stamped earlier, not scheduled away.
+**Delay is downstream of the change.** Regressing offset on delay looks like the right way
+to control for network conditions, but delay is computed from T2 and T3 — controlling for it
+absorbs part of the effect. One change measured as −12 ± 19 µs (indistinguishable from
+nothing) was −53 ± 19 µs once the known timestamp shift was added back before fitting.
 
-ESP-IDF lets you hook the Ethernet driver's receive path, before the frame reaches the
-network stack. That took the device error from **659 µs to 97 µs**. But the driver doesn't
-know a frame arrived either — it finds out by reading a register over SPI, then spends time
-clocking the payload across that same bus. Since we supply the SPI driver, we can watch
-every transaction and stamp the first one of a receive burst.
+**Tuning found the existing value was already correct.** Sweeping the T3 filter's smoothing
+rate gave a settled error RMS of 9.85 µs at the default, against 11.12, 11.91 and 15.27 at
+other rates. The weakness was not the rate but a single 1251 µs outlier that shifted the
+estimate by 156 µs.
 
-| stamp moved to | how much earlier | client offset |
-|---|---|---|
-| the "how much is waiting?" register read | 287 µs | −107 … −222 µs |
-| the first SPI transaction of the burst | 115 µs | −53 ± 19 µs |
+## Bounds on the remaining error
 
-## The half nobody had checked
+Three checks, none of which depend on the network behaving:
 
-T2 got all the attention, because T2 was the half we had instrumented. T3 was a
-*prediction*: current time plus an estimate of how long sending takes.
+- **Hardware reference.** The W5500 asserts an interrupt when a frame lands, and MCPWM
+  capture timestamps that edge in hardware — on the same pin the Ethernet driver already
+  uses, since the pin matrix allows both. The gap to our own stamp is 21 µs. Using the
+  hardware edge as T2 measures +1.4 ± 14 µs, i.e. no gain, so it stays off as a diagnostic.
+- **Packet-size sweep.** From 48 to 1400 byte requests, offset grows 90 ns/byte. Two
+  store-and-forward hops of wire time predict 80 ns/byte; SPI payload time leaking into T2
+  would give 240 or more.
+- **T3 prediction error** sits on zero.
 
-The estimate learned from how long `sendto()` took to return — which is wrong, because the
-packet is already on its way before that call comes back. It was systematically too long, so
-**every reply carried a T3 that was too late.**
+What remains is roughly 60–100 µs of path asymmetry — the difference between outbound and
+return transit time. NTP cannot separate that from a genuine clock offset, and measuring
+below it requires a client on the same network segment.
 
-We could see it, because we watch the SPI bus: there is an exact instant where the driver
-tells the chip to transmit.
+## Components
 
-```
-before:  drifts from +63 µs to −430 µs, settling near −180 µs   ← a bias, not noise
-after:   sits on zero, ±23 µs
-```
+- **`gps_pps_time`** — PPS-disciplined time source. The interrupt handler only reads
+  `micros()`; wall-clock time is reconstructed in the main loop and corrected with
+  `adjtime()` each second. Detects and corrects whole-second errors against NMEA.
+- **`ntp_server`** — RFC 5905 server on a dedicated core-1 task. Stamps T2 in the driver's
+  receive path, pre-corrects T3 from the measured transmit trigger, keeps client ARP entries
+  warm, and drops requests entirely while unsynchronised rather than serve a wrong time.
+- **`ethernet`** — fork of ESPHome's, supplying the custom SPI driver that the timestamping
+  depends on.
 
-That measurement needs no network at all — it is the device checking its own homework.
-Fixing it was worth about **−154 µs** to clients, the largest single win of the project,
-hiding in the half nobody had looked at.
-
-## Not fooling yourself
-
-Twice I nearly shipped a wrong conclusion, and both times the mistake was in the
-measurement, not the code.
-
-**Run-to-run comparison is worthless here.** Two measurements five minutes apart differed by
-143 µs from network conditions alone. Anything smaller is invisible unless you flip the
-change back and forth and compare paired blocks. Every change above has a runtime switch for
-exactly that.
-
-**The obvious statistical fix is a trap.** The natural move is to regress offset on delay to
-control for conditions. But moving T2 also changes the measured delay — delay is *computed
-from* T2. Controlling for something downstream of your change quietly removes part of the
-effect. One change first measured as a clean null (−12 ± 19 µs) was really worth −53 ± 19 µs
-once the known shift was added back before fitting.
-
-The same discipline applies to tuning. Sweeping the T3 filter's smoothing rate against its
-own error showed the existing setting was already the best of four — the weakness was not the
-rate but a single 1251 µs outlier that shifted the estimate by 156 µs and took eight samples
-to decay. Clamping how far one sample may move the estimate fixed the real problem.
-
-## The limit
-
-The W5500 pulls an interrupt line low the instant a frame lands, and the ESP32-S3 can
-timestamp a pin change in hardware. Its pin matrix even lets a second peripheral watch a pin
-that already has an interrupt on it, so this can be measured without disturbing anything.
-
-The gap between the chip's own "frame is here" signal and our stamp is **21 µs**. Wired up
-behind a switch and measured properly, using it as T2 is worth **+1.4 ± 14 µs** — a wash.
-So it stays off, but the measurement is the point: it is the first hardware-referenced bound
-on how honest T2 is. Two other checks agree, neither depending on a well-behaved network:
-
-- Sweeping request size from 48 to 1400 bytes, offset grows **90 ns per byte**. Pure wire
-  time across two store-and-forward hops predicts 80. Any SPI payload read still leaking
-  into T2 would make it 240 or worse.
-- The T3 prediction error sits on zero.
-
-The timestamps are as honest as this hardware can make them.
-
-## Where it ended up
-
-| | before | after |
-|---|---|---|
-| Client-visible offset | +3,286 µs | **+63 … +105 µs** |
-| Round-trip delay | 8,502 µs | ~580 µs |
-| Clock vs GPS | 5 µs | 5 µs |
-
-The clock never changed. It was always the good part.
-
-What remains is roughly 60–100 µs, most of it probably not ours: path asymmetry, the small
-difference between how long a packet takes to travel out versus back. NTP cannot separate
-that from a real clock offset, and neither can we while the measuring machine sits a router
-hop away. Going below 100 µs honestly needs a client on the same segment — equipment, not
-code.
-
-The server also stopped rebooting along the way. Twenty-six unexplained restarts over 149
-days turned out to be one function call in an interrupt handler that takes a lock.
-
----
-
-## Practical notes
-
-**Components** — `gps_pps_time` disciplines the clock from the PPS edge (the interrupt only
-reads `micros()`; wall-clock time is reconstructed in the main loop) and self-corrects
-whole-second errors against NMEA. `ntp_server` serves RFC 5905 from a dedicated core-1 task,
-stamps T2 in the Ethernet driver's receive path, pre-corrects T3 from the measured transmit
-trigger, keeps client ARP entries warm, and refuses to answer at all when unsynchronised
-rather than serve a wrong time. `ethernet` is a fork of ESPHome's that supplies the custom
-SPI driver the timing work depends on.
-
-**Accuracy budget**
+## Accuracy budget
 
 | Source | Magnitude | Handling |
 |---|---|---|
@@ -165,22 +104,22 @@ SPI driver the timing work depends on.
 | Antenna cable delay | ~5 ns/m | compensated via UBX-CFG-TP5 |
 | GPS PPS itself | ~30 ns RMS | the reference |
 
-Clock accuracy is **~5 µs**, measured over 100 days, and does not accumulate. The advertised
-root dispersion is 250 µs, built from those measured terms rather than a guess: clock 50,
-T2 stamping 21, T3 prediction 23, timestamp granularity 31.
+Advertised root dispersion is 250 µs, summed from measured terms: clock 50, T2 stamping 21,
+T3 prediction 23, timestamp granularity 31.
 
-**Diagnostics** — `t3_error` should sit on zero, `int_lead` near 20 µs, `arp_primes` silent.
-Each is a regression that announces itself.
+Temperature is not modelled. The loop measures whatever the drift currently is and corrects
+it each second. The residual is a steady 5 µs/s over seven days, but the board has only run
+between 43 and 46 °C — too narrow to fit a temperature coefficient, so any figure for 0 °C
+or 70 °C would come from a datasheet, not from this device.
 
-**Building**
+## Diagnostics
+
+`t3_error` should sit at zero, `int_lead` near 20 µs, `arp_primes` silent. Each reports its
+own regression.
+
+## Building
 
 ```bash
 source virtenv/bin/activate
 esphome compile ntp_server.yaml
 ```
-
-Temperature is handled implicitly rather than modelled: the loop measures whatever the drift
-currently is and corrects it every second. Over seven days the residual is a steady 5 µs/s
-while the board has only ever lived between 43 and 46 °C — far too narrow a window to fit a
-temperature coefficient to, so any figure quoted for 0 °C or 70 °C would be borrowed from a
-datasheet rather than measured here.
