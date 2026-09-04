@@ -249,6 +249,12 @@ volatile uint32_t g_w5500_rx_payload_us = 0;
 /// one "how much is waiting?" answer; only when this is 1 does the Sn_RX_RSR stamp belong
 /// to the frame now being delivered.
 volatile uint32_t g_w5500_rx_payloads_since_size_read = 0;
+/// First SPI transaction of a receive burst. The driver's RX task wakes on the W5500
+/// INT and touches SIR/Sn_IR before it ever asks Sn_RX_RSR how much is waiting, so this
+/// is earlier still. The distance to the Sn_RX_RSR stamp bounds what remains recoverable
+/// in T2 after Step 3.
+volatile uint32_t g_w5500_burst_start_us = 0;
+volatile uint32_t g_w5500_last_txn_us = 0;
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
 esp_err_t w5500_shared_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void *value, uint32_t len) {
@@ -261,6 +267,15 @@ esp_err_t w5500_shared_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void
   trans.addr = addr;
   trans.length = 8 * len;
   trans.rx_buffer = value;
+
+  {
+    const uint32_t now_us = micros();
+    // >500us of SPI silence means the previous burst ended and this transaction is the
+    // first of a new one. Normal intra-burst spacing is a few microseconds.
+    if (now_us - g_w5500_last_txn_us > 500)
+      g_w5500_burst_start_us = now_us;
+    g_w5500_last_txn_us = now_us;
+  }
 
   if (addr == 0x08 && cmd == 0x0026) {
     g_w5500_rx_size_read_us = micros();  // driver is asking "how much is waiting?"
@@ -289,7 +304,8 @@ esp_err_t w5500_shared_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void
 }  // namespace
 
 W5500RxStamps w5500_rx_stamps() {
-  return {g_w5500_rx_size_read_us, g_w5500_rx_payload_us, g_w5500_rx_payloads_since_size_read};
+  return {g_w5500_rx_size_read_us, g_w5500_rx_payload_us, g_w5500_rx_payloads_since_size_read,
+          g_w5500_burst_start_us};
 }
 
 W5500SharedSpi w5500_shared_spi() { return {g_w5500_spi_hdl, g_w5500_spi_lock}; }

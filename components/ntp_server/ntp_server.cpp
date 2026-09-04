@@ -31,7 +31,18 @@ static const int NTP_PACKET_SIZE = 48;
 
 /// Root dispersion budget, seconds. Reflects measured server-added error;
 /// revise down once serving latency is fixed. Floor matches ntpd MINDISTANCE.
-static const float ROOT_DISP_BASE_S = 0.005f;
+/// RFC 5905 s11.1: root dispersion is a BOUND on our maximum error relative to the
+/// reference clock, not a typical value. 5 ms was picked before anything had been
+/// measured. Budget as actually measured on this device:
+///   PPS -> system clock discipline   ~6 us typical; +/-50 us is the spike-filter bound
+///   timestamp precision (2^-15 s)     30.5 us
+///   T2 stamping residual              unmeasured -- no absolute reference at the wire;
+///                                     bounded above by the 287 us SPI gap Step 3 removed
+/// 1 ms keeps roughly 5x margin over everything measurable while still covering the term
+/// that is not. Do not go below this without a same-segment reference to measure T2's
+/// absolute accuracy: under-advertising makes us a falseticker, which is the exact bug
+/// that motivated advertising a non-zero dispersion in the first place.
+static const float ROOT_DISP_BASE_S = 0.001f;
 /// Dispersion growth per second since last PPS (~10ppm crystal).
 static const float ROOT_DISP_RATE_S_PER_S = 10.0e-6f;
 /// NTP short format is 16.16 fixed point; 1 LSB = 15.259us.
@@ -144,6 +155,13 @@ void NTPServer::loop() {
     this->arp_primes_pending_ = false;
     if (this->arp_primes_sensor_ != nullptr)
       this->arp_primes_sensor_->publish_state(this->arp_primes_);
+  }
+
+  if (this->rx_burst_lead_pending_) {
+    int32_t lead_us = this->last_rx_burst_lead_us_;
+    this->rx_burst_lead_pending_ = false;
+    if (this->rx_burst_lead_sensor_ != nullptr)
+      this->rx_burst_lead_sensor_->publish_state(lead_us);
   }
 
   if (this->rx_stamp_gap_pending_) {
@@ -267,6 +285,15 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
           // otherwise fall back to stamping here, which is never worse than before.
           int64_t t2 = t;
           ethernet::W5500RxStamps st = ethernet::w5500_rx_stamps();
+          // How much earlier still the burst began. This is the remaining T2 headroom
+          // after Step 3 -- the driver touches SIR/Sn_IR before asking Sn_RX_RSR.
+          if (st.burst_start_us != 0 && st.size_read_us != 0) {
+            int32_t lead = static_cast<int32_t>(st.size_read_us - st.burst_start_us);
+            if (lead >= 0 && lead < 20000) {
+              self->last_rx_burst_lead_us_ = lead;
+              self->rx_burst_lead_pending_ = true;
+            }
+          }
           if (self->use_early_t2_ && st.size_read_us != 0 && st.payloads_since_size_read == 1) {
             int32_t gap = static_cast<int32_t>(static_cast<uint32_t>(t) - st.size_read_us);
             if (gap > 0 && gap < 20000) {

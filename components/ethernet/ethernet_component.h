@@ -222,6 +222,8 @@ struct W5500RxStamps {
   /// Greater than 1 means the driver drained several frames from one Sn_RX_RSR read,
   /// and the stamp is too early for all but the first.
   uint32_t payloads_since_size_read;
+  /// First SPI transaction of this receive burst -- earlier than the Sn_RX_RSR read.
+  uint32_t burst_start_us;
 };
 W5500RxStamps w5500_rx_stamps();
 

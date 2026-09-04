@@ -34,6 +34,7 @@ class NTPServer : public Component {
   void set_hook_latency_sensor(sensor::Sensor *sensor) { this->hook_latency_sensor_ = sensor; }
   void set_rx_stamp_gap_sensor(sensor::Sensor *sensor) { this->rx_stamp_gap_sensor_ = sensor; }
   void set_arp_primes_sensor(sensor::Sensor *sensor) { this->arp_primes_sensor_ = sensor; }
+  void set_rx_burst_lead_sensor(sensor::Sensor *sensor) { this->rx_burst_lead_sensor_ = sensor; }
   /// A/B control for Phase 3 Step 3. Stamping T2 at the Sn_RX_RSR read moves it ~287 us
   /// earlier, which should cut client-visible offset by half that. Across a routed hop
   /// the run-to-run network drift is larger than the effect, so the only way to measure
@@ -128,6 +129,11 @@ class NTPServer : public Component {
   void refresh_arp_entries_();
 
   volatile bool use_early_t2_{true};
+  /// Microseconds between the first SPI transaction of a receive burst and the
+  /// Sn_RX_RSR read -- the T2 headroom still unclaimed after Step 3.
+  volatile int32_t last_rx_burst_lead_us_{0};
+  volatile bool rx_burst_lead_pending_{false};
+  sensor::Sensor *rx_burst_lead_sensor_{nullptr};
   volatile int32_t last_rx_stamp_gap_us_{0};
   volatile bool rx_stamp_gap_pending_{false};
   sensor::Sensor *rx_stamp_gap_sensor_{nullptr};
