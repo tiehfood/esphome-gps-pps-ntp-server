@@ -1,11 +1,17 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import time as time_
-from esphome.const import CONF_ID, CONF_PORT
+from esphome.components import sensor, time as time_
+from esphome.const import CONF_ID, CONF_PORT, STATE_CLASS_MEASUREMENT
 
-DEPENDENCIES = ["network"]
+# "ethernet" isn't touched through codegen (the hook reaches the driver via the C++
+# global esphome::ethernet::global_eth_component), but this component's code must be
+# compiled in for that symbol to exist at link time -- the project never builds
+# without it anyway (W5500-only, no Wi-Fi).
+DEPENDENCIES = ["network", "ethernet"]
+AUTO_LOAD = ["sensor"]
 
 CONF_TIME_ID = "time_id"
+CONF_HOOK_LATENCY = "hook_latency"
 
 gps_pps_time_ns = cg.esphome_ns.namespace("gps_pps_time")
 GPSPPSTime = gps_pps_time_ns.class_("GPSPPSTime", time_.RealTimeClock)
@@ -18,6 +24,16 @@ CONFIG_SCHEMA = cv.Schema(
         cv.GenerateID(): cv.declare_id(NTPServer),
         cv.Optional(CONF_PORT, default=123): cv.port,
         cv.Required(CONF_TIME_ID): cv.use_id(GPSPPSTime),
+        # Diagnostic: microseconds between the input-path hook's T2 stamp (frame
+        # delivered by the driver, before lwIP) and recv_task_()'s own T2 stamp on the
+        # same request. Only published on requests where the hook actually saw the
+        # frame -- see docs/superpowers/plans/2026-09-03-ntp-serving-latency.md.
+        cv.Optional(CONF_HOOK_LATENCY): sensor.sensor_schema(
+            unit_of_measurement="µs",
+            icon="mdi:timer-sand",
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -30,3 +46,7 @@ async def to_code(config):
     if time_id := config.get(CONF_TIME_ID):
         time_source = await cg.get_variable(time_id)
         cg.add(var.set_time_source(time_source))
+
+    if hook_latency_config := config.get(CONF_HOOK_LATENCY):
+        sens = await sensor.new_sensor(hook_latency_config)
+        cg.add(var.set_hook_latency_sensor(sens))

@@ -112,6 +112,11 @@ class EthernetComponent : public Component {
   /// esp_eth_start() around a register rewrite. Do not call esp_eth_* teardown on this
   /// from anywhere except the probe's own button-triggered flow.
   esp_eth_handle_t get_eth_handle() const { return this->eth_handle_; }
+  /// NTP input-path hook: the esp_netif every received frame must be forwarded to via
+  /// esp_netif_receive() by any replacement stack_input callback (esp_eth_update_input_path()).
+  /// Null until setup() runs. Callers MUST check for null and skip installing their hook
+  /// rather than ever calling esp_netif_receive(nullptr, ...).
+  esp_netif_t *get_eth_netif() const { return this->eth_netif_; }
 #ifdef USE_ETHERNET_SPI
   /// RESEARCH SPIKE hook: SPI host/CS/clock the driver's own device was created with,
   /// so the probe can open a second spi_device_handle_t on the same bus and CS.

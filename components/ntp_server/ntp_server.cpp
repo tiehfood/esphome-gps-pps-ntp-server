@@ -11,6 +11,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_timer.h>
+#include <atomic>
+#include "esphome/components/ethernet/ethernet_component.h"
 #endif
 
 namespace esphome {
@@ -68,6 +70,29 @@ void NTPServer::setup() {
     return;
   }
 
+  // Install the receive-timestamp input-path hook: replaces esp_eth's default
+  // stack_input (which the netif glue set up when esp_eth_start() ran, per
+  // EthernetComponent::get_setup_priority() == WIFI, higher than our own
+  // AFTER_CONNECTION -- ethernet setup() has already completed by the time we get
+  // here). eth_input_hook_() stamps T2 before lwIP and before recv_task_() wakes.
+  // If the netif isn't available for any reason, skip installing it entirely --
+  // serving must keep working without this, at the previous precision only.
+  if (ethernet::global_eth_component != nullptr) {
+    this->eth_netif_ = ethernet::global_eth_component->get_eth_netif();
+  }
+  if (this->eth_netif_ != nullptr) {
+    esp_err_t err = esp_eth_update_input_path(ethernet::global_eth_component->get_eth_handle(),
+                                               &NTPServer::eth_input_hook_, this);
+    if (err == ESP_OK) {
+      ESP_LOGI(TAG, "Installed NTP receive-timestamp input-path hook");
+    } else {
+      ESP_LOGE(TAG, "Failed to install NTP input-path hook: %d", err);
+      this->eth_netif_ = nullptr;
+    }
+  } else {
+    ESP_LOGE(TAG, "Ethernet netif unavailable; NTP receive-timestamp hook not installed");
+  }
+
   // RFC 5905 11.1: precision is max(resolution, read cost). Smallest non-zero
   // delta over repeated reads, as chrony does.
   uint32_t best_us = UINT32_MAX;
@@ -105,8 +130,17 @@ void NTPServer::setup() {
 }
 
 void NTPServer::loop() {
-  // Nothing to do: recv_task_() serves every request on its own task, blocked
-  // in recvfrom(). Kept as a no-op because Component::loop() is pure virtual.
+  // Nothing to do on the request path itself: recv_task_() serves every request on
+  // its own task, blocked in recvfrom(). The one exception is the hook-latency
+  // diagnostic: recv_task_() can only record the value (a single volatile int32_t,
+  // atomic on this hardware -- see .claude/rules/firmware.md), publishing it is an
+  // ESPHome API call and must happen from this main-thread loop() instead.
+  if (this->hook_latency_pending_) {
+    int32_t latency_us = this->last_hook_latency_us_;
+    this->hook_latency_pending_ = false;
+    if (this->hook_latency_sensor_ != nullptr)
+      this->hook_latency_sensor_->publish_state(latency_us);
+  }
 }
 
 void NTPServer::recv_task_(void *param) {
@@ -120,8 +154,9 @@ void NTPServer::recv_task_(void *param) {
 
     int received = recvfrom(self->socket_fd_, buffer, sizeof(buffer), 0,
                             (struct sockaddr *) &client_addr, &client_len);
-    // T2: stamped the instant recvfrom() returns -- this replaces the shared-loop
-    // poll and is the entire reason this task exists.
+    // T2 fallback: stamped the instant recvfrom() returns -- this replaces the
+    // shared-loop poll and is the entire reason this task exists. Overridden below
+    // if the input-path hook already stamped this same request earlier.
     NTPTimestamp receive_ts = self->get_ntp_timestamp_();
 
     if (received < 0) {
@@ -132,6 +167,19 @@ void NTPServer::recv_task_(void *param) {
     }
     if (received < NTP_PACKET_SIZE)
       continue;  // runt packet -- drop, keep serving
+
+    // The client's own transmit timestamp (bytes 40-47) is unique per request and
+    // is exactly what eth_input_hook_() keyed its ring entry on -- it saw this same
+    // request arrive, before lwIP, before this task woke.
+    int64_t hook_t;
+    if (self->hook_lookup_(&buffer[40], &hook_t)) {
+      receive_ts = self->hook_to_ntp_timestamp_(hook_t);
+      // Diagnostic only: how much later this task observed the same request vs.
+      // the hook. Stored here (not published -- ESPHome's API is not task-safe from
+      // a non-main task) and picked up by loop() on the main task.
+      self->last_hook_latency_us_ = static_cast<int32_t>(esp_timer_get_time() - hook_t);
+      self->hook_latency_pending_ = true;
+    }
 
     // No ESP_LOGD/publish_state here: ESPHome's logger and API are not task-safe
     // from a non-main task. Drop silently rather than working around it.
@@ -151,6 +199,123 @@ void NTPServer::recv_task_(void *param) {
     if (dur > SEND_US_MIN && dur < SEND_US_MAX)
       self->send_us_ += (dur - self->send_us_) / 8;
   }
+}
+
+esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffer, uint32_t length, void *priv) {
+  // First line, nothing before it: this is as close to "frame arrived" as the W5500
+  // driver gives us.
+  int64_t t = esp_timer_get_time();
+
+  auto *self = static_cast<NTPServer *>(priv);
+
+  // Identify an NTP request without touching anything but `buffer`/`length`, and
+  // bounds-check at every step -- this callback sits in the path of EVERY received
+  // frame, NTP or not, and runs in the W5500 driver's own task: no ESP_LOGx, no
+  // publish_state, no blocking, no allocation, no gettimeofday() here.
+  //
+  // Ethernet header (14B): dst MAC(6) src MAC(6) EtherType(2) @12.
+  // IPv4 header starts @14; low nibble of the version/IHL byte @14 is the header
+  // length in 32-bit words (min 5 = 20B); protocol @14+9 must be UDP (17).
+  // UDP header (8B) starts @14+IHL*4; destination port @+2; payload @+8.
+  // NTP transmit timestamp (the client's own, echoed back to us) is payload[40..47].
+  static const uint32_t ETH_HDR_LEN = 14;
+  static const uint32_t MIN_IPV4_HDR_LEN = 20;
+  static const uint32_t UDP_HDR_LEN = 8;
+  static const uint16_t ETHERTYPE_IPV4 = 0x0800;
+  static const uint8_t IP_PROTO_UDP = 17;
+  static const uint16_t NTP_PORT = 123;
+
+  if (length >= ETH_HDR_LEN + MIN_IPV4_HDR_LEN) {
+    uint16_t ethertype = (static_cast<uint16_t>(buffer[12]) << 8) | buffer[13];
+    if (ethertype == ETHERTYPE_IPV4) {
+      uint8_t ihl = buffer[ETH_HDR_LEN] & 0x0F;
+      uint32_t ip_hdr_len = static_cast<uint32_t>(ihl) * 4;
+      uint32_t udp_offset = ETH_HDR_LEN + ip_hdr_len;
+      if (ihl >= 5 && length >= udp_offset + UDP_HDR_LEN && buffer[ETH_HDR_LEN + 9] == IP_PROTO_UDP) {
+        uint16_t dst_port = (static_cast<uint16_t>(buffer[udp_offset + 2]) << 8) | buffer[udp_offset + 3];
+        uint32_t ntp_offset = udp_offset + UDP_HDR_LEN;
+        if (dst_port == NTP_PORT && length >= ntp_offset + NTP_PACKET_SIZE) {
+          self->hook_record_(&buffer[ntp_offset + 40], t);
+        }
+      }
+    }
+  }
+
+  // Unconditional on every path, NTP or not: failing to forward here takes down all
+  // networking on the device. Buffer ownership passes to esp_netif_receive(); it is
+  // not freed here.
+  return esp_netif_receive(self->eth_netif_, buffer, length, NULL);
+}
+
+void NTPServer::hook_record_(const uint8_t *key, int64_t t) {
+  HookEntry &slot = this->hook_ring_[this->hook_ring_next_];
+  this->hook_ring_next_ = static_cast<uint8_t>((this->hook_ring_next_ + 1) % HOOK_RING_SIZE);
+
+  // Seqlock write. eth_input_hook_() (via this function) is the sole writer -- the
+  // W5500 driver delivers one frame at a time from its own task, so this never races
+  // another write to the same slot -- only against hook_lookup_()'s reads from
+  // recv_task_(), possibly on the other core. Odd seq = write in progress; even = a
+  // consistent snapshot. Release fences ensure the payload writes cannot be observed
+  // out of order around the seq transitions on the reader's core.
+  uint32_t seq = slot.seq.load(std::memory_order_relaxed);
+  slot.seq.store(seq + 1, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
+  memcpy(slot.key, key, sizeof(slot.key));
+  slot.t = t;
+  std::atomic_thread_fence(std::memory_order_release);
+  slot.seq.store(seq + 2, std::memory_order_relaxed);
+}
+
+bool NTPServer::hook_lookup_(const uint8_t *key, int64_t *t_out) {
+  for (int i = 0; i < HOOK_RING_SIZE; i++) {
+    HookEntry &slot = this->hook_ring_[i];
+    uint32_t s1 = slot.seq.load(std::memory_order_relaxed);
+    if (s1 & 1)
+      continue;  // write in progress on this slot -- skip rather than spin
+    std::atomic_thread_fence(std::memory_order_acquire);
+    uint8_t k[8];
+    memcpy(k, slot.key, sizeof(k));
+    int64_t t = slot.t;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    uint32_t s2 = slot.seq.load(std::memory_order_relaxed);
+    if (s1 != s2)
+      continue;  // torn read (write happened mid-copy) -- skip, don't trust it
+    if (memcmp(k, key, sizeof(k)) == 0) {
+      *t_out = t;
+      return true;
+    }
+  }
+  return false;
+}
+
+NTPTimestamp NTPServer::micros_epoch_to_ntp_timestamp_(int64_t unix_us) {
+  int64_t sec = unix_us / 1000000;
+  int64_t usec = unix_us % 1000000;
+  if (usec < 0) {
+    usec += 1000000;
+    sec -= 1;
+  }
+  NTPTimestamp ts;
+  ts.seconds = static_cast<uint32_t>(sec) + NTP_UNIX_OFFSET;
+  ts.fraction = static_cast<uint32_t>((static_cast<uint64_t>(usec) << 32) / 1000000ULL);
+  return ts;
+}
+
+NTPTimestamp NTPServer::hook_to_ntp_timestamp_(int64_t hook_us) {
+  // Reconstructs the wall-clock time at the hook's stamp the same way
+  // GPSPPSTime::apply_pps_correction_() reconstructs the PPS edge's wall-clock time --
+  // gettimeofday() is never called at the hook itself (driver task; must stay
+  // non-blocking and allocation-free), so instead read gettimeofday() and
+  // esp_timer_get_time() back-to-back here and subtract the elapsed delta since
+  // hook_us. Valid on the same grounds documented there: adjtime()'s slew is bounded
+  // and settimeofday() is rare, so adjusted_boot_time() is stable across this window.
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  const int64_t now_us = esp_timer_get_time();
+  const int64_t elapsed_since_hook_us = now_us - hook_us;
+  const int64_t system_us_at_hook =
+      static_cast<int64_t>(tv.tv_sec) * 1000000LL + tv.tv_usec - elapsed_since_hook_us;
+  return NTPServer::micros_epoch_to_ntp_timestamp_(system_us_at_hook);
 }
 
 #else  // Arduino platforms (RP2040, ESP32-Arduino, etc.)

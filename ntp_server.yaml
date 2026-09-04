@@ -121,3 +121,8 @@ text_sensor:
 
 ntp_server:
   time_id: gps_pps
+  hook_latency:
+    id: ntp_hook_latency
+    name: "NTP Hook Latency"
+    icon: "mdi:timer-sand"
+    entity_category: "diagnostic"
