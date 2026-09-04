@@ -13,6 +13,7 @@ AUTO_LOAD = ["sensor"]
 CONF_TIME_ID = "time_id"
 CONF_HOOK_LATENCY = "hook_latency"
 CONF_RX_STAMP_GAP = "rx_stamp_gap"
+CONF_ARP_PRIMES = "arp_primes"
 
 gps_pps_time_ns = cg.esphome_ns.namespace("gps_pps_time")
 GPSPPSTime = gps_pps_time_ns.class_("GPSPPSTime", time_.RealTimeClock)
@@ -41,6 +42,12 @@ CONFIG_SCHEMA = cv.Schema(
             accuracy_decimals=0,
             state_class=STATE_CLASS_MEASUREMENT,
         ),
+        cv.Optional(CONF_ARP_PRIMES): sensor.sensor_schema(
+            unit_of_measurement="µs",
+            icon="mdi:timer-sand",
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -61,3 +68,7 @@ async def to_code(config):
     if rx_stamp_gap_config := config.get(CONF_RX_STAMP_GAP):
         sens = await sensor.new_sensor(rx_stamp_gap_config)
         cg.add(var.set_rx_stamp_gap_sensor(sens))
+
+    if arp_primes_config := config.get(CONF_ARP_PRIMES):
+        sens = await sensor.new_sensor(arp_primes_config)
+        cg.add(var.set_arp_primes_sensor(sens))

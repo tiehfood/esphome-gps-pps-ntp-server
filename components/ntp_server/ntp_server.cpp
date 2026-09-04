@@ -13,6 +13,9 @@
 #include <esp_timer.h>
 #include <atomic>
 #include "esphome/components/ethernet/ethernet_component.h"
+#include <lwip/etharp.h>
+#include <lwip/tcpip.h>
+#include <esp_netif_net_stack.h>
 #endif
 
 namespace esphome {
@@ -135,6 +138,14 @@ void NTPServer::loop() {
   // diagnostic: recv_task_() can only record the value (a single volatile int32_t,
   // atomic on this hardware -- see .claude/rules/firmware.md), publishing it is an
   // ESPHome API call and must happen from this main-thread loop() instead.
+  this->refresh_arp_entries_();
+
+  if (this->arp_primes_pending_) {
+    this->arp_primes_pending_ = false;
+    if (this->arp_primes_sensor_ != nullptr)
+      this->arp_primes_sensor_->publish_state(this->arp_primes_);
+  }
+
   if (this->rx_stamp_gap_pending_) {
     int32_t gap_us = this->last_rx_stamp_gap_us_;
     this->rx_stamp_gap_pending_ = false;
@@ -191,6 +202,10 @@ void NTPServer::recv_task_(void *param) {
     // from a non-main task. Drop silently rather than working around it.
     if (!self->is_time_synchronized_())
       continue;
+
+    // Remember who asked, so loop() can keep their ARP entry warm. Plain store only --
+    // no lwIP calls from this task beyond the socket API.
+    self->note_arp_client_(client_addr.sin_addr.s_addr);
 
     self->build_ntp_response_(buffer, response, receive_ts);
 
@@ -490,6 +505,59 @@ void NTPServer::dump_config() {
   ESP_LOGCONFIG(TAG, "NTP Server:");
   ESP_LOGCONFIG(TAG, "  Port: %u", this->port_);
   ESP_LOGCONFIG(TAG, "  Time source: %s", this->time_source_ != nullptr ? "configured" : "none");
+}
+
+void NTPServer::note_arp_client_(uint32_t addr) {
+  if (addr == 0)
+    return;
+  for (uint8_t i = 0; i < ARP_CLIENT_SLOTS; i++) {
+    if (this->arp_clients_[i] == addr)
+      return;  // already tracked
+  }
+  this->arp_clients_[this->arp_client_next_] = addr;
+  this->arp_client_next_ = (this->arp_client_next_ + 1) % ARP_CLIENT_SLOTS;
+}
+
+void NTPServer::refresh_arp_entries_() {
+  const uint32_t now = millis();
+  if (this->arp_last_refresh_ms_ != 0 && now - this->arp_last_refresh_ms_ < ARP_REFRESH_INTERVAL_MS)
+    return;
+  this->arp_last_refresh_ms_ = now;
+  if (this->eth_netif_ == nullptr)
+    return;
+
+  auto *netif = static_cast<struct netif *>(esp_netif_get_netif_impl(this->eth_netif_));
+  if (netif == nullptr)
+    return;
+
+  uint32_t primed = 0;
+  for (uint8_t i = 0; i < ARP_CLIENT_SLOTS; i++) {
+    uint32_t addr = this->arp_clients_[i];
+    if (addr == 0)
+      continue;
+    ip4_addr_t ip;
+    ip.addr = addr;
+
+    // etharp_* are not thread-safe; this runs on the ESPHome main task, not the tcpip
+    // thread, so the core lock is required (CONFIG_LWIP_TCPIP_CORE_LOCKING=y).
+    LOCK_TCPIP_CORE();
+    struct eth_addr *eth_ret = nullptr;
+    const ip4_addr_t *ip_ret = nullptr;
+    bool cached = etharp_find_addr(netif, &ip, &eth_ret, &ip_ret) >= 0;
+    if (!cached) {
+      // q == nullptr: resolve only, queue nothing. Fires an ARP request now so the
+      // entry is warm long before the next reply needs it.
+      etharp_query(netif, &ip, nullptr);
+      primed++;
+    }
+    UNLOCK_TCPIP_CORE();
+  }
+
+  if (primed > 0) {
+    this->arp_primes_ += primed;
+    this->arp_primes_pending_ = true;
+    ESP_LOGD(TAG, "ARP priming: re-resolved %u cold client(s), %u total", primed, this->arp_primes_);
+  }
 }
 
 }  // namespace ntp_server

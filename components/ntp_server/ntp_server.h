@@ -33,6 +33,7 @@ class NTPServer : public Component {
 #ifdef USE_ESP_IDF
   void set_hook_latency_sensor(sensor::Sensor *sensor) { this->hook_latency_sensor_ = sensor; }
   void set_rx_stamp_gap_sensor(sensor::Sensor *sensor) { this->rx_stamp_gap_sensor_ = sensor; }
+  void set_arp_primes_sensor(sensor::Sensor *sensor) { this->arp_primes_sensor_ = sensor; }
   /// A/B control for Phase 3 Step 3. Stamping T2 at the Sn_RX_RSR read moves it ~287 us
   /// earlier, which should cut client-visible offset by half that. Across a routed hop
   /// the run-to-run network drift is larger than the effect, so the only way to measure
@@ -110,6 +111,22 @@ class NTPServer : public Component {
   /// Phase 3 Step 3: microseconds between the driver reading Sn_RX_RSR and the input
   /// hook stamping T2 -- the SPI transfer + dispatch cost currently inside T2, and so
   /// the upper bound on what stamping T2 earlier could recover.
+  /// Phase 3 Step 10 (ARP priming). lwIP does not learn a peer's MAC from an incoming
+  /// IP packet (ETHARP_TRUST_IP_MAC is off), and entries age out after ARP_MAXAGE = 300 s.
+  /// A client polling less often than that finds a cold cache, so our sendto() triggers an
+  /// ARP round trip mid-reply -- a rare but large outlier between T2 and T3. Re-resolving
+  /// recent clients on a timer keeps their entries warm so the reply never waits.
+  static const uint8_t ARP_CLIENT_SLOTS = 8;
+  static const uint32_t ARP_REFRESH_INTERVAL_MS = 60000;  // ARP_MAXAGE is 300 s
+  uint32_t arp_clients_[ARP_CLIENT_SLOTS]{};  // IPv4, network byte order; 0 = empty slot
+  uint8_t arp_client_next_{0};
+  uint32_t arp_last_refresh_ms_{0};
+  uint32_t arp_primes_{0};
+  bool arp_primes_pending_{false};
+  sensor::Sensor *arp_primes_sensor_{nullptr};
+  void note_arp_client_(uint32_t addr);
+  void refresh_arp_entries_();
+
   volatile bool use_early_t2_{true};
   volatile int32_t last_rx_stamp_gap_us_{0};
   volatile bool rx_stamp_gap_pending_{false};
