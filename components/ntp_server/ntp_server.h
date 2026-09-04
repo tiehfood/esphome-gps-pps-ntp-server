@@ -134,7 +134,7 @@ class NTPServer : public Component {
   void refresh_arp_entries_();
 
   volatile bool use_early_t2_{true};
-  volatile bool use_burst_start_t2_{false};
+  volatile bool use_burst_start_t2_{true};
   /// Microseconds between the first SPI transaction of a receive burst and the
   /// Sn_RX_RSR read -- the T2 headroom still unclaimed after Step 3.
   volatile int32_t last_rx_burst_lead_us_{0};
