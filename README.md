@@ -1,203 +1,220 @@
+# A Stratum-1 NTP Server That Was Right and Still Wrong
 
-# ESPHome GPS/PPS NTP Server
-## Overview
-
-Stratum-1 NTP server running on ESPHome, good enough for home lab. A u-blox LEA-M8T GPS module provides coarse UTC time via NMEA sentences, while its PPS output disciplines the system clock to microsecond accuracy.
-
-**Hardware**: Waveshare ESP32-S3-ETH + WD22UGRC board (LEA-M8T-0-10)  
-**Accuracy**: ~10 µs worst-case between PPS corrections, self-correcting every second
-
-## Images
+**Hardware**: Waveshare ESP32-S3-ETH + WD22UGRC (u-blox LEA-M8T) · **Framework**: ESPHome on ESP-IDF
 
 | ![Image01](docs/images/image01.jpg) | ![Image02](docs/images/image02.jpg) |
 |:-----------------------------------:|:-----------------------------------:|
 | ![Image03](docs/images/image03.jpg) | ![Image04](docs/images/image04.jpg) |
 
+The GPS module hands the ESP32 two things: the current time as text, and a wire that
+twitches once a second, exactly on the second. Discipline the system clock to that wire and
+you have a very good clock. Ours held **5 µs** against GPS, and kept holding it for a
+hundred days.
 
+Then I measured what clients actually received. Every answer was **3.3 milliseconds** wrong.
 
-## Components
+The clock was fine. The clock had never been the problem. Everything between the packet
+arriving and the packet leaving was the problem, and none of it showed up in any sensor we
+had.
 
-### `gps_pps_time` - PPS-Disciplined Time Source
+## Where the time actually goes
 
-ESPHome time platform that combines NMEA time with PPS.
+An NTP exchange has four timestamps. The client notes when it sent (T1) and when the reply
+came back (T4). The server fills in when the request arrived (T2) and when the reply left
+(T3). From those four numbers the client works out how far its clock is off.
 
-**How it works:**
+The subtle part: **the server's timestamps only have to be honest, not fast.** A server that
+takes a full second to reply is fine, as long as T2 and T3 truthfully say when things
+happened. The client subtracts the server's own processing time and it cancels out.
 
-1. NMEA provides the UTC epoch (which second it is)
-2. PPS rising edge marks the exact boundary of each UTC second
-3. On each PPS pulse, the system clock is measured and corrected
+What does *not* cancel out is stamping at the wrong moment. If T2 says a packet arrived
+later than it really did, that error goes straight into the client's answer at half its
+size — and the round-trip measurement looks completely normal, so no client can detect it
+or filter it out. It is a silent, systematic lie.
 
-**Startup sequence:**
+That is what a 3.3 ms error means. Not "slow". Wrong.
 
-1. GPS module acquires fix, begins outputting NMEA + PPS
-2. First valid NMEA sentence sets coarse system time (`settimeofday`)
-3. First PPS after valid NMEA hard-syncs the clock to the correct second boundary
-4. Subsequent PPS pulses apply continuous drift correction via `adjtime()`
+## Getting out of the queue
 
-### `ntp_server` - NTP Server
+The original code stamped T2 when ESPHome's main loop got round to the component. That loop
+sleeps out a 16 ms interval, so a packet could sit for anything from zero to 16 ms before
+anyone looked at it.
 
-Serves NTPv4 over UDP port 123 using BSD sockets (non-blocking). Reads system time via `gettimeofday()`, which reflects the PPS-disciplined clock.
-
-**NTP response fields:**
-
-| Field | Synchronized | Unsynchronized |
-|-------|-------------|----------------|
-| LI (Leap Indicator) | 0 (no warning) | 3 (clock not synchronized) |
-| Stratum | 1 (primary reference) | 16 (unsynchronized) |
-| Version | echoed from request | echoed from request |
-| Reference ID | `GPS` | `GPS` |
-| Precision | measured at boot (RFC 5905 §11.1) | same |
-| Root delay | 0 (stratum 1 has no upstream) | 0 |
-| Root dispersion | 5 ms + 10 µs per second since last PPS | same |
-| Reference timestamp | last PPS correction | 0 |
-
-Root dispersion is deliberately non-zero. Zero would claim a perfect clock and
-shrink the correctness interval clients build around us (RFC 5905 §11.2.1), so
-honest peers would be rejected in our favour.
-
-The server transitions to unsynchronized when PPS is lost for >10 seconds (GPS unplugged, cable fault, etc.).
-
-## Clock Correction
-
-### ESP-IDF (primary platform)
-
-Uses `adjtime()` to gradually slew the system clock without jumps. This is ideal for NTP serving because clients never see time discontinuities.
-
-- Each PPS pulse measures the drift (system clock vs expected PPS time)
-- `adjtime(-(drift + mean))` overcorrects by the running mean drift rate, centering the sawtooth error around zero. Without overcorrection, the clock drifts from 0 to +D µs between PPS pulses. With overcorrection, it swings from -D/2 to +D/2, halving the peak error NTP clients see.
-- A spike filter (threshold: ~500 µs) prevents measurement noise from corrupting the clock
-
-### Other platforms (fallback)
-
-Uses `settimeofday()` on every PPS with a drift pre-compensation EMA. The compensation value predicts the crystal drift so the clock is set slightly behind, and the crystal drift brings it to zero by the next PPS.
-
-## Drift Measurement
-
-At each PPS pulse, the system reconstructs what the system clock read at the exact PPS edge:
+The fix is unglamorous — move serving into its own FreeRTOS task, pinned to the second core
+so nothing else can delay it — and the payoff is not:
 
 ```
-system_time_at_pps = gettimeofday() - isr_to_loop_delay - isr_latency
-drift = system_time_at_pps - expected_time
+                        slope    device error
+16 ms loop queueing     0.503    —
+own task                0.007    +659 µs
 ```
 
-Two delays are compensated:
+That slope is worth explaining, because it became the main measuring instrument for
+everything after. Plot the client's computed offset against the round-trip delay. If our
+error comes from packets waiting in a queue, offset rises with delay at exactly **half** the
+slope — that is the arithmetic of a one-sided delay landing in a two-sided formula. A slope
+of 0.5 is a queue. A slope near zero means the offset has stopped tracking the network,
+which means what is left is a fixed internal latency.
 
-1. **ISR-to-loop delay**: Time between the PPS ISR capturing `micros()` and `loop()` processing it. Measured directly via `micros() - last_pps_micros_`.
+Three milliseconds gone. And now a flat 659 µs that no amount of scheduling would touch.
 
-2. **ISR latency**: If the UART ISR delays the PPS ISR, the `micros()` timestamp in the ISR is late. Detected by measuring the interval between consecutive PPS ISRs — a deviation from 1,000,000 µs reveals the delay. Only compensated for plausible values (500 µs to 10 ms).
+## Stamp it where it arrives
 
-### Drift sensor
+659 µs is the distance between a frame landing in the Ethernet chip and our task waking up
+to look at it. You cannot schedule that away. You have to stamp earlier.
 
-The drift sensor shows the **raw clock error** at each PPS edge — the actual offset between the system clock and GPS time. This is the worst-case error an NTP client could see at that moment.
+The Ethernet chip here is a W5500 on a SPI bus, and ESP-IDF lets you hook the driver's
+receive path — the moment it hands a frame up to the network stack, before any of it
+reaches us. Stamping T2 there took the device error from **659 µs to 97 µs**.
 
-With the adjtime overcorrection, the sensor reads ~D/2 in steady state (e.g., ~5 µs for a 10 ppm crystal) instead of the full drift rate. Spikes (e.g., from ISR contention) appear as the true measured error, making anomalies immediately visible.
+Then it got interesting. The driver doesn't magically know a frame arrived either; it finds
+out by reading a register over SPI, and then spends time clocking the payload across that
+same bus before it hands anything up. Since we already supply the SPI driver, we can watch
+every transaction go past and stamp the moment the *first* one of a receive burst starts.
 
-## ISR Latency Detection
+Two steps, both measured before being believed:
 
-The PPS GPIO interrupt can be delayed by higher-priority interrupts (typically the UART ISR processing GPS NMEA data). When this happens, `micros()` in the PPS ISR captures a late timestamp.
+| stamp moved to | how much earlier | client offset |
+|---|---|---|
+| the "how much is waiting?" register read | 287 µs | −107 … −222 µs |
+| the first SPI transaction of the burst | 115 µs | −53 ± 19 µs |
 
-Detection method: the interval between consecutive PPS ISR timestamps should be exactly 1,000,000 µs. A positive deviation of 500-10,000 µs indicates ISR latency on the current pulse. This deviation is subtracted from the drift measurement to recover the true PPS edge time.
+## The half nobody had checked
 
-## Race Condition Protection
+T2 got all the attention for a day, because T2 was the half we had instrumented. T3 —
+when the reply leaves — was a *prediction*: take the current time, add an estimate of how
+long sending takes, write that down.
 
-A guard prevents NMEA from overwriting the epoch counter between PPS ISR and loop processing:
+The estimate learned from how long the `sendto()` call took to return. That felt reasonable
+and it is wrong, because the packet is already on its way before that call comes back. The
+estimate was systematically too long, so **every single reply carried a T3 that was too
+late.**
 
-```cpp
-if (!pps_synced_ && !pps_flag_) {
-    last_gps_epoch_ = val.timestamp;
-}
+We could measure it, because we watch the SPI bus: there is an exact instant where the
+driver tells the chip "transmit now". Comparing prediction against that instant:
+
+```
+before:  drifts from +63 µs to −430 µs, settling around −180 µs   ← a bias, not noise
+after:   sits on zero, ±23 µs
 ```
 
-Without this, if the main loop is delayed >50 ms (e.g., during boot, Ethernet init), NMEA for second T could arrive after the PPS ISR for second T but before `loop()` processes it. This would set `last_gps_epoch_ = T`, causing `corrected_epoch = T + 1` — one second ahead, permanently.
+That is the measurement I like best in this whole project, because **it needs no network at
+all.** It is the device checking its own homework. Fixing it was worth about **−154 µs** to
+clients — a bigger single win than anything found in T2 that day, hiding in the half nobody
+had looked at.
 
-## Failure Recovery
+## How you know you did not fool yourself
 
-### PPS gap (e.g., GPS briefly disconnected)
+Twice I nearly shipped a wrong conclusion, and both times the mistake was in the
+measurement rather than the code.
 
-If drift exceeds 500 ms, the epoch counter has diverged from reality. Instead of hard-syncing with the stale epoch (which would set the clock to the wrong time), the component resets sync state:
+**Run-to-run comparison is worthless here.** Two measurements five minutes apart differed by
+143 µs purely from network conditions. Anything smaller than that is invisible unless you
+flip the change back and forth and compare paired blocks. Every improvement above has a
+runtime switch for exactly that reason.
 
-- `pps_synced_ = false` — allows NMEA to re-establish the correct epoch
-- `gps_time_valid_ = false` — ignores PPS until fresh NMEA arrives
-- Recovery takes 1-2 seconds once GPS signal returns
+**And the obvious statistical fix is a trap.** The natural move is to regress offset on
+delay to control for network conditions. But moving T2 earlier *also changes the measured
+delay* — delay is computed from T2. It is downstream of the change, so controlling for it
+quietly removes part of the effect you are trying to measure. One change first measured as
+"no effect at all" (−12 ± 19 µs) turned out to be worth −53 ± 19 µs once the known shift was
+added back before fitting. The code had been right the whole time.
 
-### GPS fully unplugged
+## Knowing when to stop
 
-Without PPS pulses, the crystal free-runs at ~10 ppm (~36 ms/hour drift). After the 10-second PPS timeout, the NTP server sets LI=3 and stratum=16, signaling clients that the time source is unsynchronized.
+The tempting next step was a hardware trick: the W5500 has an interrupt line that goes low
+the instant a frame lands, and the ESP32-S3 can timestamp a pin change in hardware, with no
+software in the path. Better still, the chip's pin matrix lets a second peripheral watch a
+pin that already has an interrupt on it, so we could measure without disturbing anything.
 
-## Sensors
+It worked. And it said the gap between the chip's own "frame is here" signal and our stamp
+is **21 µs**.
 
-| Sensor | Type | Description |
-|--------|------|-------------|
-| `satellites` | Numeric | Total satellites in view (sum of GPS + GLONASS + Galileo GSV counts) |
-| `gps_satellites` | Numeric | GPS satellites in view (from $GPGSV field 3) |
-| `glonass_satellites` | Numeric | GLONASS satellites in view (from $GLGSV field 3) |
-| `galileo_satellites` | Numeric | Galileo satellites in view (from $GAGSV field 3) |
-| `clock_offset` | Numeric (µs) | Filtered clock error as seen by NTP clients. Only updated on clean measurements; on spikes, estimates drift from crystal rate. Steady state ~5 µs with overcorrection. |
-| `pps_drift` | Numeric (µs) | Raw unfiltered drift measurement at each PPS edge. Shows ISR contention and measurement anomalies for diagnostics. Spikes (e.g. -900 µs) indicate measurement artifacts, not actual clock error. |
-| `gps_time` | Text | Current PPS-disciplined UTC time (YYYY-MM-DD HH:MM:SS) |
+Twenty-one microseconds is not worth chasing. So we did not — but the measurement is the
+point, because it is the first *hardware-referenced* bound on how honest T2 is. Two other
+checks agree:
 
-Per-constellation satellite counts use `TinyGPSCustom` to parse GSV sentence field 3 (total satellites in view for that constellation). Requires NMEA 4.10 and GNSS-specific GSV talker IDs for Galileo (`$GAGSV`).
+- Sweeping the request size from 48 to 1400 bytes, offset grows by **90 ns per byte**. Pure
+  wire time across two store-and-forward hops predicts 80. If any of the SPI payload read
+  were still leaking into T2, it would be 240 or worse. It isn't there.
+- The T3 prediction error sits on zero.
 
-## u-blox Configuration
+Three independent checks, none of which depend on the network being well-behaved, all
+saying the same thing: **the timestamps are as honest as this hardware can make them.**
 
-Compensates for signal propagation delay in the antenna cable (~5 ns per meter of coax).
+## Where it ended up
 
-```yaml
-UBX-CFG-TP5
-```
-Active GNSS constellations. Enable GPS, SBAS and Galileo.
+| | before | after |
+|---|---|---|
+| Client-visible offset | +3,286 µs | **+63 … +105 µs** |
+| Round-trip delay | 8,502 µs | ~580 µs |
+| Clock vs GPS | 5 µs | 5 µs |
 
-```yaml
-UBX-CFG-GNSS
-```
+The clock never changed. It was always the good part.
 
-Protocol Version 4.10 for Galileo satellite IDs in NMEA output. Without this, Galileo satellites are reported under `$GPGSV` instead of `$GAGSV`, and per-constellation counting doesn't work. Also enables extended SV numbering and GNSS-specific GSV talker IDs.
+What remains is roughly 60–100 µs, and most of it is probably not ours. It is path
+asymmetry — the small difference between how long a packet takes to travel out versus back.
+NTP fundamentally cannot separate that from a real clock offset, and neither can we, because
+our measuring machine sits a router hop away. Measuring below 100 µs honestly needs a client
+on the same network segment. That is the next piece of equipment, not the next piece of code.
 
-```yaml
-UBX-CFG-NMEA
-```
-GPS module UART baud rate.
+Along the way the server also stopped rebooting — 26 unexplained restarts over 149 days
+turned out to be one function call in an interrupt handler that takes a lock, which is a
+different story — and it now advertises an error bound of 1 ms instead of the 5 ms it
+inherited, because we finally knew enough to say something honest.
 
-```yaml
-UBX-CFG-PRT
-```
+## Two things worth more than the next microsecond
 
-## Temperature Effects
+**A supercapacitor on the GPS backup pin.** There is no battery, so every power cut is a
+cold start: almanac gone, ephemeris gone, and with a weak signal that took **80 minutes**
+before the server would answer at all. A supercap turns that into seconds.
 
-The system clock is derived from the ESP32's 40 MHz crystal oscillator (via the SYSTIMER peripheral, independent of CPU frequency). Crystal frequency follows a parabolic temperature curve:
+**A better antenna position.** The module sees about 26 dB-Hz where 40–50 is normal. That is
+what makes cold starts take an hour instead of a minute.
 
-- Turnover point near ~25 °C
-- Deviation: ~0.035 ppm/°C²
-- At 50 °C: ~22 ppm drift rate (vs ~10 ppm at 25 °C)
+Neither is code. Both matter more, on any real day, than everything above.
 
-The PPS discipline loop automatically tracks temperature-induced drift changes. Higher temperatures increase the measured drift value, but `adjtime()` compensates every second. No manual temperature compensation is needed.
+---
 
-## Accuracy Budget
+## Practical notes
+
+**Components**
+
+- `gps_pps_time` — PPS-disciplined time source. Captures the PPS edge in an interrupt (only
+  `micros()`, nothing that takes a lock), reconstructs wall-clock time in the main loop, and
+  corrects with `adjtime()` every second. Detects and self-corrects whole-second errors by
+  comparing the clock against NMEA absolute time.
+- `ntp_server` — RFC 5905 server on a dedicated core-1 task. Stamps T2 in the Ethernet
+  driver's receive path, pre-corrects T3 from the measured transmit trigger, keeps client
+  ARP entries warm, and refuses to answer at all when unsynchronised rather than serve a
+  wrong time.
+- `ethernet` — a fork of ESPHome's, supplying a custom SPI driver so timing can be observed,
+  and sharing one SPI handle rather than adding a second device.
+
+**Accuracy budget**
 
 | Source | Magnitude | Handling |
-|--------|-----------|----------|
-| Crystal drift (10 ppm) | ~10 µs/s | Corrected by `adjtime()` every PPS |
-| ISR latency (UART contention) | 0-10 ms (rare) | Detected and compensated; spikes filtered |
-| ISR-to-loop delay | ~100-500 µs | Measured and subtracted from drift |
-| `micros()`/`gettimeofday()` sampling gap | ~1-3 µs | Constant bias, absorbed by adjtime steady state |
-| Antenna cable delay | ~5 ns/m | Compensated via UBX-CFG-TP5 |
-| GPS PPS accuracy (LEA-M8T) | ~30 ns RMS | Reference accuracy, not compensatable |
+|---|---|---|
+| Crystal drift (10 ppm) | ~10 µs/s | `adjtime()` every PPS |
+| PPS interrupt latency | 0–10 ms, rare | detected, compensated, spikes filtered |
+| Clock read granularity | 1–3 µs | constant, absorbed by the loop |
+| Antenna cable delay | ~5 ns/m | compensated via UBX-CFG-TP5 |
+| GPS PPS itself | ~30 ns RMS | the reference; not compensatable |
 
-**Clock accuracy: ~5 µs**, bounded by crystal drift between PPS corrections and
-measured at ±5 µs over 100 days. Does not accumulate over time.
+Clock accuracy is **~5 µs**, bounded by crystal drift between corrections, measured over
+100 days. It does not accumulate.
 
-### What clients actually get
+**Diagnostics worth watching** — `t3_error` should sit on zero, `int_lead` around 20 µs,
+`arp_primes` should stay silent. Each is a regression that announces itself.
 
-Clock accuracy is not served accuracy. The NTP receive timestamp is currently
-stamped when ESPHome's main loop dispatches the component rather than when the
-packet arrived, and ESPHome's loop sleeps out a 16 ms interval. Both server
-timestamps shift by that queueing delay, so the client's computed offset is wrong
-by the full delay — and the round-trip delay measurement is unchanged, so no
-client can detect or filter it.
+**Building**
 
-| | |
-|---|---|
-| Clock vs GPS | ~5 µs |
-| Added by serving | ~3.3 ms (measured 2026-09-03) |
+```bash
+source virtenv/bin/activate
+esphome compile ntp_server.yaml
+```
 
-Work to close that gap is tracked in `docs/superpowers/plans/`.
+Temperature is handled implicitly: the crystal follows a parabola with its turnover near
+25 °C, drifting roughly 22 ppm at 50 °C against 10 ppm at 25 °C. The discipline loop simply
+measures whatever the drift currently is and corrects it, so no explicit temperature
+compensation is needed.
