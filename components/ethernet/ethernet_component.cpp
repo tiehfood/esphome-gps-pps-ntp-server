@@ -85,6 +85,22 @@ spi_device_handle_t g_w5500_spi_hdl = nullptr;
 SemaphoreHandle_t g_w5500_spi_lock = nullptr;
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
+// Write one W5500 register through the shared handle. Used only for the one-time
+// socket-buffer split in setup(), which must happen before esp_eth_start().
+static void w5500_reg_write8(uint8_t block, uint16_t addr, uint8_t value) {
+  if (g_w5500_spi_hdl == nullptr || g_w5500_spi_lock == nullptr)
+    return;
+  spi_transaction_t t = {};
+  t.cmd = addr;                                        // address phase (command_bits=16)
+  t.addr = static_cast<uint8_t>((block << 3) | 0x04);  // control phase: BSB + RWB=write
+  t.length = 8;
+  t.tx_buffer = &value;
+  if (xSemaphoreTake(g_w5500_spi_lock, pdMS_TO_TICKS(W5500_SPI_LOCK_TIMEOUT_MS)) == pdTRUE) {
+    spi_device_polling_transmit(g_w5500_spi_hdl, &t);
+    xSemaphoreGive(g_w5500_spi_lock);
+  }
+}
+
 void *w5500_shared_spi_init(const void *spi_config) {
   const auto *w5500_config = static_cast<const eth_w5500_config_t *>(spi_config);
   auto *spi = new EthSpiInfo();
@@ -369,6 +385,27 @@ void EthernetComponent::setup() {
   this->eth_handle_ = nullptr;
   err = esp_eth_driver_install(&eth_config, &this->eth_handle_);
   ESPHL_ERROR_CHECK(err, "ETH driver install error");
+
+#if CONFIG_ETH_SPI_ETHERNET_W5500
+  // RESEARCH: reserve 2KB of the W5500's 16KB RX/TX for socket 1, so a hardware UDP
+  // listener can be opened later WITHOUT touching the network.
+  //
+  // This is the only safe moment: esp_eth_driver_install() has just run
+  // w5500_setup_default() (which gives socket 0 all 16KB and zeroes sockets 1-7), and
+  // esp_eth_start() -- which opens socket 0 -- has not run yet. W5500 buffer sizes must
+  // not change while a socket is open.
+  //
+  // Doing it here is what lets the probe avoid esp_eth_stop(): that call drops the
+  // network, and with it the API connection and every bit of telemetry, at exactly the
+  // moment something goes wrong. An earlier revision did that and cost a USB recovery.
+  if (this->type_ == ETHERNET_TYPE_W5500) {
+    w5500_reg_write8(1, 0x001E, 14);  // Sn_RXBUF_SIZE(0) = 14KB
+    w5500_reg_write8(1, 0x001F, 14);  // Sn_TXBUF_SIZE(0) = 14KB
+    w5500_reg_write8(5, 0x001E, 2);   // Sn_RXBUF_SIZE(1) = 2KB
+    w5500_reg_write8(5, 0x001F, 2);   // Sn_TXBUF_SIZE(1) = 2KB
+    ESP_LOGD(TAG, "W5500 socket buffers split 14KB/2KB for socket 0/1");
+  }
+#endif
 
 #ifndef USE_ETHERNET_SPI
 #ifdef USE_ETHERNET_KSZ8081

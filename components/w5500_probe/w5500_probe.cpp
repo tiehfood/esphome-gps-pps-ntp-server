@@ -60,6 +60,7 @@ static const uint16_t REG_Sn_RX_RSR = 0x0026;    // received size waiting, 2 byt
 
 static const uint8_t Sn_MR_UDP = 0x02;
 static const uint8_t Sn_CR_OPEN = 0x01;
+static const uint8_t Sn_CR_CLOSE = 0x10;
 static const uint8_t SOCK_UDP = 0x22;
 
 void W5500Probe::setup() {
@@ -147,30 +148,23 @@ void W5500Probe::run_probe_sequence() {
     ESP_LOGE(TAG, "not set up, aborting probe");
     return;
   }
-  ESP_LOGI(TAG, "=== w5500_probe: starting probe sequence (RESEARCH SPIKE) ===");
-  esp_eth_handle_t eth = this->ethernet_->get_eth_handle();
+  ESP_LOGI(TAG, "=== w5500_probe: opening socket 1 (RESEARCH SPIKE) ===");
 
-  esp_err_t err = esp_eth_stop(eth);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "esp_eth_stop failed: %s", esp_err_to_name(err));
+  // NO esp_eth_stop()/esp_eth_start() here, deliberately. An earlier revision did that
+  // and the device never came back -- and because stop() drops the network first, we
+  // lost the API connection and every log line at exactly the moment it failed, so the
+  // cause was unobservable. The 14KB/2KB buffer split now happens once at boot in
+  // EthernetComponent::setup(), between esp_eth_driver_install() and esp_eth_start(),
+  // which is the only point where W5500 buffer sizes may legally change. Everything
+  // below only opens socket 1 and unmasks its interrupt; the network stays up.
+  uint8_t rxbuf1 = this->spi_read_reg_(socket_reg_block(1), REG_Sn_RXBUF_SIZE);
+  if (rxbuf1 == 0) {
+    ESP_LOGE(TAG, "socket 1 has no RX buffer (Sn_RXBUF_SIZE=0) -- the boot-time split in "
+                  "the ethernet component did not run; aborting so we do not read a false negative");
+    this->publish_status_("no buffer");
     return;
   }
-
-  // Buffer split: socket 0 keeps 14KB (down from the driver's default 16KB), socket 1
-  // gets the 2KB it needs for a UDP:123 listener. Values as specified by the spike --
-  // do not "round" these to power-of-two KB splits without checking the datasheet.
-  this->spi_write_reg_(socket_reg_block(0), REG_Sn_RXBUF_SIZE, 14);
-  this->spi_write_reg_(socket_reg_block(0), REG_Sn_TXBUF_SIZE, 14);
-  this->spi_write_reg_(socket_reg_block(1), REG_Sn_RXBUF_SIZE, 2);
-  this->spi_write_reg_(socket_reg_block(1), REG_Sn_TXBUF_SIZE, 2);
-
-  // esp_eth_driver_install() (not esp_eth_start()) is what calls w5500_setup_default(),
-  // so stop()/start() here preserves the split we just wrote -- no driver patch needed.
-  err = esp_eth_start(eth);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "esp_eth_start failed: %s", esp_err_to_name(err));
-    return;
-  }
+  ESP_LOGI(TAG, "socket 1 RX buffer = %uKB", rxbuf1);
 
   this->spi_write_reg_(socket_reg_block(1), REG_Sn_MR, Sn_MR_UDP);
   this->spi_write_reg16_(socket_reg_block(1), REG_Sn_PORT, 123);
@@ -234,28 +228,16 @@ void W5500Probe::recover() {
     ESP_LOGE(TAG, "not set up -- power-cycle the device to recover");
     return;
   }
-  esp_eth_handle_t eth = this->ethernet_->get_eth_handle();
-
-  esp_err_t err = esp_eth_stop(eth);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "esp_eth_stop failed: %s", esp_err_to_name(err));
-  }
-
-  this->spi_write_reg_(socket_reg_block(0), REG_Sn_RXBUF_SIZE, 16);
-  this->spi_write_reg_(socket_reg_block(0), REG_Sn_TXBUF_SIZE, 16);
-  this->spi_write_reg_(socket_reg_block(1), REG_Sn_RXBUF_SIZE, 0);
-  this->spi_write_reg_(socket_reg_block(1), REG_Sn_TXBUF_SIZE, 0);
-  // Belt-and-braces: esp_eth_start() below already restores SIMR=0x01 on its own
-  // (emac_w5500_start() writes it unconditionally), this just makes the state correct
-  // immediately rather than relying on that.
+  // Close socket 1 and re-mask its interrupt. Deliberately does NOT touch the buffer
+  // split or restart ethernet: buffer sizes may only change while sockets are closed,
+  // which is true exactly once, at boot. Socket 0 keeps its 14KB either way -- ample for
+  // MACRAW -- and a reboot restores the driver's defaults regardless, since every W5500
+  // register is volatile. Restarting ethernet from here is what previously bricked the
+  // network with no telemetry to explain it.
+  this->spi_write_reg_(socket_reg_block(1), REG_Sn_CR, Sn_CR_CLOSE);
   this->spi_write_reg_(BLOCK_COMMON, REG_SIMR, 0x01);
 
-  err = esp_eth_start(eth);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "esp_eth_start failed: %s -- power-cycle the device", esp_err_to_name(err));
-    return;
-  }
-  ESP_LOGI(TAG, "recovered: socket 0 back to 16KB/16KB, socket 1 cleared");
+  ESP_LOGI(TAG, "recovered: socket 1 closed, SIMR back to socket 0 only; network untouched");
   this->publish_status_("recovered");
 }
 
