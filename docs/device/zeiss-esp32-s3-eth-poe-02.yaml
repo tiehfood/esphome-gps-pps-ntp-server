@@ -1,0 +1,317 @@
+substitutions:
+  name: esp32-s3-eth-poe-02
+  friendly_name: "ESP32 Time"
+  id_prefix: "esp32_s3_02"
+
+preferences:
+  flash_write_interval: never
+  
+ota:
+  - platform: esphome
+
+api:
+  reboot_timeout: 0s # do not reboot if hassio connection is lost.
+
+debug:
+  update_interval: 60s
+
+web_server:
+  port: 80
+  version: 3
+  local: True
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: False 
+  on_boot:
+    # Trim the NMEA the module emits. ESPHome's gps component drains the whole UART
+    # buffer each loop and calls every listener once per COMPLETE SENTENCE, so sentence
+    # volume -- not byte rate -- is what costs main-loop time. With 25 satellites across
+    # four constellations the GSV burst dominated it (gps loop max 135 ms).
+    # Keep GGA and RMC every fix (time, date, fix quality, satellites-in-use); drop GLL,
+    # GSA and VTG entirely (unused); downrate GSV to every 10th fix, which still feeds
+    # the per-constellation satellite sensors.
+    # Re-applied on every boot deliberately: there is no V_BCKP battery, so the module
+    # loses this configuration on any power cycle.
+    priority: -100
+    then:
+      - delay: 3s
+      - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x01, 0x00, 0xFB, 0x11]
+      - delay: 120ms
+      - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x02, 0x00, 0xFC, 0x13]
+      - delay: 120ms
+      - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x05, 0x00, 0xFF, 0x19]
+      - delay: 120ms
+      - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x03, 0x0A, 0x07, 0x1F]
+      - delay: 120ms
+      - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x00, 0x01, 0xFB, 0x10]
+      - delay: 120ms
+      - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x04, 0x01, 0xFF, 0x18]
+      - logger.log: "NMEA output trimmed: GLL/GSA/VTG off, GSV every 10th fix" 
+
+ethernet:
+  id: eth_component
+  type: W5500
+  clk_pin: GPIO13
+  mosi_pin: GPIO11
+  miso_pin: GPIO12
+  cs_pin: GPIO14
+  interrupt_pin: GPIO10
+  reset_pin: GPIO09
+
+esp32:
+  variant: esp32s3 
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+logger:
+  baud_rate: 0
+  level: DEBUG
+  logs:
+    ethernet: INFO
+    gps_pps_time: INFO
+    ntp_server: INFO
+    sensor: INFO
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+one_wire:
+  - platform: gpio
+    id: temperature_bus
+    pin: GPIO3
+
+uart:
+  id: ${id_prefix}_uart
+  rx_pin: GPIO44
+  tx_pin: GPIO43
+  baud_rate: 115200
+
+gps:
+  id: ${id_prefix}_gps
+  uart_id: ${id_prefix}_uart
+
+time:
+  - platform: gps_pps_time
+    id: ${id_prefix}_pps
+    gps_id: ${id_prefix}_gps
+    pps_pin: GPIO1
+    update_interval: 60s
+    satellites:
+      id: ${id_prefix}_total_satellites
+      name: "Satellites"
+      icon: "mdi:satellite-variant"
+      accuracy_decimals: 0
+      state_class: measurement
+      force_update: false
+      disabled_by_default: false
+      internal: false
+    clock_offset:
+      id: ${id_prefix}_clock_offset
+      name: "Clock Offset"
+      icon: "mdi:clock-check-outline"
+      unit_of_measurement: "µs"
+      accuracy_decimals: 0
+      state_class: measurement
+    nmea_clock_delta:                                                                                                                                                              
+      id: nmea_clock_delta                                                                                                                                                         
+      name: "NMEA Clock Delta"                                                                                                                                                     
+      icon: "mdi:clock-alert"                                                                                                                                                      
+      unit_of_measurement: "ms"                                                                                                                                                    
+      accuracy_decimals: 0                                                                                                                                                         
+      state_class: measurement                                                                                                                                                     
+      entity_category: "diagnostic"
+    pps_drift:
+      id: ${id_prefix}_pps_raw_drift
+      name: "PPS Drift"
+      icon: "mdi:clock-alert-outline"
+      unit_of_measurement: "µs"
+      accuracy_decimals: 0
+      state_class: measurement
+    gps_satellites:
+      id: ${id_prefix}_gps_sat_count
+      name: "GPS Satellites"
+      icon: "mdi:satellite-variant"
+      accuracy_decimals: 0
+      state_class: measurement
+    galileo_satellites:
+      id: ${id_prefix}_galileo_sat_count
+      name: "Galileo Satellites"
+      icon: "mdi:satellite-variant"
+      accuracy_decimals: 0
+      state_class: measurement
+    crash_info:
+      id: last_crash_info
+      name: "Last Crash Info"
+      icon: "mdi:alert-circle-outline"
+      entity_category: "diagnostic"
+
+ntp_server:
+  id: ${id_prefix}_ntp
+  time_id: ${id_prefix}_pps
+  hook_latency:
+    id: ${id_prefix}_ntp_hook_latency
+    name: "NTP Hook Latency"
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "µs"
+    accuracy_decimals: 0
+    state_class: measurement
+    entity_category: "diagnostic"
+  rx_stamp_gap:
+    id: ${id_prefix}_ntp_rx_stamp_gap
+    name: "NTP RX Stamp Gap"
+    icon: "mdi:transfer-down"
+    unit_of_measurement: "µs"
+    accuracy_decimals: 0
+    state_class: measurement
+    entity_category: "diagnostic"
+  t3_error:
+    id: ${id_prefix}_ntp_t3_error
+    name: "NTP T3 Prediction Error"
+    icon: "mdi:target-variant"
+    unit_of_measurement: "µs"
+    accuracy_decimals: 0
+    state_class: measurement
+    entity_category: "diagnostic"
+  int_lead:
+    id: ${id_prefix}_ntp_int_lead
+    name: "NTP INT Lead"
+    icon: "mdi:flash-outline"
+    unit_of_measurement: "µs"
+    accuracy_decimals: 0
+    state_class: measurement
+    entity_category: "diagnostic"
+  arp_primes:
+    id: ${id_prefix}_ntp_arp_primes
+    name: "NTP ARP Primes"
+    icon: "mdi:lan-connect"
+    accuracy_decimals: 0
+    state_class: total_increasing
+    entity_category: "diagnostic"
+
+# RESEARCH SPIKE -- CLOSED 2026-09-04, disabled. The W5500 has ONE INTn pin shared by all
+# sockets, so a socket-1 interrupt IS socket 0's interrupt for the same frame: an earlier
+# hardware T2 stamp is physically impossible, which was the whole point. Socket 1 UDP does
+# coexist with MACRAW (interrupt masked), TCP mode black-holes all TCP, and SIMR=0x03 wedges
+# everything. Re-enabling also re-enables the boot-time socket-buffer split. Leave it off.
+# w5500_probe:
+#   ethernet_id: eth_component
+#   probe_button:
+#     id: ${id_prefix}_probe_button
+#     name: "W5500 Probe: Open Socket 1"
+#     entity_category: "diagnostic"
+#   alt_port_button:
+#     id: ${id_prefix}_probe_alt_port
+#     name: "W5500 Probe: Open Socket 1 (port 12345)"
+#     entity_category: "diagnostic"
+#   poll_only_button:
+#     id: ${id_prefix}_probe_poll_only
+#     name: "W5500 Probe: Poll Only (control)"
+#     entity_category: "diagnostic"
+#   dump_config_button:
+#     id: ${id_prefix}_probe_dump_config
+#     name: "W5500 Probe: Dump Config"
+#     entity_category: "diagnostic"
+#   simr_button:
+#     id: ${id_prefix}_probe_simr
+#     name: "W5500 Probe: Open Socket 1 + SIMR"
+#     entity_category: "diagnostic"
+#   tcp_button:
+#     id: ${id_prefix}_probe_tcp
+#     name: "W5500 Probe: Socket 1 TCP LISTEN (12345)"
+#     entity_category: "diagnostic"
+#   sustained_button:
+#     id: ${id_prefix}_probe_sustained
+#     name: "W5500 Probe: Sustained 10min (port 123)"
+#     entity_category: "diagnostic"
+#   recover_button:
+#     id: ${id_prefix}_probe_recover
+#     name: "W5500 Probe: Recover"
+#     entity_category: "diagnostic"
+#   rx_bytes:
+#     id: ${id_prefix}_probe_rx_bytes
+#     name: "W5500 Probe RX Bytes"
+#     entity_category: "diagnostic"
+#   socket_status:
+#     id: ${id_prefix}_probe_socket_status
+#     name: "W5500 Probe Socket Status"
+#     entity_category: "diagnostic"
+external_components:
+  - source:
+      type: local
+      path: ./ntp
+    components: [ ntp_server, gps_pps_time, ethernet ]
+
+
+light:
+  - platform: esp32_rmt_led_strip
+    channel_colors: GRB
+    pin: GPIO21 
+    num_leds: 4
+    chipset: ws2812
+    name: "${name} RGB LED"
+    id: ${id_prefix}_rgb
+    
+switch:
+  - platform: template
+    name: "${name} RGB LED"
+    id: ${id_prefix}_rgb_led_switch
+    turn_on_action:
+      - light.turn_on: ${id_prefix}_rgb
+    turn_off_action:
+      - light.turn_off: ${id_prefix}_rgb
+
+sensor:
+  - platform: uptime
+    id: ${id_prefix}_uptime
+    name: "Uptime"
+    update_interval: 60s
+    icon: mdi:clock-outline
+    entity_category: "diagnostic"
+  - platform: internal_temperature
+    id: ${id_prefix}_internal_temperature
+    name: "Internal Temperature"
+    entity_category: "diagnostic"
+  - platform: dallas_temp
+    address: 0xab0000007d86de28
+    id: temperature_ntp
+    name: NTP Server
+    update_interval: 600s
+  - platform: debug
+    free:
+      name: "Heap Free"
+      icon: "mdi:memory"
+      entity_category: "diagnostic"
+    psram:
+      name: "Free PSRAM"
+      icon: "mdi:memory"
+      entity_category: "diagnostic"
+    loop_time:
+      name: "Loop Time"
+      icon: "mdi:timer-outline"
+      entity_category: "diagnostic"
+
+text_sensor:
+  - platform: version
+    id: ${id_prefix}_version
+    name: "Version"
+    icon: mdi:cube-outline
+    entity_category: "diagnostic"
+  - platform: debug
+    reset_reason:
+      name: "Reset Reason"
+      icon: "mdi:restart-alert"
+      entity_category: "diagnostic"
+    device:
+      name: "Device Info"
+      entity_category: "diagnostic"
+
+button:
+  - platform: restart
+    id: ${id_prefix}_restart
+    name: Restart
+    icon: mdi:restart
+    entity_category: "diagnostic"
