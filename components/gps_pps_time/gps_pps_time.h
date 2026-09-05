@@ -38,7 +38,10 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   /// NTP reference timestamp (RFC 5905 7.3) — not the current time.
   /// A consistent (epoch, micros) pair: at esp_timer time `micros`, true UTC was exactly
   /// `epoch` seconds and 0 microseconds -- the PPS edge IS the second boundary.
-  /// `drift_us` is the measured clock gain per second, for frequency correction.
+  /// `drift_ppb` is the hardware-measured crystal rate error in parts per billion,
+  /// used to correct raw micros() elapsed time between edges. It is a RATE, not the
+  /// position error at the edge -- the two differ by roughly 2x (the discipline loop's
+  /// sawtooth centres at D/2, so the old position mean under-corrected the rate).
   ///
   /// Published as a unit under a seqlock because the pair is briefly inconsistent: the ISR
   /// stamps micros for edge N+1 before the main loop advances the epoch, and reading across
@@ -46,7 +49,7 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   struct PpsAnchor {
     time_t epoch;
     uint32_t micros;
-    int32_t drift_us;
+    int32_t drift_ppb;
   };
 
   /// False if no anchor has been published yet, or if a writer kept interrupting.
@@ -125,12 +128,53 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   /// compiler from ever caching it across the loop() write path).
   volatile bool pps_synced_{false};
 
+  // ---- Hardware PPS edge capture (MCPWM group 1; the W5500 INTn capture uses group 0).
+  //
+  // The GPIO ISR reads micros(): 1 us resolution plus interrupt-latency jitter. MCPWM
+  // latches the edge in hardware at a 12.5 ns tick (APB 80 MHz, the only source on S3,
+  // and the prescaler is not adjustable), so consecutive captures measure the PPS
+  // interval far more precisely than the ISR can.
+  //
+  // The capture register is 32-bit and wraps every 2^32 / 80e6 = 53.687 s. Consecutive
+  // PPS edges are ~1 s apart, so plain uint32 subtraction gives the interval correctly
+  // across a wrap; only a gap longer than 53 s would alias, and that is a lost-PPS case
+  // which is rejected below.
+  static const uint32_t PPS_CAPTURE_HZ = 80000000UL;
+  volatile uint32_t pps_cap_prev_{0};
+  volatile uint32_t pps_cap_interval_{0};  ///< ticks between the last two edges
+  volatile uint32_t pps_cap_count_{0};
+  sensor::Sensor *pps_interval_sensor_{nullptr};
+  bool pps_cap_started_{false};
+  bool pps_interval_pending_{false};
+
+ public:
+  void set_pps_interval_sensor(sensor::Sensor *s) { this->pps_interval_sensor_ = s; }
+  /// Crystal error in ppb, from the hardware-captured PPS interval. The GPS second is the
+  /// reference, so any deviation from PPS_CAPTURE_HZ ticks is our oscillator, measured to
+  /// ~12.5 ns in 1 s = 0.0125 ppm resolution -- about 80x finer than the ISR can manage.
+  int32_t pps_cap_ppb_mean_x256_{0};
+
+  /// Smoothed crystal rate error. A single reading quantises to one 12.5 ns capture
+  /// tick (12.5 ppb); averaging resolves below the tick.
+  int32_t pps_capture_ppb_mean() const { return this->pps_cap_ppb_mean_x256_ / 256; }
+
+  int32_t pps_capture_ppb() const {
+    const uint32_t iv = this->pps_cap_interval_;
+    if (iv == 0)
+      return 0;
+    return static_cast<int32_t>((static_cast<int64_t>(iv) - PPS_CAPTURE_HZ) * 1000000000LL /
+                                PPS_CAPTURE_HZ);
+  }
+  void start_pps_capture_();
+
+ protected:
+
   /// Seqlock-protected anchor; see get_pps_anchor(). Odd seq means a write is in flight.
   std::atomic<uint32_t> anchor_seq_{0};
   PpsAnchor anchor_{};
-  void publish_pps_anchor_(time_t epoch, uint32_t micros, int32_t drift_us) {
+  void publish_pps_anchor_(time_t epoch, uint32_t micros, int32_t drift_ppb) {
     this->anchor_seq_.fetch_add(1, std::memory_order_release);
-    this->anchor_ = PpsAnchor{epoch, micros, drift_us};
+    this->anchor_ = PpsAnchor{epoch, micros, drift_ppb};
     this->anchor_seq_.fetch_add(1, std::memory_order_release);
   }
   /// Whether coarse GPS time has been set (once)

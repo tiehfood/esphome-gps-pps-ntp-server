@@ -1,5 +1,8 @@
 #include "gps_pps_time.h"
 #include "esphome/core/log.h"
+#if defined(USE_ESP32) && defined(CONFIG_SOC_MCPWM_SUPPORTED)
+#include <driver/mcpwm_cap.h>
+#endif
 #include <sys/time.h>
 #include <cstdlib>
 #ifdef USE_ESP_IDF
@@ -55,10 +58,63 @@ void IRAM_ATTR GPSPPSTime::pps_isr(GPSPPSTime *self) {
   self->pps_flag_ = true;
 }
 
+#if defined(USE_ESP32) && defined(CONFIG_SOC_MCPWM_SUPPORTED)
+namespace {
+// ISR: only volatile stores. No logging, no allocation, nothing that takes a lock.
+GPSPPSTime *g_capture_owner = nullptr;
+}  // namespace
+
+/// Hardware-latch every PPS rising edge. Group 1 so it cannot collide with the W5500
+/// INTn capture, which uses group 0.
+void GPSPPSTime::start_pps_capture_() {
+  if (this->pps_cap_started_ || this->pps_pin_ == nullptr)
+    return;
+  mcpwm_cap_timer_handle_t timer = nullptr;
+  mcpwm_capture_timer_config_t tcfg = {};
+  tcfg.group_id = 1;
+  tcfg.clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT;
+  if (mcpwm_new_capture_timer(&tcfg, &timer) != ESP_OK) {
+    ESP_LOGW(TAG, "MCPWM capture timer unavailable; PPS interval not measured in hardware");
+    return;
+  }
+  mcpwm_cap_channel_handle_t chan = nullptr;
+  mcpwm_capture_channel_config_t ccfg = {};
+  ccfg.gpio_num = this->pps_pin_->get_pin();
+  ccfg.prescale = 1;
+  ccfg.flags.pos_edge = true;  // PPS is a rising edge, same as the GPIO interrupt
+  if (mcpwm_new_capture_channel(timer, &ccfg, &chan) != ESP_OK) {
+    ESP_LOGW(TAG, "MCPWM capture channel on GPIO%u failed", this->pps_pin_->get_pin());
+    return;
+  }
+  g_capture_owner = this;
+  mcpwm_capture_event_callbacks_t cbs = {};
+  cbs.on_cap = [](mcpwm_cap_channel_handle_t, const mcpwm_capture_event_data_t *ed, void *) -> bool {
+    auto *self = g_capture_owner;
+    if (self == nullptr)
+      return false;
+    const uint32_t now = ed->cap_value;
+    if (self->pps_cap_count_ != 0)
+      self->pps_cap_interval_ = now - self->pps_cap_prev_;  // uint32 wrap-safe
+    self->pps_cap_prev_ = now;
+    self->pps_cap_count_++;
+    return false;
+  };
+  mcpwm_capture_channel_register_event_callbacks(chan, &cbs, nullptr);
+  mcpwm_capture_channel_enable(chan);
+  mcpwm_capture_timer_enable(timer);
+  mcpwm_capture_timer_start(timer);
+  this->pps_cap_started_ = true;
+  ESP_LOGI(TAG, "PPS hardware capture armed on GPIO%u (12.5 ns tick)", this->pps_pin_->get_pin());
+}
+#else
+void GPSPPSTime::start_pps_capture_() {}
+#endif
+
 void GPSPPSTime::setup() {
   ESP_LOGI(TAG, "Setting up GPS PPS time source...");
   this->pps_pin_->setup();
   this->pps_pin_->attach_interrupt(&GPSPPSTime::pps_isr, this, gpio::INTERRUPT_RISING_EDGE);
+  this->start_pps_capture_();
 #ifdef USE_ESP_IDF
   esp_reset_reason_t reason = esp_reset_reason();
   if (reason == ESP_RST_PANIC && crash_ctx.magic == 0xDEAD5AFE) {
@@ -339,9 +395,24 @@ void GPSPPSTime::apply_pps_correction_() {
     // Publish the anchor now that epoch and micros are a consistent pair. Serving can
     // then derive UTC straight from esp_timer without gettimeofday() -- no lock, finer
     // resolution, and immune to the adjtime slew that is still being applied above.
-    // drift_mean is the per-second clock gain, used as a frequency term between edges.
-    this->publish_pps_anchor_(corrected_epoch, pps_micros,
-                              static_cast<int32_t>(this->drift_mean_x256_ / 256));
+    // Feed the anchor the hardware-captured rate error. adjtime does not touch
+    // esp_timer, so between edges raw micros() runs fast by exactly the crystal error.
+    // Until the capture has two edges, fall back to the old position-mean estimate.
+    int32_t rate_ppb;
+    if (this->pps_cap_count_ >= 3) {
+      const int32_t raw_ppb = this->pps_capture_ppb();
+      if (raw_ppb > -100000 && raw_ppb < 100000) {
+        if (this->pps_cap_ppb_mean_x256_ == 0) {
+          this->pps_cap_ppb_mean_x256_ = raw_ppb * 256;
+        } else {
+          this->pps_cap_ppb_mean_x256_ += (raw_ppb * 256 - this->pps_cap_ppb_mean_x256_) / 16;
+        }
+      }
+      rate_ppb = this->pps_capture_ppb_mean();
+    } else {
+      rate_ppb = static_cast<int32_t>(this->drift_mean_x256_ / 256) * 1000;
+    }
+    this->publish_pps_anchor_(corrected_epoch, pps_micros, rate_ppb);
 #else
     // Platforms without adjtime(): always correct, protect EMA from spikes
     // Subtract ISR latency from compensation so set_pps_time_ adds it to elapsed time
@@ -492,6 +563,12 @@ void GPSPPSTime::on_update(TinyGPSPlus &tiny_gps) {
 }
 
 void GPSPPSTime::update() {
+  // Hardware-captured PPS interval, as crystal error in ppb. The GPS second is the
+  // reference, so any deviation from 80e6 ticks is our oscillator. 12.5 ns resolution
+  // over 1 s = 0.0125 ppm, versus ~1 ppm for the micros() read in the GPIO ISR.
+  if (this->pps_interval_sensor_ != nullptr && this->pps_cap_interval_ != 0)
+    this->pps_interval_sensor_->publish_state(this->pps_capture_ppb());
+
   // Publish crash report from previous boot (once, after HA connection is ready)
   if (this->crash_report_pending_ && this->crash_info_sensor_ != nullptr) {
     this->crash_info_sensor_->publish_state(this->crash_report_);

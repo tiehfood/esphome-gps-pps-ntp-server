@@ -500,9 +500,11 @@ bool NTPServer::anchor_epoch_us_(int64_t at_us, int64_t &out_us) {
   if (elapsed > 2000000u)
     return false;
 
+  // drift_ppb is a RATE (crystal error in parts per billion), so it scales with elapsed
+  // time. Guard at +/-100 ppm; anything beyond that is a broken measurement, not a crystal.
   int64_t corrected = elapsed;
-  if (a.drift_us > -100 && a.drift_us < 100)
-    corrected -= (static_cast<int64_t>(elapsed) * a.drift_us) / 1000000LL;
+  if (a.drift_ppb > -100000 && a.drift_ppb < 100000)
+    corrected -= (static_cast<int64_t>(elapsed) * a.drift_ppb) / 1000000000LL;
   out_us = static_cast<int64_t>(a.epoch) * 1000000LL + corrected;
   return true;
 }

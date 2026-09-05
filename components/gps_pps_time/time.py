@@ -10,6 +10,7 @@ from esphome.const import (
 
 CONF_GPS_ID = "gps_id"
 CONF_PPS_PIN = "pps_pin"
+CONF_PPS_INTERVAL_PPB = "pps_interval_ppb"
 CONF_CLOCK_OFFSET = "clock_offset"
 CONF_PPS_DRIFT = "pps_drift"
 CONF_GPS_TIME = "gps_time"
@@ -46,6 +47,12 @@ CONFIG_SCHEMA = time_.TIME_SCHEMA.extend(
         cv.Optional(CONF_PPS_DRIFT): sensor.sensor_schema(
             unit_of_measurement="µs",
             icon="mdi:clock-alert-outline",
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+        cv.Optional(CONF_PPS_INTERVAL_PPB): sensor.sensor_schema(
+            unit_of_measurement="ppb",
+            icon="mdi:sine-wave",
             accuracy_decimals=0,
             state_class=STATE_CLASS_MEASUREMENT,
         ),
@@ -98,6 +105,10 @@ async def to_code(config):
     if offset_config := config.get(CONF_CLOCK_OFFSET):
         sens = await sensor.new_sensor(offset_config)
         cg.add(var.set_clock_offset_sensor(sens))
+
+    if ppb_config := config.get(CONF_PPS_INTERVAL_PPB):
+        sens = await sensor.new_sensor(ppb_config)
+        cg.add(var.set_pps_interval_sensor(sens))
 
     if drift_config := config.get(CONF_PPS_DRIFT):
         sens = await sensor.new_sensor(drift_config)
