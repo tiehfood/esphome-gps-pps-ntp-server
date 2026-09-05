@@ -30,7 +30,7 @@ esphome:
     # volume -- not byte rate -- is what costs main-loop time. With 25 satellites across
     # four constellations the GSV burst dominated it (gps loop max 135 ms).
     # Keep GGA and RMC every fix (time, date, fix quality, satellites-in-use); drop GLL,
-    # GSA and VTG entirely (unused); downrate GSV to every 10th fix, which still feeds
+    # GSA and VTG entirely (unused); downrate GSV to every 30th fix, which still feeds
     # the per-constellation satellite sensors.
     # Re-applied on every boot deliberately: there is no V_BCKP battery, so the module
     # loses this configuration on any power cycle.
@@ -43,12 +43,12 @@ esphome:
       - delay: 120ms
       - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x05, 0x00, 0xFF, 0x19]
       - delay: 120ms
-      - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x03, 0x0A, 0x07, 0x1F]
+      - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x03, 0x1E, 0x1B, 0x33]
       - delay: 120ms
       - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x00, 0x01, 0xFB, 0x10]
       - delay: 120ms
       - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x04, 0x01, 0xFF, 0x18]
-      - logger.log: "NMEA output trimmed: GLL/GSA/VTG off, GSV every 10th fix" 
+      - logger.log: "NMEA output trimmed: GLL/GSA/VTG off, GSV every 30th fix" 
 
 ethernet:
   id: eth_component
