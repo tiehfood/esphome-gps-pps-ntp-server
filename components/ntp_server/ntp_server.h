@@ -35,6 +35,8 @@ class NTPServer : public Component {
   void set_rx_stamp_gap_sensor(sensor::Sensor *sensor) { this->rx_stamp_gap_sensor_ = sensor; }
   void set_arp_primes_sensor(sensor::Sensor *sensor) { this->arp_primes_sensor_ = sensor; }
   void set_t3_error_sensor(sensor::Sensor *sensor) { this->t3_error_sensor_ = sensor; }
+  /// A/B: derive served timestamps from the PPS anchor instead of gettimeofday().
+  void set_use_pps_anchor(bool enable) { this->use_pps_anchor_ = enable; }
   void set_int_lead_sensor(sensor::Sensor *sensor) { this->int_lead_sensor_ = sensor; }
 #endif
 
@@ -59,6 +61,7 @@ class NTPServer : public Component {
 
   /// log2(s) of max(clock resolution, clock read cost), measured in setup (RFC 5905 11.1).
   int8_t precision_{-20};
+  volatile bool use_pps_anchor_{false};
 
   /// EWMA of sendto() duration, us. LWIP_TCPIP_CORE_LOCKING + the W5500's
   /// spi_device_polling_transmit mean sendto() runs the SPI write inline, so the
@@ -165,6 +168,7 @@ class NTPServer : public Component {
   /// -- gettimeofday()+esp_timer_get_time() read back-to-back here, minus the elapsed
   /// delta since hook_us. Never calls gettimeofday() at the hook itself.
   NTPTimestamp hook_to_ntp_timestamp_(int64_t hook_us);
+  bool anchor_epoch_us_(int64_t at_us, int64_t &out_us);
 #else
   WiFiUDP udp_;
 #endif

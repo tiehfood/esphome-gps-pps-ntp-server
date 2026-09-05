@@ -175,6 +175,7 @@ void GPSPPSTime::apply_pps_correction_() {
       // NMEA re-establishes epoch and coarse clock once satellites are reacquired.
       ESP_LOGW(TAG, "GPS fix lost (0 satellites): suspending PPS sync");
       this->pps_synced_ = false;
+    this->publish_pps_anchor_(0, 0, 0);  // invalidate: serving must fall back
       this->gps_time_valid_ = false;
       this->has_gps_time_ = false;
       this->last_gps_epoch_ = 0;
@@ -275,6 +276,7 @@ void GPSPPSTime::apply_pps_correction_() {
     ESP_LOGW(TAG, "Epoch diverged (%lld us), re-syncing from NMEA+PPS",
              (long long) this->last_drift_us_);
     this->pps_synced_ = false;
+    this->publish_pps_anchor_(0, 0, 0);  // invalidate: serving must fall back
     this->gps_time_valid_ = false;
     this->has_gps_time_ = false;
     this->last_gps_epoch_ = 0;
@@ -333,6 +335,13 @@ void GPSPPSTime::apply_pps_correction_() {
                (long long) this->last_drift_us_);
       this->last_clock_offset_us_ = this->drift_mean_x256_ / 256;
     }
+
+    // Publish the anchor now that epoch and micros are a consistent pair. Serving can
+    // then derive UTC straight from esp_timer without gettimeofday() -- no lock, finer
+    // resolution, and immune to the adjtime slew that is still being applied above.
+    // drift_mean is the per-second clock gain, used as a frequency term between edges.
+    this->publish_pps_anchor_(corrected_epoch, pps_micros,
+                              static_cast<int32_t>(this->drift_mean_x256_ / 256));
 #else
     // Platforms without adjtime(): always correct, protect EMA from spikes
     // Subtract ISR latency from compensation so set_pps_time_ adds it to elapsed time
@@ -459,6 +468,7 @@ void GPSPPSTime::on_update(TinyGPSPlus &tiny_gps) {
       ESP_LOGW(TAG, "NMEA/PPS epoch diverged: NMEA=%ld PPS=%ld diff=%lld — re-syncing",
                (long) val.timestamp, (long) this->last_gps_epoch_, (long long) epoch_diff);
       this->pps_synced_ = false;
+    this->publish_pps_anchor_(0, 0, 0);  // invalidate: serving must fall back
       this->gps_time_valid_ = false;
       this->has_gps_time_ = false;
       this->last_gps_epoch_ = 0;

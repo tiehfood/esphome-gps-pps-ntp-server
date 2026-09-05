@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "esphome/components/gps/gps.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
@@ -34,6 +36,32 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
 
   /// Epoch of the last PPS correction, 0 if never synced.
   /// NTP reference timestamp (RFC 5905 7.3) — not the current time.
+  /// A consistent (epoch, micros) pair: at esp_timer time `micros`, true UTC was exactly
+  /// `epoch` seconds and 0 microseconds -- the PPS edge IS the second boundary.
+  /// `drift_us` is the measured clock gain per second, for frequency correction.
+  ///
+  /// Published as a unit under a seqlock because the pair is briefly inconsistent: the ISR
+  /// stamps micros for edge N+1 before the main loop advances the epoch, and reading across
+  /// that window yields a NEW timestamp against an OLD epoch -- a full second wrong.
+  struct PpsAnchor {
+    time_t epoch;
+    uint32_t micros;
+    int32_t drift_us;
+  };
+
+  /// False if no anchor has been published yet, or if a writer kept interrupting.
+  bool get_pps_anchor(PpsAnchor &out) const {
+    for (int attempt = 0; attempt < 4; attempt++) {
+      const uint32_t before = this->anchor_seq_.load(std::memory_order_acquire);
+      if (before & 1u)
+        continue;  // a write is in progress
+      out = this->anchor_;
+      if (this->anchor_seq_.load(std::memory_order_acquire) == before)
+        return out.epoch != 0;
+    }
+    return false;
+  }
+
   time_t get_last_sync_epoch() const {
     return this->pps_synced_ ? static_cast<time_t>(this->last_gps_epoch_) : 0;
   }
@@ -96,6 +124,15 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   /// without volatile, but this documents the cross-thread read and stops the
   /// compiler from ever caching it across the loop() write path).
   volatile bool pps_synced_{false};
+
+  /// Seqlock-protected anchor; see get_pps_anchor(). Odd seq means a write is in flight.
+  std::atomic<uint32_t> anchor_seq_{0};
+  PpsAnchor anchor_{};
+  void publish_pps_anchor_(time_t epoch, uint32_t micros, int32_t drift_us) {
+    this->anchor_seq_.fetch_add(1, std::memory_order_release);
+    this->anchor_ = PpsAnchor{epoch, micros, drift_us};
+    this->anchor_seq_.fetch_add(1, std::memory_order_release);
+  }
   /// Whether coarse GPS time has been set (once)
   bool has_gps_time_{false};
   /// PPS pulse counter for throttling settimeofday calls

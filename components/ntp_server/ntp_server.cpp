@@ -440,6 +440,43 @@ NTPTimestamp NTPServer::micros_epoch_to_ntp_timestamp_(int64_t unix_us) {
   return ts;
 }
 
+/// UTC microseconds at a given esp_timer value, derived from the PPS anchor rather than
+/// the system clock.
+///
+/// The PPS edge IS the second boundary, so (epoch, micros) fixes the mapping exactly. This
+/// avoids gettimeofday() entirely: no s_time_lock, ~1 us to read instead of ~15, and --
+/// the real point -- the served time no longer rides the adjtime slew. adjtime() corrects
+/// offset only at a bounded rate, which leaves a sawtooth in the system clock; anchoring
+/// to PPS sidesteps that instead of halving it.
+///
+/// drift_us is the measured clock gain per second. esp_timer shares the crystal, so its
+/// elapsed reading is long by that much per second; subtracting it removes the residual
+/// between edges rather than letting it accumulate for a full second.
+///
+/// Returns false when there is no usable anchor -- unsynced, or the anchor is stale
+/// because PPS stopped -- and the caller must fall back to the system clock.
+bool NTPServer::anchor_epoch_us_(int64_t at_us, int64_t &out_us) {
+  auto *src = static_cast<gps_pps_time::GPSPPSTime *>(this->time_source_);
+  if (src == nullptr)
+    return false;
+  gps_pps_time::GPSPPSTime::PpsAnchor a;
+  if (!src->get_pps_anchor(a))
+    return false;
+
+  // uint32 subtraction handles the micros() wrap (71.6 min) correctly for the sub-second
+  // spans we care about. A larger span means PPS has stopped; refuse rather than
+  // extrapolate a stale anchor into a confidently wrong timestamp.
+  const uint32_t elapsed = static_cast<uint32_t>(at_us) - a.micros;
+  if (elapsed > 2000000u)
+    return false;
+
+  int64_t corrected = elapsed;
+  if (a.drift_us > -100 && a.drift_us < 100)
+    corrected -= (static_cast<int64_t>(elapsed) * a.drift_us) / 1000000LL;
+  out_us = static_cast<int64_t>(a.epoch) * 1000000LL + corrected;
+  return true;
+}
+
 NTPTimestamp NTPServer::hook_to_ntp_timestamp_(int64_t hook_us) {
   // Reconstructs the wall-clock time at the hook's stamp the same way
   // GPSPPSTime::apply_pps_correction_() reconstructs the PPS edge's wall-clock time --
@@ -448,6 +485,10 @@ NTPTimestamp NTPServer::hook_to_ntp_timestamp_(int64_t hook_us) {
   // esp_timer_get_time() back-to-back here and subtract the elapsed delta since
   // hook_us. Valid on the same grounds documented there: adjtime()'s slew is bounded
   // and settimeofday() is rare, so adjusted_boot_time() is stable across this window.
+  int64_t anchored_us;
+  if (this->use_pps_anchor_ && this->anchor_epoch_us_(hook_us, anchored_us))
+    return NTPServer::micros_epoch_to_ntp_timestamp_(anchored_us);
+
   struct timeval tv;
   gettimeofday(&tv, nullptr);
   const int64_t now_us = esp_timer_get_time();
@@ -571,6 +612,10 @@ void NTPServer::build_ntp_response_(const uint8_t *request, uint8_t *response,
 }
 
 NTPTimestamp NTPServer::get_ntp_timestamp_(int32_t offset_us) {
+  int64_t anchored_us;
+  if (this->use_pps_anchor_ && this->anchor_epoch_us_(esp_timer_get_time(), anchored_us))
+    return NTPServer::micros_epoch_to_ntp_timestamp_(anchored_us + offset_us);
+
   struct timeval tv;
   gettimeofday(&tv, nullptr);
 
