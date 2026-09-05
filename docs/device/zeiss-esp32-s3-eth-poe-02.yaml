@@ -264,7 +264,7 @@ switch:
     id: ${id_prefix}_pps_anchor
     entity_category: "diagnostic"
     optimistic: true
-    restore_mode: ALWAYS_OFF
+    restore_mode: ALWAYS_ON
     turn_on_action:
       - lambda: 'id(${id_prefix}_ntp).set_use_pps_anchor(true);'
     turn_off_action:

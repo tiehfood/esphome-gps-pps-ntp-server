@@ -63,7 +63,11 @@ class NTPServer : public Component {
   int8_t precision_{-20};
   /// Precision of the PPS-anchor path (esp_timer), measured separately at setup.
   int8_t precision_anchor_{-20};
-  volatile bool use_pps_anchor_{false};
+  /// Default ON. Measured against the gettimeofday path over 7 interleaved blocks:
+  /// precision -16 -> -19 (8x), root dispersion 244 -> 92 us (2.7x), and IQR 27.6 -> 22.9 us
+  /// (tighter in 10 of 12 pairwise block comparisons). Falls back automatically whenever no
+  /// usable anchor exists, so this is safe to leave on.
+  volatile bool use_pps_anchor_{true};
 
   /// EWMA of sendto() duration, us. LWIP_TCPIP_CORE_LOCKING + the W5500's
   /// spi_device_polling_transmit mean sendto() runs the SPI write inline, so the
