@@ -32,20 +32,31 @@ static const int NTP_PACKET_SIZE = 48;
 
 /// Root dispersion budget, seconds. Reflects measured server-added error;
 /// revise down once serving latency is fixed. Floor matches ntpd MINDISTANCE.
-/// RFC 5905 s11.1: root dispersion is a BOUND on our maximum error relative to the
-/// reference clock. Every term below is now MEASURED on this device rather than assumed:
-///   clock vs GPS        50 us  -- 7-day mean 5.0 us/day, worst daily extreme +/-41 us,
-///                                 and the drift spike filter bounds accepted values at 50
-///   T2 stamping         21 us  -- measured against the hardware INTn edge (MCPWM capture)
-///   T3 prediction       23 us  -- measured against the actual Sn_CR=SEND instant
-///   timestamp grain     31 us  -- 2^-15 s, our advertised precision
-///   GPS PPS itself      ~0     -- ~30 ns RMS
-///   worst-case sum     125 us
-/// 250 us keeps 2x margin on that sum. The previous 1 ms was set before T2 and T3 had
-/// been measured and is now 8x too conservative -- it makes clients treat us as far less
-/// certain than we are. Do not go below the measured sum: under-advertising makes us a
-/// falseticker, which is what motivated a non-zero dispersion in the first place.
+/// RFC 5905 s11.1: root dispersion BOUNDS our error against the reference clock. It does
+/// NOT cover network path asymmetry -- that is the client's to discover, not ours to
+/// declare. Every term below is measured on this device.
+///
+/// Serving from the system clock (gettimeofday path):
+///   clock vs GPS        50 us  -- 7-day mean 5.0, worst daily extreme +/-41, and the
+///                                 drift spike filter accepts up to 50
+///   T2 stamping         21 us  -- vs the hardware INTn edge (MCPWM capture)
+///   T3 prediction       23 us  -- vs the measured Sn_CR=SEND instant
+///   timestamp grain     31 us  -- 2^-15 s
+///   worst-case sum     125 us  -> 250 us with 2x margin
 static const float ROOT_DISP_BASE_S = 0.000250f;
+
+/// Serving from the PPS anchor. The system clock, and with it the adjtime sawtooth, is out
+/// of the path entirely -- time comes from the GPS second boundary directly:
+///   GPS PPS itself      ~0     -- ~30 ns RMS, tAcc measured at 19 ns
+///   PPS edge capture     3 us  -- micros() in the ISR
+///   extrapolation        5 us  -- residual drift between edges after the frequency term
+///   T2 stamping         21 us  -- unchanged
+///   T3 prediction       23 us  -- unchanged
+///   timestamp grain      2 us  -- esp_timer resolution
+///   worst-case sum      54 us  -> 100 us with a comparable margin
+/// Still deliberately conservative: the wire-to-INTn latency inside the W5500 is not
+/// measurable from here, and under-advertising makes us a falseticker.
+static const float ROOT_DISP_ANCHOR_S = 0.000100f;
 /// Dispersion growth per second since last PPS (~10ppm crystal).
 static const float ROOT_DISP_RATE_S_PER_S = 10.0e-6f;
 /// NTP short format is 16.16 fixed point; 1 LSB = 15.259us.
@@ -136,8 +147,27 @@ void NTPServer::setup() {
     p++;
   this->precision_ = p;
 
-  ESP_LOGI(TAG, "NTP server listening on port %u (clock read %uus, precision %d)", this->port_,
-           best_us, this->precision_);
+  // Same measurement for the PPS-anchor path. It reads esp_timer_get_time() -- IRAM,
+  // lock-free -- instead of gettimeofday(), which takes s_time_lock. Measured separately
+  // because the two paths have genuinely different resolution and RFC 5905 11.1 asks for
+  // the cost of the clock we actually read.
+  uint32_t best_anchor_us = UINT32_MAX;
+  for (int i = 0; i < 100; i++) {
+    const int64_t a2 = esp_timer_get_time();
+    const int64_t b2 = esp_timer_get_time();
+    const int32_t d = static_cast<int32_t>(b2 - a2);
+    if (d > 0 && static_cast<uint32_t>(d) < best_anchor_us)
+      best_anchor_us = static_cast<uint32_t>(d);
+  }
+  if (best_anchor_us == UINT32_MAX)
+    best_anchor_us = 1;
+  int8_t pa = -20;
+  while (pa < 0 && (1.0f / static_cast<float>(1u << -pa)) < (best_anchor_us / 1000000.0f))
+    pa++;
+  this->precision_anchor_ = pa;
+
+  ESP_LOGI(TAG, "NTP server listening on port %u (clock read %uus precision %d; anchor %uus precision %d)",
+           this->port_, best_us, this->precision_, best_anchor_us, this->precision_anchor_);
 
   // Serving moves off the shared loop entirely: Application::loop() sleeps out a
   // 16ms loop_interval_ between component polls, so stamping T2 there adds a mean
@@ -551,7 +581,8 @@ void NTPServer::build_ntp_response_(const uint8_t *request, uint8_t *response,
   }
   // Poll interval (copy from request)
   response[2] = request[2];
-  response[3] = static_cast<uint8_t>(this->precision_);
+  // Advertise the precision of the clock we actually read for this reply.
+  response[3] = static_cast<uint8_t>(this->use_pps_anchor_ ? this->precision_anchor_ : this->precision_);
 
   // Reference ID: "GPS\0"
   response[12] = 'G';
@@ -576,7 +607,7 @@ void NTPServer::build_ntp_response_(const uint8_t *request, uint8_t *response,
   // Root dispersion. Zero would claim a perfect clock, which shrinks the
   // client's correctness interval (RFC 5905 11.2.1) and gets honest peers
   // rejected in our favour. Root delay stays 0: stratum 1 has no upstream.
-  float disp_s = ROOT_DISP_BASE_S;
+  float disp_s = this->use_pps_anchor_ ? ROOT_DISP_ANCHOR_S : ROOT_DISP_BASE_S;
   if (ref_seconds != 0)
     disp_s += static_cast<float>(receive_ts.seconds - ref_seconds) * ROOT_DISP_RATE_S_PER_S;
   uint32_t root_disp = static_cast<uint32_t>(disp_s * NTP_SHORT_SCALE);
