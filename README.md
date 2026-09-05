@@ -11,8 +11,9 @@
 A GPS module supplies UTC over NMEA and a 1 PPS pulse on a GPIO. The PPS edge disciplines
 the ESP32 system clock; an NTP server on the device serves that clock to the LAN.
 
-Clock accuracy is **~5 µs** against GPS, stable over 100 days. Client-visible accuracy is
-**~60–100 µs**, limited by network path asymmetry rather than by the device.
+Clock accuracy is **~5 µs** against GPS, stable over 100 days. Clients measure the server
+**~60–100 µs** away, but that number bounds the *measurement*, not the device — see
+Measurement notes.
 
 ## The gap between clock accuracy and served accuracy
 
@@ -61,6 +62,11 @@ to control for network conditions, but delay is computed from T2 and T3 — cont
 absorbs part of the effect. One change measured as −12 ± 19 µs (indistinguishable from
 nothing) was −53 ± 19 µs once the known timestamp shift was added back before fitting.
 
+**The client's own stack is part of the measurement.** Taking T4 in userspace instead of
+from the kernel's `SO_TIMESTAMPING` added 41 µs of receive-path delay, and half of that
+landed directly in the reported offset. Correcting both client timestamps tightened the
+spread from 27 µs to 14.5 µs.
+
 **Tuning found the existing value was already correct.** Sweeping the T3 filter's smoothing
 rate gave a settled error RMS of 9.85 µs at the default, against 11.12, 11.91 and 15.27 at
 other rates. The weakness was not the rate but a single 1251 µs outlier that shifted the
@@ -79,9 +85,14 @@ Three checks, none of which depend on the network behaving:
   would give 240 or more.
 - **T3 prediction error** sits on zero.
 
-What remains is roughly 60–100 µs of path asymmetry — the difference between outbound and
-return transit time. NTP cannot separate that from a genuine clock offset, and measuring
-below it requires a client on the same network segment.
+What remains is unattributed, and honestly so. Moving the server onto the client's own
+network segment cut round-trip delay from 674 µs to 129 µs and left the measured offset
+unchanged — so the residual is not mainly path asymmetry, as this section previously claimed.
+
+The limit is the reference. Measuring a server to within tens of microseconds requires a
+client whose own clock is better than that, and neither available client qualifies: one is
+disciplined by this very server (circular), the other tracks an internet stratum-1 whose
+root distance is ±4 ms. Both were reporting their own error as if it were ours.
 
 ## Accuracy budget
 
