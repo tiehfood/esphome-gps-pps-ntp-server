@@ -408,8 +408,12 @@ void GPSPPSTime::apply_pps_correction_() {
           this->pps_cap_ppb_mean_x256_ += (raw_ppb * 256 - this->pps_cap_ppb_mean_x256_) / 16;
         }
       }
+    }
+    if (this->pps_cap_count_ >= 3 && this->use_hw_rate_) {
       rate_ppb = this->pps_capture_ppb_mean();
     } else {
+      // Legacy estimate, and the A/B "off" arm: the mean POSITION error at the edge used
+      // as a rate -- roughly half the true crystal error (see .claude/CLAUDE.md).
       rate_ppb = static_cast<int32_t>(this->drift_mean_x256_ / 256) * 1000;
     }
     this->publish_pps_anchor_(corrected_epoch, pps_micros, rate_ppb);

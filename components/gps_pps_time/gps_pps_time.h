@@ -53,6 +53,11 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   };
 
   /// False if no anchor has been published yet, or if a writer kept interrupting.
+  /// A/B switch for the anchor's frequency term: the MCPWM-captured crystal rate (default)
+  /// or the legacy position-mean estimate it replaced. The capture EMA keeps updating in
+  /// both states, so switching back takes effect at the next PPS edge.
+  void set_use_hw_rate(bool use) { this->use_hw_rate_ = use; }
+
   bool get_pps_anchor(PpsAnchor &out) const {
     for (int attempt = 0; attempt < 4; attempt++) {
       const uint32_t before = this->anchor_seq_.load(std::memory_order_acquire);
@@ -153,6 +158,7 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   /// reference, so any deviation from PPS_CAPTURE_HZ ticks is our oscillator, measured to
   /// ~12.5 ns in 1 s = 0.0125 ppm resolution -- about 80x finer than the ISR can manage.
   int32_t pps_cap_ppb_mean_x256_{0};
+  bool use_hw_rate_{true};  ///< A/B: false selects the legacy position-mean rate term
 
   /// Smoothed crystal rate error. A single reading quantises to one 12.5 ns capture
   /// tick (12.5 ppb); averaging resolves below the tick.
