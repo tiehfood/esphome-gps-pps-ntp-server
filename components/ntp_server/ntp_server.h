@@ -38,6 +38,9 @@ class NTPServer : public Component {
   /// A/B: derive served timestamps from the PPS anchor instead of gettimeofday().
   void set_use_pps_anchor(bool enable) { this->use_pps_anchor_ = enable; }
   void set_int_lead_sensor(sensor::Sensor *sensor) { this->int_lead_sensor_ = sensor; }
+  void set_refused_sensor(sensor::Sensor *sensor) { this->refused_sensor_ = sensor; }
+  void set_w5500_cmd_retries_sensor(sensor::Sensor *sensor) { this->w5500_cmd_retries_sensor_ = sensor; }
+  void set_w5500_cmd_max_sensor(sensor::Sensor *sensor) { this->w5500_cmd_max_sensor_ = sensor; }
 #endif
 
   void setup() override;
@@ -83,7 +86,17 @@ class NTPServer : public Component {
   /// persists for hundreds of requests. Rejecting isolated outliers and re-seeding on a
   /// sustained run recovers in a handful.
   static const uint8_t SEND_RESEED_AFTER = 4;
+  /// A re-seed also needs the rejected run to last this long. Measured 2026-09-10: under
+  /// outbound network load the send path stalls for ~1 s, and four stalled sends in a row used
+  /// to re-seed the estimate milliseconds high, stamping the next replies' T3 that much late.
+  /// A genuine change in the send path persists far longer than a stall.
+  static constexpr int64_t SEND_RESEED_MIN_SPAN_US = 3000000;
   uint8_t send_reject_run_{0};
+  /// Spread of the current run of rejects and when it began. A re-seed needs the rejects to
+  /// agree with each other to within SEND_STEP_MAX_US; stalled sends do not.
+  int32_t send_reject_min_{0};
+  int32_t send_reject_max_{0};
+  int64_t send_reject_first_us_{0};
 
   /// Dedicated FreeRTOS task blocked in recvfrom() -- stamps T2 on return instead of
   /// whenever ESPHome's shared loop next polls us. Runs for the component's lifetime;
@@ -107,6 +120,8 @@ class NTPServer : public Component {
     std::atomic<uint32_t> seq{0};
     uint8_t key[8]{};
     int64_t t{0};
+    /// The receive burst began long after the W5500 raised INTn: T2 is late, refuse.
+    bool rx_stalled{false};
   };
   static const int HOOK_RING_SIZE = 8;
   HookEntry hook_ring_[HOOK_RING_SIZE];
@@ -118,12 +133,31 @@ class NTPServer : public Component {
   /// also never registered as the input path, so it never runs with this still null.
   esp_netif_t *eth_netif_{nullptr};
 
-  /// Diagnostic only: microseconds between the hook's stamp and recv_task_()'s own
-  /// stamp on the most recent ring hit -- the latency this hook exists to remove.
-  /// Written only by recv_task_(); published from loop() (the main ESPHome task) --
-  /// never from recv_task_() itself, which must make no ESPHome API calls.
-  volatile int32_t last_hook_latency_us_{0};
-  volatile bool hook_latency_pending_{false};
+  /// Largest-magnitude sample since the last publish, and how many samples fed it. Written
+  /// from the driver task and ntp_recv, drained by loop() every TELEMETRY_INTERVAL_MS -- the
+  /// main ESPHome task, since the API must not be called from the other two. Lock-free, so
+  /// neither writer can block. Adjacent windows may trade a single sample; that is fine for
+  /// a diagnostic whose purpose is to show the worst case.
+  struct WindowMax {
+    std::atomic<int32_t> value{0};
+    std::atomic<uint32_t> count{0};
+    void add(int32_t v) {
+      int32_t cur = this->value.load(std::memory_order_relaxed);
+      while ((v < 0 ? -v : v) > (cur < 0 ? -cur : cur) &&
+             !this->value.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
+      }
+      this->count.fetch_add(1, std::memory_order_relaxed);
+    }
+    bool take(int32_t &out) {
+      if (this->count.exchange(0, std::memory_order_relaxed) == 0)
+        return false;
+      out = this->value.exchange(0, std::memory_order_relaxed);
+      return true;
+    }
+  };
+  /// Microseconds between the hook's stamp and recv_task_()'s own stamp on a ring hit --
+  /// the latency this hook exists to remove.
+  WindowMax hook_latency_win_;
   /// Phase 3 Step 3: microseconds between the driver reading Sn_RX_RSR and the input
   /// hook stamping T2 -- the SPI transfer + dispatch cost currently inside T2, and so
   /// the upper bound on what stamping T2 earlier could recover.
@@ -143,20 +177,23 @@ class NTPServer : public Component {
   void note_arp_client_(uint32_t addr);
   void refresh_arp_entries_();
 
+  /// Microseconds from the hardware INTn edge to our burst-start T2 stamp: GPIO ISR latency
+  /// plus driver task wake, normally 3-25 us. A stalled receive shows here as ~100 ms.
+  WindowMax int_lead_win_;
+  sensor::Sensor *int_lead_sensor_{nullptr};
   /// (actual Sn_CR=SEND instant) - (predicted send_us_). Positive means we stamped T3
   /// EARLIER than the packet really departed, i.e. we under-predict the send cost.
-  /// Microseconds from the hardware INTn edge to our burst-start T2 stamp: GPIO ISR
-  /// latency plus driver task wake. The last unclaimed part of T2.
-  volatile int32_t last_int_lead_us_{0};
-  volatile bool int_lead_pending_{false};
-  sensor::Sensor *int_lead_sensor_{nullptr};
-  volatile int32_t last_t3_error_us_{0};
-  volatile bool t3_error_pending_{false};
+  WindowMax t3_error_win_;
   sensor::Sensor *t3_error_sensor_{nullptr};
-  volatile int32_t last_rx_stamp_gap_us_{0};
-  volatile bool rx_stamp_gap_pending_{false};
+  WindowMax rx_stamp_gap_win_;
   sensor::Sensor *rx_stamp_gap_sensor_{nullptr};
   sensor::Sensor *hook_latency_sensor_{nullptr};
+  /// Requests refused because their receive stalled (total since boot).
+  std::atomic<uint32_t> refused_{0};
+  sensor::Sensor *refused_sensor_{nullptr};
+  sensor::Sensor *w5500_cmd_retries_sensor_{nullptr};
+  sensor::Sensor *w5500_cmd_max_sensor_{nullptr};
+  uint32_t telemetry_last_ms_{0};
 
   /// Registered with esp_eth_update_input_path() as the driver's stack_input. Runs in
   /// the W5500 driver's own task for EVERY received frame -- no ESPHome API calls, no
@@ -164,9 +201,9 @@ class NTPServer : public Component {
   /// path: failing to forward a frame here takes down all networking on the device.
   static esp_err_t eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffer, uint32_t length, void *priv);
   /// Records (key, t) in the ring. Called only from eth_input_hook_() (driver task).
-  void hook_record_(const uint8_t *key, int64_t t);
+  void hook_record_(const uint8_t *key, int64_t t, bool rx_stalled);
   /// Looks up a key written by hook_record_(). Called only from recv_task_() (our task).
-  bool hook_lookup_(const uint8_t *key, int64_t *t_out);
+  bool hook_lookup_(const uint8_t *key, int64_t *t_out, bool *rx_stalled_out);
   /// Converts an absolute Unix-epoch microsecond value to an NTPTimestamp.
   static NTPTimestamp micros_epoch_to_ntp_timestamp_(int64_t unix_us);
   /// Reconstructs the wall-clock time at a past esp_timer_get_time() reading, the same

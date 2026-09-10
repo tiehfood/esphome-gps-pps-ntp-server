@@ -3,6 +3,7 @@
 #include "esphome/components/gps_pps_time/gps_pps_time.h"
 
 #include <sys/time.h>
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 
@@ -74,6 +75,20 @@ static const int32_t SEND_US_MAX = 5000;
 /// keeps a rare scheduling hiccup from moving the estimate more than 12 us, while still
 /// allowing genuine change far beyond the ~10 us normal spread.
 static const int32_t SEND_STEP_MAX_US = 100;
+
+/// Refuse a request when its receive burst began this long after the W5500 raised INTn.
+/// Normal INTn-to-burst lead is 3-25 us. Under outbound TCP load the receive path stalls for
+/// up to ~100 ms (measured 2026-09-10 with the P4 probe: every minute, and on demand by
+/// downloading the web page), and a T2 stamped that late puts half of the delay into the
+/// client's offset. No reply beats a wrong one -- clients retry -- and 1 ms is still ~40x
+/// the normal lead.
+static const int32_t RX_STALL_MAX_US = 1000;
+/// An INTn edge older than this is not trusted as the arrival reference.
+static const int32_t RX_STALL_EDGE_MAX_AGE_US = 2000000;
+/// Per-request diagnostics are published as the largest-magnitude value per window. Publishing
+/// on every request put ~16 state messages/s through API and SSE at a 4 Hz client: outbound
+/// load of exactly the kind that stalls the receive path.
+static const uint32_t TELEMETRY_INTERVAL_MS = 10000;
 
 // ---- Platform-specific setup / loop ----
 
@@ -186,10 +201,9 @@ void NTPServer::setup() {
 
 void NTPServer::loop() {
   // Nothing to do on the request path itself: recv_task_() serves every request on
-  // its own task, blocked in recvfrom(). The one exception is the hook-latency
-  // diagnostic: recv_task_() can only record the value (a single volatile int32_t,
-  // atomic on this hardware -- see .claude/rules/firmware.md), publishing it is an
-  // ESPHome API call and must happen from this main-thread loop() instead.
+  // its own task, blocked in recvfrom(). Diagnostics are recorded there and in the driver
+  // task, and published here -- publishing is an ESPHome API call, only safe from this
+  // main-thread loop() -- once per TELEMETRY_INTERVAL_MS as the window's worst case.
   this->refresh_arp_entries_();
 
   if (this->arp_primes_pending_) {
@@ -198,32 +212,31 @@ void NTPServer::loop() {
       this->arp_primes_sensor_->publish_state(this->arp_primes_);
   }
 
-  if (this->t3_error_pending_) {
-    int32_t err_us = this->last_t3_error_us_;
-    this->t3_error_pending_ = false;
-    if (this->t3_error_sensor_ != nullptr)
-      this->t3_error_sensor_->publish_state(err_us);
-  }
+  const uint32_t now_ms = millis();
+  if (now_ms - this->telemetry_last_ms_ < TELEMETRY_INTERVAL_MS)
+    return;
+  this->telemetry_last_ms_ = now_ms;
 
-  if (this->int_lead_pending_) {
-    int32_t v = this->last_int_lead_us_;
-    this->int_lead_pending_ = false;
-    if (this->int_lead_sensor_ != nullptr)
-      this->int_lead_sensor_->publish_state(v);
-  }
+  int32_t v;
+  if (this->t3_error_win_.take(v) && this->t3_error_sensor_ != nullptr)
+    this->t3_error_sensor_->publish_state(v);
+  if (this->int_lead_win_.take(v) && this->int_lead_sensor_ != nullptr)
+    this->int_lead_sensor_->publish_state(v);
+  if (this->rx_stamp_gap_win_.take(v) && this->rx_stamp_gap_sensor_ != nullptr)
+    this->rx_stamp_gap_sensor_->publish_state(v);
+  if (this->hook_latency_win_.take(v) && this->hook_latency_sensor_ != nullptr)
+    this->hook_latency_sensor_->publish_state(v);
+  if (this->refused_sensor_ != nullptr)
+    this->refused_sensor_->publish_state(this->refused_.load(std::memory_order_relaxed));
 
-  if (this->rx_stamp_gap_pending_) {
-    int32_t gap_us = this->last_rx_stamp_gap_us_;
-    this->rx_stamp_gap_pending_ = false;
-    if (this->rx_stamp_gap_sensor_ != nullptr)
-      this->rx_stamp_gap_sensor_->publish_state(gap_us);
-  }
-  if (this->hook_latency_pending_) {
-    int32_t latency_us = this->last_hook_latency_us_;
-    this->hook_latency_pending_ = false;
-    if (this->hook_latency_sensor_ != nullptr)
-      this->hook_latency_sensor_->publish_state(latency_us);
-  }
+  const ethernet::W5500CmdStats cmd = ethernet::w5500_take_cmd_stats();
+  if (this->w5500_cmd_retries_sensor_ != nullptr)
+    this->w5500_cmd_retries_sensor_->publish_state(cmd.retried);
+  if (this->w5500_cmd_max_sensor_ != nullptr && cmd.commands > 0)
+    this->w5500_cmd_max_sensor_->publish_state(cmd.max_us);
+  if (cmd.overlaps > 0)
+    ESP_LOGD(TAG, "W5500 Sn_CR: %u commands, %u retried, max %u us, %u overlapping", (unsigned) cmd.commands,
+             (unsigned) cmd.retried, (unsigned) cmd.max_us, (unsigned) cmd.overlaps);
 }
 
 void NTPServer::recv_task_(void *param) {
@@ -255,19 +268,26 @@ void NTPServer::recv_task_(void *param) {
     // is exactly what eth_input_hook_() keyed its ring entry on -- it saw this same
     // request arrive, before lwIP, before this task woke.
     int64_t hook_t;
-    if (self->hook_lookup_(&buffer[40], &hook_t)) {
+    bool rx_stalled = false;
+    if (self->hook_lookup_(&buffer[40], &hook_t, &rx_stalled)) {
       receive_ts = self->hook_to_ntp_timestamp_(hook_t);
-      // Diagnostic only: how much later this task observed the same request vs.
-      // the hook. Stored here (not published -- ESPHome's API is not task-safe from
-      // a non-main task) and picked up by loop() on the main task.
-      self->last_hook_latency_us_ = static_cast<int32_t>(esp_timer_get_time() - hook_t);
-      self->hook_latency_pending_ = true;
+      // Diagnostic only: how much later this task observed the same request vs. the hook.
+      // Recorded here, published by loop() -- ESPHome's API is not task-safe from here.
+      self->hook_latency_win_.add(static_cast<int32_t>(esp_timer_get_time() - hook_t));
     }
 
     // No ESP_LOGD/publish_state here: ESPHome's logger and API are not task-safe
     // from a non-main task. Drop silently rather than working around it.
     if (!self->is_time_synchronized_())
       continue;
+
+    // The receive path stalled on this request: its T2 is late by up to ~100 ms, and half of
+    // that would land in the client's offset. Refuse rather than serve it; the client retries.
+    // Nothing is sent, so the T3 estimate cannot learn from a stalled send either.
+    if (rx_stalled) {
+      self->refused_.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
 
     // Remember who asked, so loop() can keep their ARP entry warm. Plain store only --
     // no lwIP calls from this task beyond the socket API.
@@ -294,8 +314,7 @@ void NTPServer::recv_task_(void *param) {
       // writing T3 that much too late on every reply.
       int32_t actual_us = static_cast<int32_t>(after.send_cmd_us - static_cast<uint32_t>(t0));
       if (actual_us > 0 && actual_us < SEND_US_MAX) {
-        self->last_t3_error_us_ = actual_us - self->send_us_;
-        self->t3_error_pending_ = true;
+        self->t3_error_win_.add(actual_us - self->send_us_);
         if (actual_us > SEND_US_MIN) {
           if (self->send_us_ == 0) {
             // Cold start: seed from the first real measurement rather than creeping up
@@ -307,15 +326,31 @@ void NTPServer::recv_task_(void *param) {
             if (innov > -SEND_STEP_MAX_US && innov < SEND_STEP_MAX_US) {
               self->send_us_ += innov >> SEND_EWMA_SHIFT;
               self->send_reject_run_ = 0;
-            } else if (++self->send_reject_run_ >= SEND_RESEED_AFTER) {
-              // Several measurements in a row disagree with the estimate by more than an
-              // outlier ever should. The estimate is wrong, not the samples -- this is how
-              // a slow first request after boot, or a genuine change in the send path,
-              // gets corrected instead of persisting.
-              self->send_us_ = actual_us;
-              self->send_reject_run_ = 0;
+            } else {
+              // A single outlier is ignored: clamping would still drag the estimate. A run of
+              // them re-seeds -- but only if the run is a changed send path, not a stall.
+              // Stalled sends disagree with each other as much as with the estimate, so a
+              // reject that widens the run's spread past SEND_STEP_MAX_US starts a new run.
+              if (self->send_reject_run_ == 0 ||
+                  std::max(self->send_reject_max_, actual_us) - std::min(self->send_reject_min_, actual_us) >=
+                      SEND_STEP_MAX_US) {
+                self->send_reject_min_ = actual_us;
+                self->send_reject_max_ = actual_us;
+                self->send_reject_first_us_ = t0;
+                self->send_reject_run_ = 1;
+              } else {
+                self->send_reject_min_ = std::min(self->send_reject_min_, actual_us);
+                self->send_reject_max_ = std::max(self->send_reject_max_, actual_us);
+                if (self->send_reject_run_ < 255)
+                  self->send_reject_run_++;
+              }
+              // Consistent AND longer than a stall lasts: the send path really changed (e.g. a
+              // slow first request after boot). Re-seed to the run's centre.
+              if (self->send_reject_run_ >= SEND_RESEED_AFTER && t0 - self->send_reject_first_us_ >= SEND_RESEED_MIN_SPAN_US) {
+                self->send_us_ = self->send_reject_min_ + (self->send_reject_max_ - self->send_reject_min_) / 2;
+                self->send_reject_run_ = 0;
+              }
             }
-            // A single outlier is simply ignored: clamping would still drag the estimate.
           }
           learned_from_hardware = true;
         }
@@ -376,13 +411,16 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
           int64_t t2 = t;
           ethernet::W5500RxStamps st = ethernet::w5500_rx_stamps();
           // The W5500 asserted INTn before any of this: hardware timestamp vs our stamp.
-          // This is the last unmeasured piece of T2 -- GPIO ISR plus driver task wake.
+          // Normally 3-25 us (GPIO ISR plus driver task wake). When the receive path stalls,
+          // the burst starts up to ~100 ms after the edge, T2 is that late, and the request is
+          // refused in recv_task_(). Edges older than RX_STALL_EDGE_MAX_AGE_US are not trusted.
+          bool rx_stalled = false;
           ethernet::W5500IntStamp ist = ethernet::w5500_int_stamp();
           if (ist.seq != 0 && st.burst_start_us != 0) {
             int32_t int_lead = static_cast<int32_t>(st.burst_start_us - ist.edge_us);
-            if (int_lead > 0 && int_lead < 20000) {
-              self->last_int_lead_us_ = int_lead;
-              self->int_lead_pending_ = true;
+            if (int_lead > 0 && int_lead < RX_STALL_EDGE_MAX_AGE_US) {
+              self->int_lead_win_.add(int_lead);
+              rx_stalled = int_lead >= RX_STALL_MAX_US;
             }
           }
 
@@ -400,11 +438,10 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
             int32_t gap = static_cast<int32_t>(static_cast<uint32_t>(t) - stamp);
             if (gap > 0 && gap < 20000) {
               t2 = t - gap;
-              self->last_rx_stamp_gap_us_ = gap;
-              self->rx_stamp_gap_pending_ = true;
+              self->rx_stamp_gap_win_.add(gap);
             }
           }
-          self->hook_record_(&buffer[ntp_offset + 40], t2);
+          self->hook_record_(&buffer[ntp_offset + 40], t2, rx_stalled);
         }
       }
     }
@@ -416,7 +453,7 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
   return esp_netif_receive(self->eth_netif_, buffer, length, NULL);
 }
 
-void NTPServer::hook_record_(const uint8_t *key, int64_t t) {
+void NTPServer::hook_record_(const uint8_t *key, int64_t t, bool rx_stalled) {
   HookEntry &slot = this->hook_ring_[this->hook_ring_next_];
   this->hook_ring_next_ = static_cast<uint8_t>((this->hook_ring_next_ + 1) % HOOK_RING_SIZE);
 
@@ -431,11 +468,12 @@ void NTPServer::hook_record_(const uint8_t *key, int64_t t) {
   std::atomic_thread_fence(std::memory_order_release);
   memcpy(slot.key, key, sizeof(slot.key));
   slot.t = t;
+  slot.rx_stalled = rx_stalled;
   std::atomic_thread_fence(std::memory_order_release);
   slot.seq.store(seq + 2, std::memory_order_relaxed);
 }
 
-bool NTPServer::hook_lookup_(const uint8_t *key, int64_t *t_out) {
+bool NTPServer::hook_lookup_(const uint8_t *key, int64_t *t_out, bool *rx_stalled_out) {
   for (int i = 0; i < HOOK_RING_SIZE; i++) {
     HookEntry &slot = this->hook_ring_[i];
     uint32_t s1 = slot.seq.load(std::memory_order_relaxed);
@@ -445,12 +483,14 @@ bool NTPServer::hook_lookup_(const uint8_t *key, int64_t *t_out) {
     uint8_t k[8];
     memcpy(k, slot.key, sizeof(k));
     int64_t t = slot.t;
+    bool rx_stalled = slot.rx_stalled;
     std::atomic_thread_fence(std::memory_order_acquire);
     uint32_t s2 = slot.seq.load(std::memory_order_relaxed);
     if (s1 != s2)
       continue;  // torn read (write happened mid-copy) -- skip, don't trust it
     if (memcmp(k, key, sizeof(k)) == 0) {
       *t_out = t;
+      *rx_stalled_out = rx_stalled;
       return true;
     }
   }

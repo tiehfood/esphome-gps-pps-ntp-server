@@ -1,7 +1,7 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import sensor, time as time_
-from esphome.const import CONF_ID, CONF_PORT, STATE_CLASS_MEASUREMENT
+from esphome.const import CONF_ID, CONF_PORT, STATE_CLASS_MEASUREMENT, STATE_CLASS_TOTAL_INCREASING
 
 # "ethernet" isn't touched through codegen (the hook reaches the driver via the C++
 # global esphome::ethernet::global_eth_component), but this component's code must be
@@ -16,6 +16,9 @@ CONF_RX_STAMP_GAP = "rx_stamp_gap"
 CONF_ARP_PRIMES = "arp_primes"
 CONF_T3_ERROR = "t3_error"
 CONF_INT_LEAD = "int_lead"
+CONF_REFUSED = "refused"
+CONF_W5500_CMD_RETRIES = "w5500_cmd_retries"
+CONF_W5500_CMD_MAX = "w5500_cmd_max"
 
 gps_pps_time_ns = cg.esphome_ns.namespace("gps_pps_time")
 GPSPPSTime = gps_pps_time_ns.class_("GPSPPSTime", time_.RealTimeClock)
@@ -30,8 +33,10 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_TIME_ID): cv.use_id(GPSPPSTime),
         # Diagnostic: microseconds between the input-path hook's T2 stamp (frame
         # delivered by the driver, before lwIP) and recv_task_()'s own T2 stamp on the
-        # same request. Only published on requests where the hook actually saw the
-        # frame -- see docs/superpowers/plans/2026-09-03-ntp-serving-latency.md.
+        # same request -- see docs/superpowers/plans/2026-09-03-ntp-serving-latency.md.
+        # hook_latency, rx_stamp_gap, t3_error and int_lead are each published every 10 s as
+        # the largest-magnitude value in that window, not per request: per-request publishing
+        # was itself outbound load that stalls the receive path.
         cv.Optional(CONF_HOOK_LATENCY): sensor.sensor_schema(
             unit_of_measurement="µs",
             icon="mdi:timer-sand",
@@ -58,6 +63,27 @@ CONFIG_SCHEMA = cv.Schema(
         ),
         cv.Optional(CONF_ARP_PRIMES): sensor.sensor_schema(
                         icon="mdi:lan-connect",
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+        # Requests refused because their receive stalled (INTn to burst start >= 1 ms), total
+        # since boot. A stalled request's T2 is late by up to ~100 ms; no reply beats a wrong one.
+        cv.Optional(CONF_REFUSED): sensor.sensor_schema(
+            icon="mdi:cancel",
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_TOTAL_INCREASING,
+        ),
+        # W5500 Sn_CR command handshakes (SEND / RECV) that needed more than one poll per
+        # window; each cost the calling task a 10 ms sleep in the stock driver.
+        cv.Optional(CONF_W5500_CMD_RETRIES): sensor.sensor_schema(
+            icon="mdi:timer-alert-outline",
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+        # Longest Sn_CR write-to-cleared time per window.
+        cv.Optional(CONF_W5500_CMD_MAX): sensor.sensor_schema(
+            unit_of_measurement="µs",
+            icon="mdi:timer-alert-outline",
             accuracy_decimals=0,
             state_class=STATE_CLASS_MEASUREMENT,
         ),
@@ -94,3 +120,15 @@ async def to_code(config):
     if arp_primes_config := config.get(CONF_ARP_PRIMES):
         sens = await sensor.new_sensor(arp_primes_config)
         cg.add(var.set_arp_primes_sensor(sens))
+
+    if refused_config := config.get(CONF_REFUSED):
+        sens = await sensor.new_sensor(refused_config)
+        cg.add(var.set_refused_sensor(sens))
+
+    if cmd_retries_config := config.get(CONF_W5500_CMD_RETRIES):
+        sens = await sensor.new_sensor(cmd_retries_config)
+        cg.add(var.set_w5500_cmd_retries_sensor(sens))
+
+    if cmd_max_config := config.get(CONF_W5500_CMD_MAX):
+        sens = await sensor.new_sensor(cmd_max_config)
+        cg.add(var.set_w5500_cmd_max_sensor(sens))

@@ -60,14 +60,30 @@ struct W5500SendStamp {
 };
 W5500SendStamp w5500_send_stamp();
 
-/// micros() captured in hardware (MCPWM) at the W5500 INTn falling edge. Diagnostic only:
-/// measured ~21 us ahead of the burst-start stamp, which is not worth acting on.
+/// micros() captured in hardware (MCPWM) at the W5500 INTn falling edge. Normally 3-25 us
+/// ahead of the burst-start stamp. Its real use is the exception: when the receive path
+/// stalls, the burst starts up to ~100 ms after this edge, and ntp_server refuses the request.
 struct W5500IntStamp {
   uint32_t edge_us;
   uint32_t seq;
 };
 W5500IntStamp w5500_int_stamp();
 void w5500_start_int_capture(int gpio_num);
+
+/// Sn_CR command handshakes since the last call; reading resets them. The stock driver writes a
+/// command -- SEND for every transmitted frame, RECV after every received one -- then polls
+/// Sn_CR until the chip clears it, sleeping vTaskDelay(10 ms) between polls (100 ms timeout).
+///   commands  handshakes seen to complete
+///   retried   of those, how many needed more than one poll: each cost the caller >= 10 ms
+///   max_us    longest write-to-cleared time
+///   overlaps  commands written while the previous one had not yet been seen to clear
+struct W5500CmdStats {
+  uint32_t commands;
+  uint32_t retried;
+  uint32_t max_us;
+  uint32_t overlaps;
+};
+W5500CmdStats w5500_take_cmd_stats();
 
 }  // namespace esphome::ethernet
 

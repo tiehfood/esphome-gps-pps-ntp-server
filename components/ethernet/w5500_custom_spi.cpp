@@ -10,6 +10,7 @@
 #endif
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <atomic>
 #include <cstring>
 #include <new>
 
@@ -53,6 +54,16 @@ volatile uint32_t g_send_cmd_us = 0;
 volatile uint32_t g_send_cmd_seq = 0;
 volatile uint32_t g_int_edge_us = 0;
 volatile uint32_t g_int_edge_seq = 0;
+// Sn_CR handshake tracking. The in-flight fields are written by whichever task issues a
+// command (the driver's RX task for RECV, the transmitting task for SEND); a race between them
+// is itself what `overlaps` exists to show, so these are diagnostic-grade, not exact.
+volatile uint32_t g_cr_write_us = 0;
+volatile uint32_t g_cr_polls = 0;
+volatile bool g_cr_pending = false;
+std::atomic<uint32_t> g_cr_commands{0};
+std::atomic<uint32_t> g_cr_retried{0};
+std::atomic<uint32_t> g_cr_max_us{0};
+std::atomic<uint32_t> g_cr_overlaps{0};
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
 /// Marks the start of a receive burst. READS ONLY -- deliberately.
@@ -121,12 +132,21 @@ esp_err_t w5500_custom_spi_transfer(W5500CustomSpiContext *ctx, spi_transaction_
 
 esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, const void *data, uint32_t len) {
   auto *ctx = static_cast<W5500CustomSpiContext *>(spi_ctx);
-  // LOCAL DELTA: NTP T3. Stamp the instant the chip is told to transmit -- strictly earlier
-  // than sendto() returns, which is what the estimate used to learn from and why T3 ran late.
-  if (addr == W5500_CTRL_S0_REG_WRITE && cmd == W5500_REG_SN_CR && len == 1 && data != nullptr &&
-      *static_cast<const uint8_t *>(data) == W5500_CMD_SEND) {
-    g_send_cmd_us = micros();
-    g_send_cmd_seq++;
+  if (addr == W5500_CTRL_S0_REG_WRITE && cmd == W5500_REG_SN_CR && len == 1 && data != nullptr) {
+    const uint32_t now_us = micros();
+    // LOCAL DELTA: NTP T3. Stamp the instant the chip is told to transmit -- strictly earlier
+    // than sendto() returns, which is what the estimate used to learn from and why T3 ran late.
+    if (*static_cast<const uint8_t *>(data) == W5500_CMD_SEND) {
+      g_send_cmd_us = now_us;
+      g_send_cmd_seq++;
+    }
+    // LOCAL DELTA: command handshake stats (see w5500_take_cmd_stats()).
+    if (g_cr_pending) {
+      g_cr_overlaps.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_cr_write_us = now_us;
+    g_cr_polls = 0;
+    g_cr_pending = true;
   }
   spi_transaction_t trans = {};
   trans.cmd = static_cast<uint16_t>(cmd);
@@ -161,6 +181,21 @@ esp_err_t w5500_custom_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void
   if (use_rxdata && (ret == ESP_OK)) {
     memcpy(data, trans.rx_data, len);
   }
+  // LOCAL DELTA: the driver polls Sn_CR until the chip clears the command it just wrote.
+  if (ret == ESP_OK && g_cr_pending && addr == W5500_CTRL_S0_REG_READ && cmd == W5500_REG_SN_CR && len == 1) {
+    g_cr_polls++;
+    if (static_cast<const uint8_t *>(data)[0] == 0) {
+      const uint32_t took_us = micros() - g_cr_write_us;
+      g_cr_pending = false;
+      g_cr_commands.fetch_add(1, std::memory_order_relaxed);
+      if (g_cr_polls > 1) {
+        g_cr_retried.fetch_add(1, std::memory_order_relaxed);
+      }
+      uint32_t cur = g_cr_max_us.load(std::memory_order_relaxed);
+      while (took_us > cur && !g_cr_max_us.compare_exchange_weak(cur, took_us, std::memory_order_relaxed)) {
+      }
+    }
+  }
   return ret;
 }
 
@@ -186,6 +221,11 @@ W5500RxStamps w5500_rx_stamps() {
 W5500SendStamp w5500_send_stamp() { return {g_send_cmd_us, g_send_cmd_seq}; }
 
 W5500IntStamp w5500_int_stamp() { return {g_int_edge_us, g_int_edge_seq}; }
+
+W5500CmdStats w5500_take_cmd_stats() {
+  return {g_cr_commands.exchange(0, std::memory_order_relaxed), g_cr_retried.exchange(0, std::memory_order_relaxed),
+          g_cr_max_us.exchange(0, std::memory_order_relaxed), g_cr_overlaps.exchange(0, std::memory_order_relaxed)};
+}
 
 void w5500_start_int_capture(int gpio_num) {
 #if defined(CONFIG_SOC_MCPWM_SUPPORTED)
