@@ -1,0 +1,479 @@
+<title>P4 Timing Probe</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --paper:#f2f3f5;
+    --surface:#ffffff;
+    --ink:#171b22;
+    --muted:#5b6675;
+    --hairline:#d5dae1;
+    --accent:#0b6e8f;
+    --accent-soft:#e2f0f5;
+    --signal:#b4530d;
+    --signal-soft:#fbeee1;
+    --verified:#17694a;
+    --verified-soft:#e3f1ea;
+    --diagram:#ffffff;
+    --shadow:0 1px 2px rgba(23,27,34,.06),0 8px 24px rgba(23,27,34,.05);
+    --measure:68ch;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --paper:#0f131a;
+      --surface:#171c25;
+      --ink:#e5eaf1;
+      --muted:#98a4b4;
+      --hairline:#2a323e;
+      --accent:#59bcdc;
+      --accent-soft:#132b36;
+      --signal:#e0913f;
+      --signal-soft:#2e2214;
+      --verified:#5cba8e;
+      --verified-soft:#132a20;
+      --diagram:#dfe5ec;
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.3);
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#0f131a;
+    --surface:#171c25;
+    --ink:#e5eaf1;
+    --muted:#98a4b4;
+    --hairline:#2a323e;
+    --accent:#59bcdc;
+    --accent-soft:#132b36;
+    --signal:#e0913f;
+    --signal-soft:#2e2214;
+    --verified:#5cba8e;
+    --verified-soft:#132a20;
+    --diagram:#dfe5ec;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.3);
+  }
+
+  *{box-sizing:border-box}
+  body{
+    background:var(--paper);
+    color:var(--ink);
+    font-family:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+    font-size:16px;
+    line-height:1.62;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1040px;margin:0 auto;padding:0 28px 96px}
+  .col{max-width:var(--measure)}
+
+  h1,h2,h3{font-family:"IBM Plex Sans Condensed","IBM Plex Sans",system-ui,sans-serif;text-wrap:balance;margin:0}
+  h1{font-size:clamp(2.1rem,5vw,3rem);font-weight:700;letter-spacing:-.015em;line-height:1.1}
+  h2{font-size:1.65rem;font-weight:700;letter-spacing:-.01em}
+  h3{font-size:1.12rem;font-weight:600}
+  p{margin:0}
+  a{color:var(--accent)}
+
+  .eyebrow{
+    font-family:"IBM Plex Mono",ui-monospace,monospace;
+    font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--muted);
+  }
+
+  header.masthead{
+    border-bottom:2px solid var(--ink);
+    padding:64px 0 28px;
+    display:flex;flex-direction:column;gap:18px;
+  }
+  .lede{font-size:1.14rem;color:var(--muted);max-width:60ch}
+  .meta{
+    display:flex;flex-wrap:wrap;gap:10px 28px;
+    font-family:"IBM Plex Mono",monospace;font-size:.78rem;color:var(--muted);
+    padding-top:6px;
+  }
+  .meta b{color:var(--ink);font-weight:500}
+
+  section{padding-top:56px;display:flex;flex-direction:column;gap:20px}
+  section > p,section > ul,section > ol{max-width:var(--measure)}
+  .sec-head{display:flex;flex-direction:column;gap:6px}
+
+  ul,ol{margin:0;padding-left:1.2em;display:flex;flex-direction:column;gap:9px}
+  li::marker{color:var(--accent)}
+
+  /* callouts */
+  .note{
+    border-left:3px solid var(--accent);
+    background:var(--accent-soft);
+    padding:16px 20px;border-radius:0 6px 6px 0;
+    display:flex;flex-direction:column;gap:8px;
+    max-width:var(--measure);
+  }
+  .note.warn{border-left-color:var(--signal);background:var(--signal-soft)}
+  .note .eyebrow{color:inherit;opacity:.75}
+  .note h3{font-size:1rem}
+
+  /* equation */
+  .eq{
+    background:var(--surface);border:1px solid var(--hairline);border-radius:8px;
+    padding:22px 24px;display:flex;flex-direction:column;gap:12px;
+    box-shadow:var(--shadow);max-width:var(--measure);
+  }
+  .eq code{
+    font-family:"IBM Plex Mono",monospace;font-size:1.18rem;color:var(--ink);
+    letter-spacing:.01em;
+  }
+  .eq .why{font-size:.92rem;color:var(--muted)}
+
+  /* tables */
+  .tablewrap{overflow-x:auto;border:1px solid var(--hairline);border-radius:8px;background:var(--surface);box-shadow:var(--shadow)}
+  table{border-collapse:collapse;width:100%;font-size:.9rem}
+  th,td{text-align:left;padding:11px 16px;border-bottom:1px solid var(--hairline);vertical-align:top}
+  thead th{
+    font-family:"IBM Plex Mono",monospace;font-size:.7rem;letter-spacing:.1em;
+    text-transform:uppercase;color:var(--muted);font-weight:500;
+    background:var(--paper);white-space:nowrap;
+  }
+  tbody tr:last-child td{border-bottom:none}
+  td code,th code{font-family:"IBM Plex Mono",monospace;font-size:.86em}
+  .num{font-variant-numeric:tabular-nums;white-space:nowrap}
+
+  .pill{
+    display:inline-block;font-family:"IBM Plex Mono",monospace;font-size:.68rem;
+    letter-spacing:.06em;text-transform:uppercase;padding:3px 9px;border-radius:3px;
+    background:var(--verified-soft);color:var(--verified);white-space:nowrap;font-weight:500;
+  }
+  .pill.gap{background:var(--signal-soft);color:var(--signal)}
+
+  /* diagrams */
+  figure{margin:0;display:flex;flex-direction:column;gap:10px}
+  .diagram{
+    background:var(--diagram);border:1px solid var(--hairline);border-radius:8px;
+    padding:20px;overflow-x:auto;box-shadow:var(--shadow);
+  }
+  .diagram pre.mermaid{margin:0;background:transparent;min-width:min-content}
+  figcaption{font-size:.85rem;color:var(--muted);max-width:var(--measure)}
+
+  /* phases */
+  .phases{display:flex;flex-direction:column;gap:14px}
+  .phase{
+    background:var(--surface);border:1px solid var(--hairline);border-radius:8px;
+    padding:20px 22px;display:grid;grid-template-columns:auto 1fr;gap:6px 20px;
+    box-shadow:var(--shadow);
+  }
+  .phase.gate{border-color:var(--signal);border-width:1px 1px 1px 3px}
+  .pnum{
+    font-family:"IBM Plex Mono",monospace;font-size:1.5rem;font-weight:500;
+    color:var(--accent);line-height:1.1;font-variant-numeric:tabular-nums;
+  }
+  .phase.gate .pnum{color:var(--signal)}
+  .pbody{display:flex;flex-direction:column;gap:9px;grid-column:2}
+  .ptitle{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px}
+  .accept{
+    font-size:.88rem;color:var(--muted);border-top:1px dashed var(--hairline);padding-top:9px;
+  }
+  .accept b{color:var(--ink);font-weight:500}
+
+  /* asks */
+  .asks{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}
+  .ask{
+    background:var(--surface);border:1px solid var(--hairline);border-left:3px solid var(--accent);
+    border-radius:0 8px 8px 0;padding:18px 20px;display:flex;flex-direction:column;gap:8px;
+  }
+  .ask h3{font-size:.98rem}
+  .ask p{font-size:.9rem;color:var(--muted)}
+
+  footer{margin-top:72px;padding-top:22px;border-top:1px solid var(--hairline);
+    font-size:.85rem;color:var(--muted);max-width:var(--measure)}
+
+  @media (max-width:620px){
+    .phase{grid-template-columns:1fr}
+    .pbody{grid-column:1}
+    header.masthead{padding-top:40px}
+  }
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <span class="eyebrow">Implementation plan &middot; 2026-09-10</span>
+  <h1>P4 Timing Probe</h1>
+  <p class="lede">A hardware-timestamped measurement instrument for the GPS/PPS stratum-1 NTP server — built because we can no longer measure our own improvements.</p>
+  <div class="meta">
+    <span><b>Target</b> Waveshare ESP32-P4 ETH PoE</span>
+    <span><b>Silicon</b> rev 1.3</span>
+    <span><b>Framework</b> ESP-IDF 5.5.1, bare app</span>
+    <span><b>Status</b> awaiting review</span>
+  </div>
+</header>
+
+<section>
+  <div class="sec-head">
+    <span class="eyebrow">Why</span>
+    <h2>The instrument is the bottleneck</h2>
+  </div>
+  <p>The server's own GPS-referenced clock holds 4–6&nbsp;µs. But every client we own reports it 60–100&nbsp;µs away, and that number moved by 105&nbsp;µs across one evening while the device itself never budged.</p>
+  <p>The cause is not the network. Moving the server onto the client's own network segment cut round-trip delay from 674&nbsp;µs to 129&nbsp;µs and left the offset unchanged. The clients are simply not references: one is disciplined by the very server it measures, the other tracks an internet stratum-1 with ±4&nbsp;ms root distance.</p>
+  <p>So changes below roughly 20&nbsp;µs are currently unfalsifiable. Last session's rate-term fix — a real correctness bug — could not be shown to help. This probe exists to end that.</p>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="eyebrow">Constraint</span>
+    <h2>What rev 1.3 costs us</h2>
+  </div>
+  <div class="note warn">
+    <span class="eyebrow">Confirmed from the board</span>
+    <p>The P4 carries <b>silicon revision 1.3</b>. The EMAC's hardware PPS <em>output</em> requires rev&nbsp;≥&nbsp;3, so there is no hardware path between the GPS pulse and the PTP clock. Every design choice here assumes that.</p>
+  </div>
+  <p>What survives is the part that matters most: per-frame TX and RX timestamps, captured in silicon at the start-of-frame delimiter on the RMII boundary. Against the current W5500 SPI taps — measured ~21&nbsp;µs behind the earliest electrical indication — that is a change of three orders of magnitude.</p>
+  <p>The auxiliary snapshot input, which would have latched GPS PPS directly into the PTP clock, is absent at <em>every</em> revision: the registers exist in Espressif's headers but no pad reaches the trigger. Rev 3 would not have given us that either.</p>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="eyebrow">Theory</span>
+    <h2>Delay is absolute; offset is not</h2>
+  </div>
+  <p>This asymmetry shapes the entire design, so it is worth stating precisely.</p>
+  <div class="eq">
+    <code>&delta; = (T4 &minus; T1) &minus; (T3 &minus; T2)</code>
+    <p class="why">T1 and T4 are P4 time; T2 and T3 are server time. The clock <em>offsets</em> cancel algebraically. Only relative <em>rate</em> error survives, and across a ~1&nbsp;ms round trip that is picoseconds.</p>
+  </div>
+  <p>A free-running P4 therefore measures round-trip delay to nanoseconds with no shared reference at all — which lets us compare measured delay against the physical minimum for a 90-byte frame at 100&nbsp;Mbit and attribute the excess to device latency.</p>
+  <div class="eq">
+    <code>&theta; = &frac12;[(T2 &minus; T1) + (T3 &minus; T4)] = &theta;<sub>true</sub> + c</code>
+    <p class="why">Here <em>c</em> is the P4's unknown clock offset. It does not cancel — but in an interleaved A/B it is constant across the window and drops out of the <em>difference</em> between the two arms.</p>
+  </div>
+  <p>Hence the split: absolute delay and differential offset come free in Phases 1–6. Absolute offset requires Phase 7, and lands softer.</p>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="eyebrow">Topology</span>
+    <h2>How the pieces sit</h2>
+  </div>
+  <figure>
+    <div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  GPS["LEA-M8T GPS<br/>1 PPS + NMEA"]
+  S3["ESP32-S3 + W5500<br/><b>NTP server under test</b><br/>T2/T3 in SPI driver"]
+  P4["ESP32-P4 probe<br/><b>T1/T4 in EMAC silicon</b><br/>~ns at the SFD"]
+  SW{{"UniFi USW Pro XG 10<br/>no PTP support"}}
+  MAC["Mac Studio<br/>control + analysis"]
+
+  GPS -->|"PPS + NMEA"| S3
+  GPS -.->|"PPS split — Phase 7 only<br/>signal + ground"| P4
+  S3 <--> SW
+  P4 <--> SW
+  MAC <--> SW
+  MAC -.->|"UDP: run N exchanges"| P4
+  MAC -.->|"HTTP: flip A/B switch"| S3
+</pre>
+    </div>
+    <figcaption>The probe stays deliberately dumb — it returns raw timestamp quadruples and nothing else. All statistics, interleaving and A/B control live in Python on the Mac, so the analysis can change without reflashing.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="eyebrow">Exchange</span>
+    <h2>Where each timestamp is taken</h2>
+  </div>
+  <figure>
+    <div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant P as P4 probe
+  participant S as S3 NTP server
+  Note over P: T1 — EMAC, at the SFD
+  P->>S: NTP request (mode 3)
+  Note over S: T2 — SPI driver, at Sn_RX_RSR read
+  Note over S: turnaround ≈ 1.6–2.4 ms
+  Note over S: T3 — predicted at Sn_CR = SEND
+  S->>P: NTP reply
+  Note over P: T4 — EMAC, at the SFD
+</pre>
+    </div>
+    <figcaption>The two server-side stamps are unchanged — this instrument measures them, it does not improve them. The gain is entirely on the client side, where software stamping previously injected 41&nbsp;µs of receive-path delay.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="eyebrow">Verified</span>
+    <h2>Checked against ESP-IDF 5.5.1 source</h2>
+  </div>
+  <p>Every capability below was confirmed by reading the local framework tree, not from documentation or summaries.</p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Capability</th><th>Evidence</th><th>State</th></tr></thead>
+      <tbody>
+        <tr><td><code>SOC_EMAC_IEEE1588V2_SUPPORTED</code> for P4</td><td><code>soc_caps.h:800</code></td><td><span class="pill">= 1</span></td></tr>
+        <tr><td>PTP ioctls — enable, get/set time, <code>ADJ_PTP_FREQ</code>, <code>ADJ_PTP_TIME</code>, target time + ISR callback</td><td><code>esp_eth_mac_esp.h:192–201</code></td><td><span class="pill">present</span></td></tr>
+        <tr><td>Compile gate is the SOC cap alone — no <code>CONFIG_</code> flag</td><td><code>esp_eth_mac_esp.c:307,456,627</code></td><td><span class="pill">no gate</span></td></tr>
+        <tr><td>RX path carries <code>void *info</code></td><td><code>esp_eth_driver.h:82,303</code></td><td><span class="pill">present</span></td></tr>
+        <tr><td>TX path <code>esp_eth_transmit_ctrl_vargs()</code></td><td><code>esp_eth_driver.h:338</code></td><td><span class="pill">present</span></td></tr>
+        <tr><td>MCPWM — 2 groups &times; 1 capture timer &times; 3 channels, PLL160M</td><td><code>soc_caps.h:456,464,465</code></td><td><span class="pill">6.25 ns</span></td></tr>
+        <tr><td><code>EMAC_PTP</code> register base</td><td><code>esp32p4.peripherals.ld:120</code></td><td><span class="pill">0x50098700</span></td></tr>
+        <tr><td><code>ts4all</code> — stamp every frame, not only PTP frames</td><td><code>emac_ll.h:686</code>, never called by <code>emac_hal.c:332</code></td><td><span class="pill gap">gap</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note">
+    <span class="eyebrow">The one gap</span>
+    <p>Our probes are NTP over UDP, so without <code>ts4all</code> the MAC stamps nothing we care about. <code>esp_eth_mac_enable_ts4all()</code> is master-only — but the low-level inline exists in 5.5.1 and <code>emac_hal_ptp_start()</code> simply never calls it. We set <code>EMAC_PTP.timestamp_ctrl.en_ts4all</code> ourselves: one register bit, reached through the linker-provided symbol. Considerably less invasive than the W5500 driver fork this project already carries.</p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="eyebrow">Sequence</span>
+    <h2>Seven phases, two gates</h2>
+  </div>
+  <figure>
+    <div class="diagram">
+<pre class="mermaid">
+flowchart TD
+  P1["1 · Bring-up<br/>Ethernet, IP101, link"] --> P2["2 · PTP clock alive"]
+  P2 --> G1{"3 · Does ts4all stamp<br/>plain UDP frames?"}
+  G1 -->|no| STOP["Stop, reassess<br/>fallback: newer ESP-IDF"]
+  G1 -->|yes| P4T["4 · TX timestamps"]
+  P4T --> P5["5 · NTP probe<br/>raw T1–T4 over UDP"]
+  P5 --> G2{"6 · Is the noise floor<br/>well under 1 µs?"}
+  G2 -->|no| HOLD["Phase 7 not worth it"]
+  G2 -->|yes| P7["7 · GPS PPS capture<br/>absolute, ±1–5 µs"]
+</pre>
+    </div>
+    <figcaption>Phase 3 is a genuine stop point, not a checkpoint — everything downstream assumes hardware stamps on ordinary UDP.</figcaption>
+  </figure>
+
+  <div class="phases">
+    <div class="phase">
+      <span class="pnum">1</span>
+      <div class="pbody">
+        <div class="ptitle"><h3>Bring-up</h3></div>
+        <p>Standalone ESP-IDF project outside the ESPHome tree. Internal EMAC with the IP101 over RMII, external 50&nbsp;MHz clock in on GPIO50 — the arrangement that avoids the MPLL/PSRAM conflict that can fail EMAC init.</p>
+        <p class="accept"><b>Done when</b> the board takes a DHCP lease and answers ping from the Mac Studio.</p>
+      </div>
+    </div>
+
+    <div class="phase">
+      <span class="pnum">2</span>
+      <div class="pbody">
+        <div class="ptitle"><h3>PTP clock alive</h3></div>
+        <p>Enable timestamping through the ioctl interface and poll the clock.</p>
+        <p class="accept"><b>Done when</b> the PTP clock advances monotonically at 1&nbsp;s/s with no rollover glitch between the seconds and nanoseconds registers.</p>
+      </div>
+    </div>
+
+    <div class="phase gate">
+      <span class="pnum">3</span>
+      <div class="pbody">
+        <div class="ptitle"><h3>ts4all and RX timestamps</h3><span class="pill gap">risk gate</span></div>
+        <p>Set the <code>en_ts4all</code> bit after <code>ptp_start</code>, register the receive callback, resolve the concrete type behind its <code>void *info</code>, and send the board an ordinary UDP packet.</p>
+        <p class="accept"><b>Done when</b> a hardware timestamp arrives for a <b>non-PTP</b> UDP frame and tracks the PTP clock. If it does not — stop here and reassess rather than build on it.</p>
+      </div>
+    </div>
+
+    <div class="phase">
+      <span class="pnum">4</span>
+      <div class="pbody">
+        <div class="ptitle"><h3>TX timestamps</h3></div>
+        <p>Transmit through the control path with a timestamp structure attached. The driver polls the descriptor for the stamp; Espressif's own comment notes a maximum of 31 loops observed on the P4 for a 1500-byte frame.</p>
+        <p class="accept"><b>Done when</b> every frame returns a plausible, monotonic stamp with no timeouts.</p>
+      </div>
+    </div>
+
+    <div class="phase">
+      <span class="pnum">5</span>
+      <div class="pbody">
+        <div class="ptitle"><h3>NTP probe</h3></div>
+        <p>Hand-built Ethernet/IP/UDP frame carrying a 48-byte NTP request, so transmission goes through the control path. Parse T2 and T3 from the reply; return raw quadruples over a UDP command interface.</p>
+        <p class="accept"><b>Done when</b> delay and offset computed on the Mac match the existing Python probe in magnitude, with visibly tighter scatter.</p>
+      </div>
+    </div>
+
+    <div class="phase gate">
+      <span class="pnum">6</span>
+      <div class="pbody">
+        <div class="ptitle"><h3>Characterise the floor</h3><span class="pill gap">go / no-go</span></div>
+        <p>Move the probe onto the server's own VLAN so no routed hop remains, then measure repeatability and compare delay against the computed physical minimum. Re-run the anchor A/B and the PPS rate-term change with the new instrument.</p>
+        <p class="accept"><b>Done when</b> we can state a defensible A/B resolution figure. This is the deliverable — if it is not well under 1&nbsp;µs, Phase 7 is not worth building.</p>
+      </div>
+    </div>
+
+    <div class="phase">
+      <span class="pnum">7</span>
+      <div class="pbody">
+        <div class="ptitle"><h3>Absolute reference</h3></div>
+        <p>Capture the GPS pulse on MCPWM at 6.25&nbsp;ns, then correlate the MCPWM timebase to the PTP clock in software — paired reads with <em>alternating order</em>, plus back-to-back reads of each counter to measure and subtract the inter-read skew, so the residual is variability rather than a fixed bias.</p>
+        <p class="accept"><b>Done when</b> the PTP-versus-GPS offset holds ±1–5&nbsp;µs, making the residual offset attributable and settling whether T3 is stamped early.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="eyebrow">Expectations</span>
+    <h2>What each phase actually buys</h2>
+  </div>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Quantity</th><th class="num">Today</th><th class="num">After Phase 6</th><th class="num">After Phase 7</th></tr></thead>
+      <tbody>
+        <tr><td>Round-trip delay</td><td class="num">±100 µs</td><td class="num">nanoseconds</td><td class="num">nanoseconds</td></tr>
+        <tr><td>A/B difference in offset</td><td class="num">±19 µs</td><td class="num">sub-µs (target)</td><td class="num">sub-µs</td></tr>
+        <tr><td>Absolute offset</td><td class="num">unmeasurable</td><td class="num">unmeasurable</td><td class="num">±1–5 µs</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note warn">
+    <span class="eyebrow">Stated plainly</span>
+    <p>Phase 7 cannot reach sub-microsecond on rev 1.3. With no hardware path from the capture timer to the PTP clock, the GPS link crosses software and carries a bias of order the register-read latency. The skew calibration removes the mean, not the variance. Against today's ~100&nbsp;µs uncertainty it is still a twentyfold improvement — enough to settle the open question of whether T3 is stamped ~124&nbsp;µs early — but it is not the nanosecond-grade reference a rev&nbsp;3 board would allow.</p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="eyebrow">Risks</span>
+    <h2>What could go wrong</h2>
+  </div>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Risk</th><th>Impact</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>ts4all</code> does not stamp plain UDP</td><td>Blocks everything downstream</td><td>Phase 3 gate; fall back to a newer ESP-IDF where the API is public</td></tr>
+        <tr><td><code>ptp_start</code> clears <code>en_ts4all</code></td><td>Silent loss of stamps</td><td>Set the bit after, re-verify after every link event</td></tr>
+        <tr><td>Type behind the RX <code>info</code> pointer unknown</td><td>Minor — resolved by reading source</td><td>Determine during Phase 3</td></tr>
+        <tr><td>Free GPIO for the PPS input unconfirmed</td><td>Blocks Phase 7 wiring</td><td>Confirm against the board pinout before wiring</td></tr>
+        <tr><td>Both boards are PoE-powered and isolated</td><td>Signal wire without a reference is meaningless</td><td>Ground wire is mandatory, plus a ~100 Ω series resistor</td></tr>
+        <tr><td>IP101 PHY latency asymmetry uncharacterised</td><td>Bounds absolute accuracy below ~1 µs</td><td>Affects Phase 7 only — delay and differential offset are immune</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="eyebrow">Handover</span>
+    <h2>Three things that need you</h2>
+  </div>
+  <div class="asks">
+    <div class="ask">
+      <h3>Move the probe's switch port</h3>
+      <p>Phase 6 needs the P4 on the server's VLAN so no routed hop remains. This is the expendable device, so it carries none of the risk we declined earlier for the Pi and the Mac Studio.</p>
+    </div>
+    <div class="ask">
+      <h3>Wire the PPS split</h3>
+      <p>Phase 7 needs the GPS pulse on a free P4 pin — signal plus a ~100 Ω series resistor <b>and a ground wire</b>. Both boards run on PoE and are galvanically isolated; without the ground reference the measurement is meaningless.</p>
+    </div>
+    <div class="ask">
+      <h3>Pick the input pin</h3>
+      <p>A free GPIO, avoiding the RMII set (34, 35, 28, 29, 30, 49), MDC&nbsp;31, MDIO&nbsp;52, PHY power&nbsp;51 and clock-in&nbsp;50.</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  Plan source: <code>docs/superpowers/plans/2026-09-09-p4-ntp-probe.md</code>. Capabilities verified against <code>~/.platformio/packages/framework-espidf</code> 5.5.1 on 2026-09-09. Implementation begins at Phase 1 on approval, reporting back at the Phase 3 gate before proceeding.
+</footer>
+
+</div>
