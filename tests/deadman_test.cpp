@@ -14,6 +14,7 @@
 #include <cstdlib>
 
 using esphome::ntp_server::DeadmanTimer;
+using esphome::ntp_server::int_level_still_short;
 
 static int g_failures = 0;
 
@@ -84,6 +85,13 @@ int main() {
     t.arm(0, 5000);
     check(t.remaining_ms(0) == 5000, "re-arming replaces the previous deadline");
   }
+
+  // int_level_still_short(): the INTLEVEL re-check guard used by design A''. A pure predicate
+  // deliberately kept trivial -- the value that matters is that it is actually called from
+  // loop() on a schedule, which this file cannot exercise, only the logic itself.
+  check(int_level_still_short(true, 0x0FFF), "int_level_still_short: read ok, still the short value -> true");
+  check(!int_level_still_short(true, 0xFFFF), "int_level_still_short: read ok, back to the driver default -> false");
+  check(!int_level_still_short(false, 0x0FFF), "int_level_still_short: read failed -> false regardless of value");
 
   std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "OK", g_failures);
   return g_failures ? EXIT_FAILURE : EXIT_SUCCESS;

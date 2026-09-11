@@ -45,5 +45,13 @@ class DeadmanTimer {
   uint32_t deadline_ms_{0};
 };
 
+/// Guard for design A ("W5500 Short Interrupt Wait"): the ESP-IDF driver can re-initialise the
+/// W5500 (e.g. after a recovered link event) and silently restore INTLEVEL to its own 0xFFFF
+/// default, while short_wait_effective_ -- set once at the original write -- would otherwise
+/// stay true forever. Pure so it is host-testable independent of the register read it guards.
+inline bool int_level_still_short(bool read_ok, uint16_t readback) {
+  return read_ok && readback == 0x0FFF;
+}
+
 }  // namespace ntp_server
 }  // namespace esphome

@@ -91,6 +91,10 @@ static const uint16_t W5500_INT_LEVEL_DEFAULT = 0xFFFF;
 /// How long an enabled short-interrupt-wait reverts itself if nobody calls
 /// set_short_int_wait(false) again -- a live register write with no other recovery path.
 static const uint32_t INT_WAIT_DEADMAN_MS = 1800000;  // 30 minutes
+/// How often loop() re-reads INTLEVEL while short_wait_effective_ is true, to catch the ESP-IDF
+/// driver silently restoring its own 0xFFFF default (e.g. after re-initialising the W5500) --
+/// see int_level_still_short() in deadman.h.
+static const uint32_t INT_LEVEL_RECHECK_MS = 60000;  // 60 seconds
 #endif
 
 /// Encodes an NTPTimestamp into the 8-byte big-endian wire format used for every timestamp
@@ -240,6 +244,25 @@ void NTPServer::loop() {
     ESP_LOGW(TAG, "dead-man expired: INTLEVEL restored to 0x%04X", readback);
   }
 
+  // Design A guard: the ESP-IDF driver can re-initialise the W5500 (e.g. after a link-recovery
+  // event) and silently restore INTLEVEL to its own 0xFFFF default -- see .claude/CLAUDE.md risk
+  // note. short_wait_effective_ was set once at the original write, so without this it would
+  // keep gating rx_admission()'s fresh-burst relaxation on a re-assertion window that no longer
+  // exists in hardware. Main task only; recv_task_() only reads the flag.
+  if (this->short_wait_effective_ &&
+      static_cast<int32_t>(millis() - this->int_level_recheck_ms_) >= 0) {
+    this->int_level_recheck_ms_ = millis() + INT_LEVEL_RECHECK_MS;
+    uint16_t readback = 0;
+    const bool read_ok = ethernet::w5500_read_int_level(&readback);
+    this->last_int_level_readback_ = read_ok ? readback : 0;
+    if (!int_level_still_short(read_ok, readback)) {
+      this->short_wait_effective_ = false;
+      this->int_wait_deadman_.disarm();  // nothing left to revert -- the register is not short
+      ESP_LOGW(TAG, "INTLEVEL is 0x%04X, not the short wait: edge-aware admission disabled",
+               readback);
+    }
+  }
+
   // Nothing to do on the request path itself: recv_task_() serves every request on
   // its own task, blocked in recvfrom(). Diagnostics are recorded there and in the driver
   // task, and published here -- publishing is an ESPHome API call, only safe from this
@@ -367,7 +390,8 @@ void NTPServer::recv_task_(void *param) {
     } else if (hook_hit) {
       const int32_t queued = queued_behind_bytes(hook.rx_rsr, hook.frame_len);
       const RxVerdict verdict = rx_admission(hook.capture_armed, hook.edge_usable, hook.lead_us,
-                                             self->strict_rx_admission_, self->short_wait_effective_, queued);
+                                             self->strict_rx_admission_, self->short_wait_effective_, queued,
+                                             hook.rx_gap_us);
       if (verdict == RxVerdict::OLD_EDGE)
         refuse_reason = REFUSE_OLD_EDGE;
       else if (verdict == RxVerdict::NO_EDGE)
@@ -664,6 +688,8 @@ void NTPServer::set_short_int_wait(bool enable) {
   // Design A': reflects hardware state, not just "was asked for" -- false on disable, and on
   // any failed write or a read-back that does not match what was requested.
   this->short_wait_effective_ = enable && write_ok && read_ok && readback == target;
+  if (this->short_wait_effective_)
+    this->int_level_recheck_ms_ = millis() + INT_LEVEL_RECHECK_MS;
 
   if (!write_ok || !read_ok) {
     if (!enable && !write_ok) {

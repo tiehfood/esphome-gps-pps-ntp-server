@@ -20,6 +20,14 @@ static constexpr int32_t RX_EDGE_LEAD_STRICT_US = 200;
 /// window bounds how late a real edge can be. Verified: in normal exchanges
 /// queued_behind_bytes() is 0 in 6,302 of 6,313 -- see docs/superpowers/plans/2026-09-09-p4-ntp-probe.md.
 static constexpr int32_t RX_QUEUED_BEHIND_MIN_BYTES = 60;
+/// Design A'' (fresh-burst admission): `HookInfo::rx_gap_us` -- the gap between the T2 stamp
+/// source and the hook -- separated design A's admitted-but-edgeless requests perfectly: late
+/// replies (0.48-1.8 ms) had a gap of 580-656 us, on-time ones 962-1,329 us, and normal
+/// fresh-edge exchanges a median of 1,046 us. A short gap means T2 came from the size read in
+/// the middle of an existing read burst, not the start of a fresh one, so the chip's own
+/// re-assertion window (the thing design A's relaxation was trusting) never applied to this
+/// request at all. See docs/superpowers/plans/2026-09-09-p4-ntp-probe.md.
+static constexpr int32_t RX_FRESH_BURST_MIN_GAP_US = 800;
 
 struct RxEdgeEval {
   bool edge_usable;
@@ -62,16 +70,18 @@ inline int32_t queued_behind_bytes(int32_t rx_rsr, int32_t frame_len) {
 /// additionally NO_EDGE once capture is armed and this request had no usable edge at all --
 /// unchanged from before design A' existed.
 ///
-/// Strict, short_wait_active=true (design A', "W5500 Short Interrupt Wait" is live): OLD_EDGE
-/// unchanged. But with the chip's own INTLEVEL re-assertion window shortened to ~109 us, a
-/// missing edge is no longer necessarily a stall -- the real edge can simply postdate the burst
-/// it explains (measured: strict refusals with nothing queued behind rose 4 -> 34 per 3,840 when
-/// this switch went live, zero of them losses). So NO_EDGE only fires when something else was
-/// ALSO queued behind this frame (queued_bytes >= RX_QUEUED_BEHIND_MIN_BYTES, or unknown -- -1
-/// is treated conservatively as queued, i.e. still refused); otherwise the 109 us bound is
-/// trusted and the request is accepted.
+/// Strict, short_wait_active=true (design A, "W5500 Short Interrupt Wait" is live): OLD_EDGE
+/// unchanged. With the chip's own INTLEVEL re-assertion window shortened to ~109 us, a missing
+/// edge is no longer necessarily a stall -- the real edge can simply postdate the burst it
+/// explains (measured: strict refusals with nothing queued behind rose 4 -> 34 per 3,840 when
+/// this switch went live, zero of them losses). Design A' relaxed this on `queued_bytes` alone
+/// and admitted 20 edge-less requests, 9 of them late by 0.48-1.8 ms -- all 20 had
+/// queued_bytes == 0, so that check never discriminated. Design A'' (this version) additionally
+/// requires `rx_gap_us >= RX_FRESH_BURST_MIN_GAP_US`: only a request whose T2 came from a fresh
+/// read burst (not the size read mid-burst) gets the benefit of the short re-assertion window.
+/// Unknown (-1) queued_bytes or rx_gap_us are both treated conservatively as a refusal.
 inline RxVerdict rx_admission(bool capture_armed, bool edge_usable, int32_t lead_us, bool strict,
-                               bool short_wait_active, int32_t queued_bytes) {
+                               bool short_wait_active, int32_t queued_bytes, int32_t rx_gap_us) {
   const int32_t threshold = strict ? RX_EDGE_LEAD_STRICT_US : RX_STALL_MAX_US;
   if (edge_usable && lead_us >= threshold)
     return RxVerdict::OLD_EDGE;
@@ -81,6 +91,8 @@ inline RxVerdict rx_admission(bool capture_armed, bool edge_usable, int32_t lead
   if (!short_wait_active)
     return RxVerdict::NO_EDGE;
   if (queued_bytes < 0 || queued_bytes >= RX_QUEUED_BEHIND_MIN_BYTES)
+    return RxVerdict::NO_EDGE;
+  if (rx_gap_us < RX_FRESH_BURST_MIN_GAP_US)
     return RxVerdict::NO_EDGE;
   return RxVerdict::ACCEPT;
 }

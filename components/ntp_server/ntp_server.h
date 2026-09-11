@@ -342,6 +342,9 @@ class NTPServer : public Component {
   /// short_int_wait_active() (a public, const-qualified convenience for callers outside the hot
   /// path, e.g. the INT diag command) -- one fewer function call per request, same value.
   volatile bool short_wait_effective_{false};
+  /// millis() of the last INTLEVEL re-check while short_wait_effective_ was true (see loop()) --
+  /// wrap-safe against the same subtraction idiom used by int_wait_deadman_. Main task only.
+  uint32_t int_level_recheck_ms_{0};
 
   // ---- Design B: "NTP Post-Write T3" ----
   /// EWMA estimate of the patch-callback-to-SEND delay, learned from every SEND that was
