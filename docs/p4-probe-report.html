@@ -430,7 +430,7 @@
 
   <div class="note warn">
     <span class="eyebrow">Where the two fixes stand</span>
-    <p><b>Late T3 is explained, and the explanation favours it.</b> The old path wrote a T3 about 21&nbsp;µs too early: its clock read came 16&nbsp;µs before the send timer started, and the send itself ran 5&nbsp;µs late. The patched T3 is early by only 3&nbsp;µs. The offset shift therefore comes from removing a bias, not adding one, and late T3 is proposed as the default.</p>
+    <p><b>Late T3 is explained, and the explanation favours it.</b> The old path wrote a T3 about 21&nbsp;µs too early: its clock read came 16&nbsp;µs before the send timer started, and the send itself ran 5&nbsp;µs late. The patched T3 is early by only 3&nbsp;µs. The offset shift therefore comes from removing a bias, not adding one. <b>Late T3 is now the default:</b> after the reboot all 29 of 29 test replies were patched, with no checksum errors at the client.</p>
     <p><b>The shorter interrupt wait still has no good trade.</b> The strict rule either refuses about 30 requests that are probably on time, or, when told to accept requests with nothing queued behind them, lets through replies where 9 of 20 were late. Both variants stay off.</p>
   </div>
 </section>
