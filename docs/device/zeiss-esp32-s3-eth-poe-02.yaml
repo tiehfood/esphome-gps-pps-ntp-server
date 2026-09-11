@@ -326,15 +326,15 @@ switch:
     turn_off_action:
       - lambda: 'id(${id_prefix}_ntp).set_diagnostics(false);'
 
-  # A/B, off until verified: refuse on a tight (200us) or missing INTn edge lead instead of the
-  # legacy 1ms-only rule. See rx_admission.h; re-evaluated per request, so this takes effect
-  # immediately either way.
+  # On by default (verified 2026-09-11: replies off by more than 1 ms 6.86 -> 0.53 per 1000):
+  # refuse on a tight (200us) or missing INTn edge lead instead of the legacy 1ms-only rule. Kept
+  # as a switch for later A/Bs; re-evaluated per request, so it takes effect immediately.
   - platform: template
     name: "NTP Strict RX Admission"
     id: ${id_prefix}_ntp_strict_rx_admission
     entity_category: "diagnostic"
     optimistic: true
-    restore_mode: ALWAYS_OFF
+    restore_mode: ALWAYS_ON
     turn_on_action:
       - lambda: 'id(${id_prefix}_ntp).set_strict_rx_admission(true);'
     turn_off_action:

@@ -195,9 +195,11 @@ class NTPServer : public Component {
   sensor::Sensor *w5500_cmd_max_sensor_{nullptr};
   uint32_t telemetry_last_ms_{0};
 
-  /// A/B, off by default: refuse on a tight (200us) or missing INTn edge lead. See
-  /// rx_admission.h. Evaluated fresh per request, so flipping this takes effect immediately.
-  volatile bool strict_rx_admission_{false};
+  /// On by default: refuse on a tight (200us) or missing INTn edge lead. See rx_admission.h.
+  /// Verified 2026-09-11 in an interleaved A/B against a pre-registered prediction: replies off
+  /// by more than 1 ms 6.86 -> 0.53 per 1000, refusals 1.41 -> 2.79 %. Kept switchable for later
+  /// A/Bs; evaluated fresh per request, so flipping it takes effect immediately.
+  volatile bool strict_rx_admission_{true};
 
   /// Reasons a request can be refused, recorded in DiagRecord::refuse_reason and the REQ dump.
   static constexpr uint8_t REFUSE_NONE = 0;

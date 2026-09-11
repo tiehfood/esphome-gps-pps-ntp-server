@@ -358,8 +358,37 @@
 
   <div class="note warn">
     <span class="eyebrow">Two new defects</span>
-    <p><b>A wrong send estimate can last for minutes.</b> The first send after boot took 2.6&nbsp;ms and seeded the estimate. Sparse requests afterwards agreed with it, so it never re-seeded. When the probe's steady stream began (sends ~1.0&nbsp;ms), 15 replies went out with T3 0.77&nbsp;ms late before a re-seed. <span id="idle-result">It is not idleness: after 0.25–60&nbsp;s of silence, sends still take 1.04&nbsp;ms. It is ordinary service, though. Overnight, with no test running, a quarter of the ten-second windows showed a reply leaving 1.5–1.75&nbsp;ms after its T3. In a 20-minute passive capture, every slow send went to an SNTP-style client, one that leaves the transmit field empty, and SNTP clients set their clock from T3 alone. The cause is an ARP miss. For that client the server has no cached hardware address, so the reply waits in a queue while an ARP request goes out. All four slow sends sat next to the server's ARP request and its answer, where chance alone would give about 4%. All ten requests from SNTP-style clients triggered an ARP request, and none of the ten from other clients did. Worse, about half of these delays go unmeasured: the server records the ARP request's send, which looks normal, while the reply actually leaves later. So every reply to such a client carries an early T3.</span></p>
+    <p><b>A wrong send estimate can last for minutes.</b> The first send after boot took 2.6&nbsp;ms and seeded the estimate. Sparse requests afterwards agreed with it, so it never re-seeded. When the probe's steady stream began (sends ~1.0&nbsp;ms), 15 replies went out with T3 0.77&nbsp;ms late before a re-seed. <span id="idle-result">It is not idleness: after 0.25–60&nbsp;s of silence, sends still take 1.04&nbsp;ms. It is ordinary service, though. Overnight, with no test running, a quarter of the ten-second windows showed a reply leaving 1.5–1.75&nbsp;ms after its T3. In a 20-minute passive capture, every slow send went to an SNTP-style client, one that leaves the transmit field empty, and SNTP clients set their clock from T3 alone. The cause is an ARP miss. For that client the server has no cached hardware address, so the reply waits in a queue while an ARP request goes out. All four slow sends sat next to the server's ARP request and its answer, where chance alone would give about 4%. All ten requests from SNTP-style clients triggered an ARP request, and none of the ten from other clients did. Worse, about half of these delays go unmeasured: the server records the ARP request's send, which looks normal, while the reply actually leaves later. So every reply to such a client carries an early T3. A second run from another host, with its prediction written down first, gave the same result: four of four slow sends next to an ARP exchange, and every ARP exchange from these clients.</span></p>
     <p><b>The receive hook can match a stale request.</b> Its 8-entry lookup returns the first entry with the same client transmit field and never checks age. A client that repeats that field, or leaves it zero, can be served a receive timestamp minutes old. Home Assistant's hook-latency history shows 11–574&nbsp;s matches on both the old and new firmware.</p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="eyebrow">Fixed</span>
+    <h2>Four fixes, each tested against a written prediction</h2>
+  </div>
+  <p>Every prediction below was committed before the firmware was flashed. The strict-admission rule was tested in interleaved four-minute blocks (off, on, on, off, twice) under the same web load as before, so drift in the network couldn't pass for an effect.</p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Fix</th><th>Prediction</th><th>Measured</th><th>State</th></tr></thead>
+      <tbody>
+        <tr><td>Resolve the client's address before stamping T3</td><td>No slow sends; every reply that had to wait for ARP sends on time</td><td>0 slow sends in 30&nbsp;min; 6 of 6 waited replies within ±150&nbsp;µs of the estimate</td><td><span class="pill">passed</span></td></tr>
+        <tr><td>Match receive times by client, newest first, under 1&nbsp;s old</td><td>No SNTP-style request matches an old entry</td><td>13 of 13 matched fresh entries; worst 1.8&nbsp;ms, down from minutes</td><td><span class="pill">passed</span></td></tr>
+        <tr><td>Stricter refusal rule (switch)</td><td>Replies off by more than 1&nbsp;ms at most 2 per 1,000 with the rule on</td><td>6.86 per 1,000 off vs <b>0.53 per 1,000</b> on (26 vs 2 replies)</td><td><span class="pill">passed</span></td></tr>
+        <tr><td></td><td>At most 2.5 points more refusals</td><td>1.41% off vs 2.79% on</td><td><span class="pill">passed</span></td></tr>
+        <tr><td></td><td>Noise floor within ±1&nbsp;µs</td><td>7.13 vs 7.73&nbsp;µs, higher with the rule on in 3 of 4 block pairs</td><td><span class="pill">passed</span></td></tr>
+        <tr><td>Name the :07 sender</td><td>Senders covering 80% of the burst identified</td><td>One Ubiquiti device sending VLAN-tagged broadcasts: 80% alone, 91% with its mDNS. IPv6 is 1%.</td><td><span class="pill">passed</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <span class="eyebrow">What the verification also turned up</span>
+    <p><b>Some clients answer ARP slowly.</b> A quarter of the requests in the passive run came from clients whose ARP reply took longer than the 20&nbsp;ms wait, so they were refused. Every one of them asked again 3–4&nbsp;s later and got a correct reply. No wrong timestamp went out, but they need one extra request each time.</p>
+    <p><b>The :07 burst was a switch setting, not firmware, and it's now fixed.</b> Tagged broadcasts reaching the server meant its switch port forwarded other VLANs, and the W5500 can't filter those frames without also dropping ARP. After the port was restricted to its native VLAN, tagged frames fell from 20.5 per second to effectively none (4 frames in 10 minutes). Busy moments fell to a third, and what remains is ordinary mDNS.</p>
+    <p><b>Decisions taken.</b> The stricter refusal rule is now on by default. The ARP wait stays at 20&nbsp;ms: a longer wait would save slow clients one retry, but it would hold up every other client meanwhile and make the server easier to stall.</p>
+    <p><b>Still being checked:</b> an overnight share of early-T3 windows, predicted at 2% or less against 24% before, and a day of receive-hook latency, predicted to stay under 1&nbsp;s.</p>
   </div>
 </section>
 
