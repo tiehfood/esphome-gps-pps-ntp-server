@@ -2,6 +2,7 @@
 
 #include "esphome/core/component.h"
 #include "esphome/components/sensor/sensor.h"
+#include "send_estimator.h"
 
 #ifdef USE_ESP_IDF
 #include <sys/socket.h>
@@ -41,6 +42,9 @@ class NTPServer : public Component {
   void set_refused_sensor(sensor::Sensor *sensor) { this->refused_sensor_ = sensor; }
   void set_w5500_cmd_retries_sensor(sensor::Sensor *sensor) { this->w5500_cmd_retries_sensor_ = sensor; }
   void set_w5500_cmd_max_sensor(sensor::Sensor *sensor) { this->w5500_cmd_max_sensor_ = sensor; }
+  /// Stall investigation: per-request records and the W5500 network recorder, pulled over
+  /// UDP DIAG_PORT after a run. Off by default; adds no traffic while on.
+  void set_diagnostics(bool enable);
 #endif
 
   void setup() override;
@@ -72,31 +76,11 @@ class NTPServer : public Component {
   /// usable anchor exists, so this is safe to leave on.
   volatile bool use_pps_anchor_{true};
 
-  /// EWMA of sendto() duration, us. LWIP_TCPIP_CORE_LOCKING + the W5500's
-  /// spi_device_polling_transmit mean sendto() runs the SPI write inline, so the
-  /// packet leaves this long after T3 is stamped. Added to T3 to compensate.
-  int32_t send_us_{0};
-  /// EWMA smoothing for the T3 send estimate, as a right-shift. 3 (alpha 1/8) measured
-  /// best: settled error RMS 9.85 us, against 11.12 at 1/4, 11.91 at 1/16 and 15.27 at
-  /// 1/64 where the slow filter lags into a +11 us bias.
-  static const uint8_t SEND_EWMA_SHIFT = 3;
-  /// Consecutive out-of-band measurements before the estimate is re-seeded. Clamping a
-  /// large innovation instead of rejecting it drags the estimate toward a bad sample, and
-  /// recovers at only SEND_STEP_MAX_US >> SHIFT = 12 us per request; a bad seed then
-  /// persists for hundreds of requests. Rejecting isolated outliers and re-seeding on a
-  /// sustained run recovers in a handful.
-  static const uint8_t SEND_RESEED_AFTER = 4;
-  /// A re-seed also needs the rejected run to last this long. Measured 2026-09-10: under
-  /// outbound network load the send path stalls for ~1 s, and four stalled sends in a row used
-  /// to re-seed the estimate milliseconds high, stamping the next replies' T3 that much late.
-  /// A genuine change in the send path persists far longer than a stall.
-  static constexpr int64_t SEND_RESEED_MIN_SPAN_US = 3000000;
-  uint8_t send_reject_run_{0};
-  /// Spread of the current run of rejects and when it began. A re-seed needs the rejects to
-  /// agree with each other to within SEND_STEP_MAX_US; stalled sends do not.
-  int32_t send_reject_min_{0};
-  int32_t send_reject_max_{0};
-  int64_t send_reject_first_us_{0};
+  /// Predicts how long after the reply is built the W5500 is told to transmit, so T3 names the
+  /// instant the packet leaves. LWIP_TCPIP_CORE_LOCKING + the W5500's polling SPI mean sendto()
+  /// runs the SPI write inline. Rules and their tests: send_estimator.h,
+  /// tests/send_estimator_test.cpp.
+  SendEstimator send_estimator_;
 
   /// Dedicated FreeRTOS task blocked in recvfrom() -- stamps T2 on return instead of
   /// whenever ESPHome's shared loop next polls us. Runs for the component's lifetime;
@@ -116,12 +100,18 @@ class NTPServer : public Component {
   /// race each other -- recv_task_() is the sole reader. `seq` is a seqlock: odd means
   /// a write is in progress, even means key/t are a consistent snapshot. Needed because
   /// a 64-bit `t` (and the 8-byte `key`) tears on Xtensa; see .claude/rules/firmware.md.
-  struct HookEntry {
-    std::atomic<uint32_t> seq{0};
-    uint8_t key[8]{};
+  /// What the hook learned about one request, handed from the driver task to recv_task_().
+  struct HookInfo {
     int64_t t{0};
     /// The receive burst began long after the W5500 raised INTn: T2 is late, refuse.
     bool rx_stalled{false};
+    int32_t int_lead_us{-1};
+    int32_t rx_gap_us{-1};
+  };
+  struct HookEntry {
+    std::atomic<uint32_t> seq{0};
+    uint8_t key[8]{};
+    HookInfo info;
   };
   static const int HOOK_RING_SIZE = 8;
   HookEntry hook_ring_[HOOK_RING_SIZE];
@@ -181,7 +171,7 @@ class NTPServer : public Component {
   /// plus driver task wake, normally 3-25 us. A stalled receive shows here as ~100 ms.
   WindowMax int_lead_win_;
   sensor::Sensor *int_lead_sensor_{nullptr};
-  /// (actual Sn_CR=SEND instant) - (predicted send_us_). Positive means we stamped T3
+  /// (actual Sn_CR=SEND instant) - (the send estimate). Positive means we stamped T3
   /// EARLIER than the packet really departed, i.e. we under-predict the send cost.
   WindowMax t3_error_win_;
   sensor::Sensor *t3_error_sensor_{nullptr};
@@ -195,15 +185,54 @@ class NTPServer : public Component {
   sensor::Sensor *w5500_cmd_max_sensor_{nullptr};
   uint32_t telemetry_last_ms_{0};
 
+  // ---- Stall investigation diagnostics (switch-gated, pulled over UDP DIAG_PORT) ----
+  /// One served or refused request, as the server saw it. client_tx joins it to the client's
+  /// own record of the same exchange; -1 means not measured.
+  struct DiagRecord {
+    int64_t t2_us;          ///< esp_timer at T2 (hook stamp; at lookup time if the hook missed)
+    uint8_t client_tx[8];   ///< the client's transmit field
+    uint8_t flags;          ///< DIAG_* bits
+    int32_t int_lead_us;
+    int32_t rx_gap_us;
+    int32_t hook_latency_us;
+    int32_t send_us;        ///< t0 to Sn_CR = SEND, unclipped (stalled sends included)
+    int32_t sendto_us;
+    int32_t lock_wait_us;   ///< taking lwIP's core lock just before the reply was built
+    int32_t estimate_us;    ///< send estimate this reply's T3 used
+  };
+  static constexpr uint8_t DIAG_HOOK_HIT = 0x01;
+  static constexpr uint8_t DIAG_RX_STALLED = 0x02;
+  static constexpr uint8_t DIAG_REFUSED = 0x04;
+  static constexpr uint8_t DIAG_RESEEDED = 0x08;
+  static constexpr uint8_t DIAG_SEND_LONG = 0x10;
+  static constexpr uint8_t DIAG_FALLBACK = 0x20;
+  /// 1024 records: 4.3 min at a 4 Hz client, so a whole test run joins without a mid-run dump
+  /// (a dump is itself outbound traffic).
+  static constexpr uint16_t DIAG_RING_SIZE = 1024;
+  struct DiagSlot {
+    std::atomic<uint32_t> seq{0};
+    DiagRecord rec{};
+  };
+  /// Allocated on first enable by the main task, before diagnostics_ turns on.
+  DiagSlot *diag_ring_{nullptr};
+  /// Next slot to write. recv_task_() is the only writer.
+  uint16_t diag_next_{0};
+  volatile bool diagnostics_{false};
+  int diag_socket_{-1};
+  /// recv_task_() only.
+  void diag_record_(const DiagRecord &rec);
+  /// loop() only: opens/closes the dump socket with the switch and answers CLK / REQ / NET.
+  void diag_serve_();
+
   /// Registered with esp_eth_update_input_path() as the driver's stack_input. Runs in
   /// the W5500 driver's own task for EVERY received frame -- no ESPHome API calls, no
   /// blocking, no allocation, no gettimeofday(). Must call esp_netif_receive() on every
   /// path: failing to forward a frame here takes down all networking on the device.
   static esp_err_t eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffer, uint32_t length, void *priv);
   /// Records (key, t) in the ring. Called only from eth_input_hook_() (driver task).
-  void hook_record_(const uint8_t *key, int64_t t, bool rx_stalled);
+  void hook_record_(const uint8_t *key, const HookInfo &info);
   /// Looks up a key written by hook_record_(). Called only from recv_task_() (our task).
-  bool hook_lookup_(const uint8_t *key, int64_t *t_out, bool *rx_stalled_out);
+  bool hook_lookup_(const uint8_t *key, HookInfo *out);
   /// Converts an absolute Unix-epoch microsecond value to an NTPTimestamp.
   static NTPTimestamp micros_epoch_to_ntp_timestamp_(int64_t unix_us);
   /// Reconstructs the wall-clock time at a past esp_timer_get_time() reading, the same

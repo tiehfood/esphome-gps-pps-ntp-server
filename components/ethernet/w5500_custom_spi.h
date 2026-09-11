@@ -85,6 +85,40 @@ struct W5500CmdStats {
 };
 W5500CmdStats w5500_take_cmd_stats();
 
+/// Network activity recorder: 100 ms bins over the last 120 s, counting frames through the W5500
+/// by class and direction, their bytes, the longest wait for the SPI device lock, and Sn_CR
+/// commands that needed a retry. Off until enabled; the bins are allocated (PSRAM first) on the
+/// first enable. Built to find what the server is doing when its receive path stalls, without
+/// adding any traffic of its own. Diagnostic-grade: a bin rolls under a spinlock, but a frame
+/// racing the roll may land in the neighbouring bin.
+enum W5500FrameClass : uint8_t {
+  W5500_FC_API = 0,  // TCP 6053, ESPHome native API (Home Assistant, esphome logs)
+  W5500_FC_HTTP,     // TCP 80, the web server
+  W5500_FC_NTP,      // UDP 123
+  W5500_FC_MDNS,     // UDP 5353
+  W5500_FC_ARP,
+  W5500_FC_TCP,      // any other TCP
+  W5500_FC_UDP,      // any other UDP
+  W5500_FC_OTHER,
+  W5500_FC_COUNT
+};
+struct W5500NetBin {
+  uint32_t start_us;  // micros() at the bin start; 0 = never used
+  uint16_t tx[W5500_FC_COUNT];
+  uint16_t rx[W5500_FC_COUNT];
+  uint32_t tx_bytes;
+  uint32_t rx_bytes;
+  uint32_t lock_wait_max_us;
+  uint16_t cr_retried;
+};
+static constexpr uint32_t W5500_NET_BIN_US = 100000;
+static constexpr uint16_t W5500_NET_BINS = 1200;
+void w5500_set_net_recorder(bool enable);
+bool w5500_net_recorder_enabled();
+/// Copies bin i, oldest first (0 .. W5500_NET_BINS-1). False if the recorder never ran or the
+/// bin is unused.
+bool w5500_net_bin(uint16_t i, W5500NetBin &out);
+
 }  // namespace esphome::ethernet
 
 #endif  // USE_ESP32 && USE_ETHERNET_W5500

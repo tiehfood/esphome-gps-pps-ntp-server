@@ -5,6 +5,7 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 #include <driver/spi_master.h>
+#include <esp_heap_caps.h>
 #if defined(CONFIG_SOC_MCPWM_SUPPORTED)
 #include <driver/mcpwm_cap.h>
 #endif
@@ -40,6 +41,8 @@ constexpr uint8_t W5500_CTRL_S0_RXBUF_READ = 0x18;
 constexpr uint16_t W5500_REG_SN_RX_RSR = 0x0026;
 constexpr uint16_t W5500_REG_SN_CR = 0x0001;
 constexpr uint8_t W5500_CMD_SEND = 0x20;
+/// Socket 0 TX buffer (BSB=2) write: every transmitted frame is one write with this control byte.
+constexpr uint8_t W5500_CTRL_S0_TXBUF_WRITE = 0x14;
 /// SPI silence longer than this means the previous burst ended; intra-burst spacing is a
 /// few microseconds, and realistic NTP gaps are milliseconds.
 constexpr uint32_t W5500_BURST_GAP_US = 500;
@@ -64,6 +67,12 @@ std::atomic<uint32_t> g_cr_commands{0};
 std::atomic<uint32_t> g_cr_retried{0};
 std::atomic<uint32_t> g_cr_max_us{0};
 std::atomic<uint32_t> g_cr_overlaps{0};
+// Network activity recorder (see w5500_custom_spi.h).
+volatile bool g_net_enabled = false;
+W5500NetBin *g_net_bins = nullptr;
+uint16_t g_net_cur = 0;
+uint32_t g_net_cur_start_us = 0;
+portMUX_TYPE g_net_mux = portMUX_INITIALIZER_UNLOCKED;
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
 /// Marks the start of a receive burst. READS ONLY -- deliberately.
@@ -79,6 +88,85 @@ inline void note_read_transaction() {
     g_burst_start_us = now_us;
   }
   g_last_txn_us = now_us;
+}
+
+// ---- LOCAL DELTA: network activity recorder ----
+
+/// Coarse class of an Ethernet frame by EtherType and, for IPv4, protocol and either port.
+uint8_t classify_frame(const uint8_t *f, uint32_t len) {
+  if (f == nullptr || len < 14)
+    return W5500_FC_OTHER;
+  const uint16_t ethertype = static_cast<uint16_t>((f[12] << 8) | f[13]);
+  if (ethertype == 0x0806)
+    return W5500_FC_ARP;
+  if (ethertype != 0x0800 || len < 14 + 20)
+    return W5500_FC_OTHER;
+  const uint32_t ihl = static_cast<uint32_t>(f[14] & 0x0F) * 4;
+  if (ihl < 20 || len < 14 + ihl + 4)
+    return W5500_FC_OTHER;
+  const uint8_t proto = f[14 + 9];
+  const uint16_t src = static_cast<uint16_t>((f[14 + ihl] << 8) | f[14 + ihl + 1]);
+  const uint16_t dst = static_cast<uint16_t>((f[14 + ihl + 2] << 8) | f[14 + ihl + 3]);
+  const auto uses = [src, dst](uint16_t port) { return src == port || dst == port; };
+  if (proto == 6)
+    return uses(6053) ? W5500_FC_API : uses(80) ? W5500_FC_HTTP : W5500_FC_TCP;
+  if (proto == 17)
+    return uses(123) ? W5500_FC_NTP : uses(5353) ? W5500_FC_MDNS : W5500_FC_UDP;
+  return W5500_FC_OTHER;
+}
+
+/// The bin covering now_us, rolling the ring over any bins that elapsed. Call with g_net_mux held.
+W5500NetBin *net_bin_now(uint32_t now_us) {
+  if (g_net_cur_start_us == 0 || now_us - g_net_cur_start_us >= W5500_NET_BIN_US * W5500_NET_BINS) {
+    memset(g_net_bins, 0, sizeof(W5500NetBin) * W5500_NET_BINS);
+    g_net_cur = 0;
+    g_net_cur_start_us = now_us;
+    g_net_bins[0].start_us = now_us;
+    return &g_net_bins[0];
+  }
+  while (now_us - g_net_cur_start_us >= W5500_NET_BIN_US) {
+    g_net_cur = static_cast<uint16_t>((g_net_cur + 1) % W5500_NET_BINS);
+    g_net_cur_start_us += W5500_NET_BIN_US;
+    memset(&g_net_bins[g_net_cur], 0, sizeof(W5500NetBin));
+    g_net_bins[g_net_cur].start_us = g_net_cur_start_us;
+  }
+  return &g_net_bins[g_net_cur];
+}
+
+void net_record_frame(bool tx, const uint8_t *f, uint32_t len) {
+  if (!g_net_enabled || g_net_bins == nullptr)
+    return;
+  const uint8_t cls = classify_frame(f, len);
+  const uint32_t now_us = micros();
+  portENTER_CRITICAL(&g_net_mux);
+  W5500NetBin *bin = net_bin_now(now_us);
+  uint16_t &count = tx ? bin->tx[cls] : bin->rx[cls];
+  if (count < UINT16_MAX)
+    count++;
+  (tx ? bin->tx_bytes : bin->rx_bytes) += len;
+  portEXIT_CRITICAL(&g_net_mux);
+}
+
+void net_record_lock_wait(uint32_t wait_us) {
+  if (!g_net_enabled || g_net_bins == nullptr)
+    return;
+  const uint32_t now_us = micros();
+  portENTER_CRITICAL(&g_net_mux);
+  W5500NetBin *bin = net_bin_now(now_us);
+  if (wait_us > bin->lock_wait_max_us)
+    bin->lock_wait_max_us = wait_us;
+  portEXIT_CRITICAL(&g_net_mux);
+}
+
+void net_record_cr_retry() {
+  if (!g_net_enabled || g_net_bins == nullptr)
+    return;
+  const uint32_t now_us = micros();
+  portENTER_CRITICAL(&g_net_mux);
+  W5500NetBin *bin = net_bin_now(now_us);
+  if (bin->cr_retried < UINT16_MAX)
+    bin->cr_retried++;
+  portEXIT_CRITICAL(&g_net_mux);
 }
 
 void *w5500_custom_spi_init(const void *spi_config) {
@@ -117,8 +205,12 @@ esp_err_t w5500_custom_spi_deinit(void *spi_ctx) {
 // Bulk payloads (> FIFO size) block so the calling task sleeps while DMA runs; small register
 // accesses stay on the cheaper polling path. Used by both read and write.
 esp_err_t w5500_custom_spi_transfer(W5500CustomSpiContext *ctx, spi_transaction_t *trans, uint32_t len) {
+  const uint32_t lock_start_us = g_net_enabled ? micros() : 0;
   if (xSemaphoreTake(ctx->lock, pdMS_TO_TICKS(W5500_SPI_LOCK_TIMEOUT_MS)) != pdTRUE) {
     return ESP_ERR_TIMEOUT;
+  }
+  if (g_net_enabled) {
+    net_record_lock_wait(micros() - lock_start_us);
   }
   esp_err_t ret;
   if (len > W5500_SPI_BULK_THRESHOLD) {
@@ -147,6 +239,11 @@ esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, con
     g_cr_write_us = now_us;
     g_cr_polls = 0;
     g_cr_pending = true;
+  }
+  // LOCAL DELTA: network recorder. The stock driver writes each transmitted frame into the socket 0
+  // TX buffer in a single write.
+  if (addr == W5500_CTRL_S0_TXBUF_WRITE && len >= 14) {
+    net_record_frame(true, static_cast<const uint8_t *>(data), len);
   }
   spi_transaction_t trans = {};
   trans.cmd = static_cast<uint16_t>(cmd);
@@ -190,11 +287,16 @@ esp_err_t w5500_custom_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void
       g_cr_commands.fetch_add(1, std::memory_order_relaxed);
       if (g_cr_polls > 1) {
         g_cr_retried.fetch_add(1, std::memory_order_relaxed);
+        net_record_cr_retry();
       }
       uint32_t cur = g_cr_max_us.load(std::memory_order_relaxed);
       while (took_us > cur && !g_cr_max_us.compare_exchange_weak(cur, took_us, std::memory_order_relaxed)) {
       }
     }
+  }
+  // LOCAL DELTA: network recorder. A received frame's payload read starts at its Ethernet header.
+  if (ret == ESP_OK && addr == W5500_CTRL_S0_RXBUF_READ && len > 4) {
+    net_record_frame(false, static_cast<const uint8_t *>(data), len);
   }
   return ret;
 }
@@ -221,6 +323,36 @@ W5500RxStamps w5500_rx_stamps() {
 W5500SendStamp w5500_send_stamp() { return {g_send_cmd_us, g_send_cmd_seq}; }
 
 W5500IntStamp w5500_int_stamp() { return {g_int_edge_us, g_int_edge_seq}; }
+
+void w5500_set_net_recorder(bool enable) {
+  if (enable && g_net_bins == nullptr) {
+    auto *bins = static_cast<W5500NetBin *>(heap_caps_calloc(W5500_NET_BINS, sizeof(W5500NetBin), MALLOC_CAP_SPIRAM));
+    if (bins == nullptr) {
+      bins = static_cast<W5500NetBin *>(heap_caps_calloc(W5500_NET_BINS, sizeof(W5500NetBin), MALLOC_CAP_8BIT));
+    }
+    if (bins == nullptr) {
+      ESP_LOGW("w5500_spi", "network recorder: cannot allocate %u bins", (unsigned) W5500_NET_BINS);
+      return;
+    }
+    portENTER_CRITICAL(&g_net_mux);
+    g_net_bins = bins;
+    g_net_cur = 0;
+    g_net_cur_start_us = 0;
+    portEXIT_CRITICAL(&g_net_mux);
+  }
+  g_net_enabled = enable && g_net_bins != nullptr;
+}
+
+bool w5500_net_recorder_enabled() { return g_net_enabled; }
+
+bool w5500_net_bin(uint16_t i, W5500NetBin &out) {
+  if (g_net_bins == nullptr || i >= W5500_NET_BINS)
+    return false;
+  portENTER_CRITICAL(&g_net_mux);
+  out = g_net_bins[(g_net_cur + 1 + i) % W5500_NET_BINS];
+  portEXIT_CRITICAL(&g_net_mux);
+  return out.start_us != 0;
+}
 
 W5500CmdStats w5500_take_cmd_stats() {
   return {g_cr_commands.exchange(0, std::memory_order_relaxed), g_cr_retried.exchange(0, std::memory_order_relaxed),

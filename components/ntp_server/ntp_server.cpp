@@ -6,12 +6,14 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <new>
 
 #ifdef USE_ESP_IDF
 #include <unistd.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_timer.h>
+#include <esp_heap_caps.h>
 #include <atomic>
 #include "esphome/components/ethernet/ethernet_component.h"
 #include "esphome/components/ethernet/w5500_custom_spi.h"
@@ -63,18 +65,7 @@ static const float ROOT_DISP_RATE_S_PER_S = 10.0e-6f;
 /// NTP short format is 16.16 fixed point; 1 LSB = 15.259us.
 static const float NTP_SHORT_SCALE = 65536.0f;
 
-/// Bounds for learning the send-duration EWMA. Below the floor the packet was
-/// queued (ARP miss), above the ceiling something stalled; neither is typical.
-static const int32_t SEND_US_MIN = 50;
-static const int32_t SEND_US_MAX = 5000;
-/// Largest single step the send estimate may take, in us. Tuning the EWMA rate showed the
-/// default alpha of 1/8 was already optimal (settled RMS 9.85 us, against 11.12 at 1/4,
-/// 11.91 at 1/16 and 15.27 at 1/64, where the slow filter lags into a +11 us bias). The
-/// real weakness was outliers: one measured 1251 us sample passed the SEND_US_MAX guard
-/// and injected a 156 us step that took eight samples to decay. Clamping the innovation
-/// keeps a rare scheduling hiccup from moving the estimate more than 12 us, while still
-/// allowing genuine change far beyond the ~10 us normal spread.
-static const int32_t SEND_STEP_MAX_US = 100;
+// The send estimate's bounds, EWMA rate and re-seed rules live in send_estimator.h.
 
 /// Refuse a request when its receive burst began this long after the W5500 raised INTn.
 /// Normal INTn-to-burst lead is 3-25 us. Under outbound TCP load the receive path stalls for
@@ -89,6 +80,8 @@ static const int32_t RX_STALL_EDGE_MAX_AGE_US = 2000000;
 /// on every request put ~16 state messages/s through API and SSE at a 4 Hz client: outbound
 /// load of exactly the kind that stalls the receive path.
 static const uint32_t TELEMETRY_INTERVAL_MS = 10000;
+/// UDP port answering CLK / REQ / NET while the diagnostics switch is on.
+static const uint16_t DIAG_PORT = 12301;
 
 // ---- Platform-specific setup / loop ----
 
@@ -205,6 +198,7 @@ void NTPServer::loop() {
   // task, and published here -- publishing is an ESPHome API call, only safe from this
   // main-thread loop() -- once per TELEMETRY_INTERVAL_MS as the window's worst case.
   this->refresh_arp_entries_();
+  this->diag_serve_();
 
   if (this->arp_primes_pending_) {
     this->arp_primes_pending_ = false;
@@ -267,13 +261,15 @@ void NTPServer::recv_task_(void *param) {
     // The client's own transmit timestamp (bytes 40-47) is unique per request and
     // is exactly what eth_input_hook_() keyed its ring entry on -- it saw this same
     // request arrive, before lwIP, before this task woke.
-    int64_t hook_t;
-    bool rx_stalled = false;
-    if (self->hook_lookup_(&buffer[40], &hook_t, &rx_stalled)) {
-      receive_ts = self->hook_to_ntp_timestamp_(hook_t);
+    HookInfo hook;
+    const bool hook_hit = self->hook_lookup_(&buffer[40], &hook);
+    int32_t hook_latency_us = -1;
+    if (hook_hit) {
+      receive_ts = self->hook_to_ntp_timestamp_(hook.t);
       // Diagnostic only: how much later this task observed the same request vs. the hook.
       // Recorded here, published by loop() -- ESPHome's API is not task-safe from here.
-      self->hook_latency_win_.add(static_cast<int32_t>(esp_timer_get_time() - hook_t));
+      hook_latency_us = static_cast<int32_t>(esp_timer_get_time() - hook.t);
+      self->hook_latency_win_.add(hook_latency_us);
     }
 
     // No ESP_LOGD/publish_state here: ESPHome's logger and API are not task-safe
@@ -281,17 +277,46 @@ void NTPServer::recv_task_(void *param) {
     if (!self->is_time_synchronized_())
       continue;
 
+    const bool diagnostics = self->diagnostics_;
+    DiagRecord diag{};
+    if (diagnostics) {
+      diag.t2_us = hook_hit ? hook.t : esp_timer_get_time();
+      memcpy(diag.client_tx, &buffer[40], sizeof(diag.client_tx));
+      diag.flags = (hook_hit ? DIAG_HOOK_HIT : 0) | (hook.rx_stalled ? DIAG_RX_STALLED : 0);
+      diag.int_lead_us = hook_hit ? hook.int_lead_us : -1;
+      diag.rx_gap_us = hook_hit ? hook.rx_gap_us : -1;
+      diag.hook_latency_us = hook_latency_us;
+      diag.send_us = -1;
+      diag.sendto_us = -1;
+      diag.lock_wait_us = -1;
+      diag.estimate_us = self->send_estimator_.estimate();
+    }
+
     // The receive path stalled on this request: its T2 is late by up to ~100 ms, and half of
     // that would land in the client's offset. Refuse rather than serve it; the client retries.
     // Nothing is sent, so the T3 estimate cannot learn from a stalled send either.
-    if (rx_stalled) {
+    if (hook_hit && hook.rx_stalled) {
       self->refused_.fetch_add(1, std::memory_order_relaxed);
+      if (diagnostics) {
+        diag.flags |= DIAG_REFUSED;
+        self->diag_record_(diag);
+      }
       continue;
     }
 
     // Remember who asked, so loop() can keep their ARP entry warm. Plain store only --
     // no lwIP calls from this task beyond the socket API.
     self->note_arp_client_(client_addr.sin_addr.s_addr);
+
+    if (diagnostics) {
+      // How contended lwIP's core lock is right now -- sendto() has to take it too. Probed
+      // before the reply is built, so a wait here happens before T3 is computed and cannot leak
+      // into the served timestamp. The lock is not recursive: it must not be held into sendto().
+      const int64_t lock_start_us = esp_timer_get_time();
+      LOCK_TCPIP_CORE();
+      diag.lock_wait_us = static_cast<int32_t>(esp_timer_get_time() - lock_start_us);
+      UNLOCK_TCPIP_CORE();
+    }
 
     self->build_ntp_response_(buffer, response, receive_ts);
 
@@ -302,66 +327,35 @@ void NTPServer::recv_task_(void *param) {
     int64_t t_after = esp_timer_get_time();
     int32_t dur = static_cast<int32_t>(t_after - t0);
 
-    // T3 was written as t0 + send_us_, a prediction. The W5500 was actually told to
-    // transmit when the driver wrote Sn_CR = SEND. Measure how wrong the prediction was;
-    // a non-zero mean here is a systematic, correctable error in every reply we serve.
+    // T3 was written as build time + the send estimate, a prediction. The W5500 was actually
+    // told to transmit when the driver wrote Sn_CR = SEND: measure how wrong it was and learn.
     ethernet::W5500SendStamp after = ethernet::w5500_send_stamp();
-    bool learned_from_hardware = false;
+    SendEstimator::Result learned = SendEstimator::Result::IGNORED;
+    int32_t actual_us = -1;
     if (after.seq != before.seq) {
-      // Time from t0 to the Sn_CR = SEND write: when the chip was actually told to
-      // transmit. That is what T3 should predict -- NOT how long sendto() took to
-      // return, which is strictly later and made send_us_ over-predict by ~180 us,
-      // writing T3 that much too late on every reply.
-      int32_t actual_us = static_cast<int32_t>(after.send_cmd_us - static_cast<uint32_t>(t0));
-      if (actual_us > 0 && actual_us < SEND_US_MAX) {
-        self->t3_error_win_.add(actual_us - self->send_us_);
-        if (actual_us > SEND_US_MIN) {
-          if (self->send_us_ == 0) {
-            // Cold start: seed from the first real measurement rather than creeping up
-            // from zero.
-            self->send_us_ = actual_us;
-            self->send_reject_run_ = 0;
-          } else {
-            const int32_t innov = actual_us - self->send_us_;
-            if (innov > -SEND_STEP_MAX_US && innov < SEND_STEP_MAX_US) {
-              self->send_us_ += innov >> SEND_EWMA_SHIFT;
-              self->send_reject_run_ = 0;
-            } else {
-              // A single outlier is ignored: clamping would still drag the estimate. A run of
-              // them re-seeds -- but only if the run is a changed send path, not a stall.
-              // Stalled sends disagree with each other as much as with the estimate, so a
-              // reject that widens the run's spread past SEND_STEP_MAX_US starts a new run.
-              if (self->send_reject_run_ == 0 ||
-                  std::max(self->send_reject_max_, actual_us) - std::min(self->send_reject_min_, actual_us) >=
-                      SEND_STEP_MAX_US) {
-                self->send_reject_min_ = actual_us;
-                self->send_reject_max_ = actual_us;
-                self->send_reject_first_us_ = t0;
-                self->send_reject_run_ = 1;
-              } else {
-                self->send_reject_min_ = std::min(self->send_reject_min_, actual_us);
-                self->send_reject_max_ = std::max(self->send_reject_max_, actual_us);
-                if (self->send_reject_run_ < 255)
-                  self->send_reject_run_++;
-              }
-              // Consistent AND longer than a stall lasts: the send path really changed (e.g. a
-              // slow first request after boot). Re-seed to the run's centre.
-              if (self->send_reject_run_ >= SEND_RESEED_AFTER && t0 - self->send_reject_first_us_ >= SEND_RESEED_MIN_SPAN_US) {
-                self->send_us_ = self->send_reject_min_ + (self->send_reject_max_ - self->send_reject_min_) / 2;
-                self->send_reject_run_ = 0;
-              }
-            }
-          }
-          learned_from_hardware = true;
-        }
-      }
+      // Time from t0 to the Sn_CR = SEND write -- NOT how long sendto() took to return, which is
+      // strictly later and made the estimate over-predict by ~180 us.
+      actual_us = static_cast<int32_t>(after.send_cmd_us - static_cast<uint32_t>(t0));
+      if (actual_us > 0 && actual_us < SendEstimator::US_MAX)
+        self->t3_error_win_.add(actual_us - self->send_estimator_.estimate());
+      learned = self->send_estimator_.learn(actual_us, t0);
     }
+    // Fallback only: no usable hardware stamp this round (none, or outside the bounds), so learn
+    // from the sendto() duration, under the same bounds.
+    if (learned == SendEstimator::Result::IGNORED)
+      self->send_estimator_.learn_fallback(dur);
 
-    // Fallback only: if the hardware stamp was unavailable this round, fall back to the
-    // sendto() duration. Same ARP-miss guard as before -- a queued packet returns
-    // immediately and would drag the estimate down even though it departs late.
-    if (!learned_from_hardware && dur > SEND_US_MIN && dur < SEND_US_MAX)
-      self->send_us_ += (dur - self->send_us_) >> SEND_EWMA_SHIFT;
+    if (diagnostics) {
+      diag.send_us = actual_us;
+      diag.sendto_us = dur;
+      if (actual_us >= SendEstimator::US_MAX || dur >= SendEstimator::US_MAX)
+        diag.flags |= DIAG_SEND_LONG;
+      if (learned == SendEstimator::Result::RESEEDED)
+        diag.flags |= DIAG_RESEEDED;
+      if (learned == SendEstimator::Result::IGNORED)
+        diag.flags |= DIAG_FALLBACK;
+      self->diag_record_(diag);
+    }
   }
 }
 
@@ -414,13 +408,14 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
           // Normally 3-25 us (GPIO ISR plus driver task wake). When the receive path stalls,
           // the burst starts up to ~100 ms after the edge, T2 is that late, and the request is
           // refused in recv_task_(). Edges older than RX_STALL_EDGE_MAX_AGE_US are not trusted.
-          bool rx_stalled = false;
+          HookInfo info;
           ethernet::W5500IntStamp ist = ethernet::w5500_int_stamp();
           if (ist.seq != 0 && st.burst_start_us != 0) {
             int32_t int_lead = static_cast<int32_t>(st.burst_start_us - ist.edge_us);
             if (int_lead > 0 && int_lead < RX_STALL_EDGE_MAX_AGE_US) {
               self->int_lead_win_.add(int_lead);
-              rx_stalled = int_lead >= RX_STALL_MAX_US;
+              info.int_lead_us = int_lead;
+              info.rx_stalled = int_lead >= RX_STALL_MAX_US;
             }
           }
 
@@ -439,9 +434,11 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
             if (gap > 0 && gap < 20000) {
               t2 = t - gap;
               self->rx_stamp_gap_win_.add(gap);
+              info.rx_gap_us = gap;
             }
           }
-          self->hook_record_(&buffer[ntp_offset + 40], t2, rx_stalled);
+          info.t = t2;
+          self->hook_record_(&buffer[ntp_offset + 40], info);
         }
       }
     }
@@ -453,7 +450,154 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
   return esp_netif_receive(self->eth_netif_, buffer, length, NULL);
 }
 
-void NTPServer::hook_record_(const uint8_t *key, int64_t t, bool rx_stalled) {
+void NTPServer::set_diagnostics(bool enable) {
+  if (enable && this->diag_ring_ == nullptr) {
+    // ~53 KB, PSRAM first: leave the internal heap the network stack draws on alone.
+    void *mem = heap_caps_calloc(DIAG_RING_SIZE, sizeof(DiagSlot), MALLOC_CAP_SPIRAM);
+    if (mem == nullptr)
+      mem = heap_caps_calloc(DIAG_RING_SIZE, sizeof(DiagSlot), MALLOC_CAP_8BIT);
+    if (mem != nullptr) {
+      auto *ring = static_cast<DiagSlot *>(mem);
+      for (uint16_t i = 0; i < DIAG_RING_SIZE; i++)
+        new (&ring[i]) DiagSlot();
+      this->diag_ring_ = ring;
+    }
+    if (this->diag_ring_ == nullptr) {
+      ESP_LOGW(TAG, "Diagnostics: cannot allocate the request ring");
+      return;
+    }
+  }
+  ethernet::w5500_set_net_recorder(enable);
+  this->diagnostics_ = enable;
+  ESP_LOGI(TAG, "Diagnostics %s", enable ? "on: request ring, network recorder, UDP 12301" : "off");
+}
+
+void NTPServer::diag_record_(const DiagRecord &rec) {
+  DiagSlot *ring = this->diag_ring_;
+  if (!this->diagnostics_ || ring == nullptr)
+    return;
+  DiagSlot &slot = ring[this->diag_next_];
+  this->diag_next_ = static_cast<uint16_t>((this->diag_next_ + 1) % DIAG_RING_SIZE);
+  // Seqlock write, as in hook_record_(): the dump in loop() may read concurrently.
+  const uint32_t seq = slot.seq.load(std::memory_order_relaxed);
+  slot.seq.store(seq + 1, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
+  slot.rec = rec;
+  std::atomic_thread_fence(std::memory_order_release);
+  slot.seq.store(seq + 2, std::memory_order_relaxed);
+}
+
+void NTPServer::diag_serve_() {
+  if (!this->diagnostics_) {
+    if (this->diag_socket_ >= 0) {
+      close(this->diag_socket_);
+      this->diag_socket_ = -1;
+    }
+    return;
+  }
+  if (this->diag_socket_ < 0) {
+    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0)
+      return;
+    struct sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(DIAG_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+      close(fd);
+      return;
+    }
+    this->diag_socket_ = fd;
+  }
+
+  char cmd[16];
+  struct sockaddr_in peer {};
+  socklen_t peer_len = sizeof(peer);
+  const int received = recvfrom(this->diag_socket_, cmd, sizeof(cmd) - 1, MSG_DONTWAIT,
+                                (struct sockaddr *) &peer, &peer_len);
+  if (received <= 0)
+    return;
+  cmd[received] = '\0';
+
+  // Dumps are pulled after a run, so a short block of the main loop here costs nothing measured.
+  char batch[1400];
+  size_t used = 0;
+  const auto flush = [&]() {
+    if (used > 0) {
+      sendto(this->diag_socket_, batch, used, 0, (struct sockaddr *) &peer, peer_len);
+      used = 0;
+      vTaskDelay(pdMS_TO_TICKS(2));
+    }
+  };
+  const auto emit = [&](const char *line, int len) {
+    if (len <= 0 || static_cast<size_t>(len) >= sizeof(batch))
+      return;
+    if (used + len > sizeof(batch))
+      flush();
+    memcpy(batch + used, line, len);
+    used += len;
+  };
+  char line[240];
+  uint32_t lines = 0;
+
+  if (strncmp(cmd, "CLK", 3) == 0) {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    emit(line, snprintf(line, sizeof(line), "CLK %lld %u %lld\n", (long long) esp_timer_get_time(),
+                        (unsigned) micros(), (long long) tv.tv_sec * 1000000LL + tv.tv_usec));
+    lines = 1;
+  } else if (strncmp(cmd, "REQ", 3) == 0 && this->diag_ring_ != nullptr) {
+    const uint16_t start = this->diag_next_;
+    for (uint16_t i = 0; i < DIAG_RING_SIZE; i++) {
+      DiagSlot &slot = this->diag_ring_[(start + i) % DIAG_RING_SIZE];
+      DiagRecord rec{};
+      bool consistent = false;
+      for (int attempt = 0; attempt < 3 && !consistent; attempt++) {
+        const uint32_t s1 = slot.seq.load(std::memory_order_relaxed);
+        if (s1 & 1)
+          continue;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        rec = slot.rec;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        consistent = slot.seq.load(std::memory_order_relaxed) == s1;
+      }
+      if (!consistent || rec.t2_us == 0)
+        continue;
+      char tx_hex[17];
+      for (int b = 0; b < 8; b++)
+        snprintf(tx_hex + 2 * b, 3, "%02x", rec.client_tx[b]);
+      emit(line, snprintf(line, sizeof(line), "R %lld %s %x %d %d %d %d %d %d %d\n", (long long) rec.t2_us, tx_hex,
+                          (unsigned) rec.flags, (int) rec.int_lead_us, (int) rec.rx_gap_us, (int) rec.hook_latency_us,
+                          (int) rec.send_us, (int) rec.sendto_us, (int) rec.lock_wait_us, (int) rec.estimate_us));
+      lines++;
+    }
+  } else if (strncmp(cmd, "NET", 3) == 0) {
+    ethernet::W5500NetBin bin;
+    for (uint16_t i = 0; i < ethernet::W5500_NET_BINS; i++) {
+      if (!ethernet::w5500_net_bin(i, bin))
+        continue;
+      if (bin.tx_bytes == 0 && bin.rx_bytes == 0 && bin.lock_wait_max_us == 0 && bin.cr_retried == 0)
+        continue;
+      int len = snprintf(line, sizeof(line), "N %u", (unsigned) bin.start_us);
+      for (int k = 0; k < ethernet::W5500_FC_COUNT; k++)
+        len += snprintf(line + len, sizeof(line) - len, " %u", (unsigned) bin.tx[k]);
+      len += snprintf(line + len, sizeof(line) - len, " %u", (unsigned) bin.tx_bytes);
+      for (int k = 0; k < ethernet::W5500_FC_COUNT; k++)
+        len += snprintf(line + len, sizeof(line) - len, " %u", (unsigned) bin.rx[k]);
+      len += snprintf(line + len, sizeof(line) - len, " %u %u %u\n", (unsigned) bin.rx_bytes,
+                      (unsigned) bin.lock_wait_max_us, (unsigned) bin.cr_retried);
+      emit(line, len);
+      lines++;
+    }
+  } else {
+    emit(line, snprintf(line, sizeof(line), "ERR usage: CLK | REQ | NET\n"));
+  }
+  char kind[4] = {cmd[0], cmd[1], cmd[2], '\0'};
+  emit(line, snprintf(line, sizeof(line), "END %s %u\n", kind, (unsigned) lines));
+  flush();
+}
+
+void NTPServer::hook_record_(const uint8_t *key, const HookInfo &info) {
   HookEntry &slot = this->hook_ring_[this->hook_ring_next_];
   this->hook_ring_next_ = static_cast<uint8_t>((this->hook_ring_next_ + 1) % HOOK_RING_SIZE);
 
@@ -467,13 +611,12 @@ void NTPServer::hook_record_(const uint8_t *key, int64_t t, bool rx_stalled) {
   slot.seq.store(seq + 1, std::memory_order_relaxed);
   std::atomic_thread_fence(std::memory_order_release);
   memcpy(slot.key, key, sizeof(slot.key));
-  slot.t = t;
-  slot.rx_stalled = rx_stalled;
+  slot.info = info;
   std::atomic_thread_fence(std::memory_order_release);
   slot.seq.store(seq + 2, std::memory_order_relaxed);
 }
 
-bool NTPServer::hook_lookup_(const uint8_t *key, int64_t *t_out, bool *rx_stalled_out) {
+bool NTPServer::hook_lookup_(const uint8_t *key, HookInfo *out) {
   for (int i = 0; i < HOOK_RING_SIZE; i++) {
     HookEntry &slot = this->hook_ring_[i];
     uint32_t s1 = slot.seq.load(std::memory_order_relaxed);
@@ -482,15 +625,13 @@ bool NTPServer::hook_lookup_(const uint8_t *key, int64_t *t_out, bool *rx_stalle
     std::atomic_thread_fence(std::memory_order_acquire);
     uint8_t k[8];
     memcpy(k, slot.key, sizeof(k));
-    int64_t t = slot.t;
-    bool rx_stalled = slot.rx_stalled;
+    HookInfo info = slot.info;
     std::atomic_thread_fence(std::memory_order_acquire);
     uint32_t s2 = slot.seq.load(std::memory_order_relaxed);
     if (s1 != s2)
       continue;  // torn read (write happened mid-copy) -- skip, don't trust it
     if (memcmp(k, key, sizeof(k)) == 0) {
-      *t_out = t;
-      *rx_stalled_out = rx_stalled;
+      *out = info;
       return true;
     }
   }
@@ -673,7 +814,7 @@ void NTPServer::build_ntp_response_(const uint8_t *request, uint8_t *response,
 
   // Transmit timestamp, advanced by the measured send duration so it names the
   // instant the packet actually leaves rather than when we built the response.
-  NTPTimestamp transmit_ts = this->get_ntp_timestamp_(this->send_us_);
+  NTPTimestamp transmit_ts = this->get_ntp_timestamp_(this->send_estimator_.estimate());
   response[40] = (transmit_ts.seconds >> 24) & 0xFF;
   response[41] = (transmit_ts.seconds >> 16) & 0xFF;
   response[42] = (transmit_ts.seconds >> 8) & 0xFF;

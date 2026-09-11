@@ -306,6 +306,19 @@ switch:
     turn_off_action:
       - lambda: 'id(${id_prefix}_pps).set_use_hw_rate(false);'
 
+  # Stall investigation (off by default): per-request records on the S3 and a W5500 network
+  # activity recorder, pulled over UDP 12301 after a test run. Adds no traffic while on.
+  - platform: template
+    name: "NTP Diagnostics"
+    id: ${id_prefix}_ntp_diagnostics
+    entity_category: "diagnostic"
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - lambda: 'id(${id_prefix}_ntp).set_diagnostics(true);'
+    turn_off_action:
+      - lambda: 'id(${id_prefix}_ntp).set_diagnostics(false);'
+
   - platform: template
     name: "${name} RGB LED"
     id: ${id_prefix}_rgb_led_switch
