@@ -394,6 +394,36 @@
 
 <section>
   <div class="sec-head">
+    <span class="eyebrow">Measured</span>
+    <h2>What the per-sample floor was made of</h2>
+  </div>
+  <p>Once the stalls were gone, about 7&nbsp;µs of noise remained in every single exchange. A robust fit across 2,772 exchanges split it cleanly. Almost all of it was the server predicting <em>when</em> its reply would leave: that prediction has 11.9&nbsp;µs of jitter. Removing it left 1.95&nbsp;µs. Also removing the small interrupt-to-read delay left about 1&nbsp;µs for the network, the probe and its PHY together. The fit's coefficients matched the physics: −0.515 and +0.480 against −0.5 and +0.5, and +1.03 on delay.</p>
+  <p>Timing each reply's path showed where the jitter lives. Nearly all of it arises before the frame reaches the W5500; after the frame is written, only 3&nbsp;µs remains before the chip is told to send. Separately, a hard cutoff in the late-receive cases pointed to the W5500 itself. The driver sets the chip to wait 1.75&nbsp;ms before raising a new interrupt, and every late receive fell at or below 1.75&nbsp;ms.</p>
+
+  <h3>Two more fixes, each tested against a written prediction</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Change (behind its own switch)</th><th>Prediction</th><th class="num">Off</th><th class="num">On</th><th>State</th></tr></thead>
+      <tbody>
+        <tr><td>Shorter chip interrupt wait (1.75&nbsp;ms → 109&nbsp;µs)</td><td>Late receives over 150&nbsp;µs at most 0.1%</td><td class="num">0.87%</td><td class="num"><b>0.05%</b></td><td><span class="pill">passed</span></td></tr>
+        <tr><td></td><td>Missing replies rise at most 0.5 points</td><td class="num">1.72%</td><td class="num">2.81%</td><td><span class="pill gap">failed</span></td></tr>
+        <tr><td></td><td>Largest remaining lateness at most 250&nbsp;µs; no stalls</td><td class="num">–</td><td class="num">2.4&nbsp;ms (2 cases); 0 stalls</td><td><span class="pill gap">failed</span> / <span class="pill">passed</span></td></tr>
+        <tr><td>T3 written into the frame just before the chip sends it</td><td>Per-sample noise at most 3.5&nbsp;µs</td><td class="num">7.14&nbsp;µs</td><td class="num"><b>2.83&nbsp;µs</b></td><td><span class="pill">passed</span></td></tr>
+        <tr><td></td><td>No checksum errors at a real client; no rise in missing replies</td><td class="num">0; 62 missing</td><td class="num">0; 48 missing</td><td><span class="pill">passed</span></td></tr>
+        <tr><td></td><td>Mean offset moves at most ±10&nbsp;µs</td><td class="num">–</td><td class="num">+11.7&nbsp;µs</td><td><span class="pill gap">failed</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <span class="eyebrow">Why neither is on by default yet</span>
+    <p><b>The shorter interrupt wait works, but it collides with the strict refusal rule.</b> With the chip re-raising interrupts quickly, the edge the rule relies on sometimes lands after the read it should explain. So the rule refused 30 more requests that were probably on time. Nothing was lost, but that fails the test as written.</p>
+    <p><b>Writing T3 late cuts the per-sample noise by 2.5 times, but it also moves the mean offset by 11.7&nbsp;µs</b>, more than the bound set in advance. The likely reason is that the old path computed T3 slightly before the point its send estimate is measured from, which would make the old T3 the biased one. But the probe has no absolute reference, so it cannot say which is closer to true time. That is exactly what the absolute-reference phase would answer.</p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head">
     <span class="eyebrow">Constraint</span>
     <h2>What rev 1.3 costs us</h2>
   </div>
