@@ -72,6 +72,14 @@ struct W5500SendStamp {
   uint8_t frame_class;
   uint32_t txbuf_start_us;
   uint32_t txbuf_end_us;
+  /// Design B ("NTP Post-Write T3"): micros() when the patch callback ran for this SEND's
+  /// frame, and whether the patch was fully applied (T3 written, and the checksum too if it was
+  /// present) -- 0/0 when no patch fn was registered or the frame did not pass
+  /// plan_ntp_tx_patch(). patched can be 1 even when frame_class != W5500_FC_NTP is never the
+  /// case in practice (plan_ntp_tx_patch already requires an NTP frame), but callers should
+  /// still gate on frame_class == W5500_FC_NTP the same way they already do for T3 learning.
+  uint32_t patch_us;
+  uint8_t patched;
 };
 W5500SendStamp w5500_send_stamp();
 
@@ -140,6 +148,45 @@ bool w5500_net_bin(uint16_t i, W5500NetBin &out);
 static constexpr uint8_t W5500_TALKER_TABLE_SIZE = W5500TalkerTable::SIZE;
 /// Copies out entry i (insertion order). False if i is out of range or unused.
 bool w5500_talker(uint8_t i, W5500Talker &out);
+
+// ---------------------------------------------------------------------------------------
+// LOCAL DELTA: design A, "W5500 Short Interrupt Wait".
+//
+// INTLEVEL (common register 0x0013, 2 bytes big-endian) sets the chip's own Interrupt Assert
+// Wait Time = (INTLEVEL + 1) * 4 / 150 MHz. The driver writes 0xFFFF at init (1.748 ms) to avoid
+// missing a quickly re-asserted interrupt on its NEGEDGE GPIO; 0x0FFF (~109 us) still leaves
+// that margin while cutting the wait sixteen-fold. A live register write with no independent
+// recovery path if it went wrong, so ntp_server gates it behind a switch plus a dead-man timer
+// (see ntp_server/deadman.h) -- these two functions are the raw register access only.
+///
+/// False when no W5500 SPI context exists yet (e.g. called before esp_eth_start()) or the SPI
+/// transfer itself failed.
+bool w5500_write_int_level(uint16_t value);
+bool w5500_read_int_level(uint16_t *out);
+/// The value the driver's own init wrote to INTLEVEL (normally 0xFFFF), or 0 if never observed
+/// -- what set_short_int_wait(false) restores to.
+uint16_t w5500_driver_int_level();
+
+// ---------------------------------------------------------------------------------------
+// LOCAL DELTA: design B, "NTP Post-Write T3".
+//
+// Rewrites T3 (and, if present, the UDP checksum) into an NTP reply's bytes already sitting in
+// the W5500 TX buffer, immediately before the Sn_CR = SEND write that actually transmits it --
+// closer to the wire than any timestamp written before sendto() can be. The pure planning and
+// checksum-update math lives in ntp_server/ntp_tx_patch.h (host-tested); this is only the
+// callback wiring and the extra SPI writes.
+///
+/// fn(ctx, now_us, t3_out): called with a micros() reading taken just before the SEND write, for
+/// a frame already confirmed (by plan_ntp_tx_patch) to be our own NTP reply on `server_port`.
+/// Returns false to leave the frame untouched (e.g. clock not synchronized) -- the SEND still
+/// proceeds either way. Runs in the transmitting task's context, inside sendto(): no
+/// ESP_LOGx/publish_state, no blocking, no allocation, no gettimeofday().
+///
+/// fn == nullptr disables the feature. While disabled this costs nothing: the outgoing-frame
+/// tracking it depends on (capturing each frame's TX-buffer header bytes) only runs while a fn
+/// is registered.
+using W5500TxPatchFn = bool (*)(void *ctx, uint32_t now_us, uint8_t t3_out[8]);
+void w5500_set_tx_patch(W5500TxPatchFn fn, void *ctx, uint16_t server_port);
 
 }  // namespace esphome::ethernet
 

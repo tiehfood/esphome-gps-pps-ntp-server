@@ -4,6 +4,7 @@
 
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
+#include "esphome/components/ntp_server/ntp_tx_patch.h"
 #include <driver/spi_master.h>
 #include <esp_heap_caps.h>
 #if defined(CONFIG_SOC_MCPWM_SUPPORTED)
@@ -11,6 +12,7 @@
 #endif
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <new>
@@ -47,6 +49,19 @@ constexpr uint8_t W5500_CTRL_S0_TXBUF_WRITE = 0x14;
 /// few microseconds, and realistic NTP gaps are milliseconds.
 constexpr uint32_t W5500_BURST_GAP_US = 500;
 
+// LOCAL DELTA: design A, "W5500 Short Interrupt Wait". Common register block (BSB=0): read
+// control byte 0x00, write 0x04. INTLEVEL is register 0x0013, 2 bytes big-endian.
+constexpr uint8_t W5500_CTRL_COMMON_READ = 0x00;
+constexpr uint8_t W5500_CTRL_COMMON_WRITE = 0x04;
+constexpr uint16_t W5500_REG_INTLEVEL = 0x0013;
+
+// LOCAL DELTA: design B, "NTP Post-Write T3". Only the first W5500_TX_PATCH_HDR_MAX bytes of an
+// outgoing frame are kept -- our own NTP reply is always exactly 90 bytes (14 Ethernet + 20
+// IPv4, no options + 8 UDP + 48 NTP); 128 leaves generous headroom without copying whole frames.
+// A frame longer than this before its T3 field (impossible for our own replies) simply fails
+// plan_ntp_tx_patch() and is left unpatched -- never a correctness problem, only a missed patch.
+constexpr uint16_t W5500_TX_PATCH_HDR_MAX = 128;
+
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
 volatile uint32_t g_rx_size_read_us = 0;
 volatile uint32_t g_rx_payload_us = 0;
@@ -74,6 +89,29 @@ volatile uint32_t g_send_txbuf_end_us = 0;
 volatile uint16_t g_rx_size_value = 0;
 volatile uint32_t g_int_edge_us = 0;
 volatile uint32_t g_int_edge_seq = 0;
+// LOCAL DELTA: design A, "W5500 Short Interrupt Wait". Set once by w5500_custom_spi_init() --
+// there is exactly one W5500 device on this hardware, same one-context assumption the rest of
+// this file already makes for the recorder and command stats.
+W5500CustomSpiContext *g_spi_ctx = nullptr;
+volatile uint16_t g_driver_int_level = 0;
+volatile bool g_driver_int_level_seen = false;
+// LOCAL DELTA: design B, "NTP Post-Write T3". g_tx_patch_fn is written only from the main task
+// (NTPServer::set_post_write_t3()) and read from the transmitting task's SPI write callback --
+// a single pointer-sized load/store, diagnostic-grade like the rest of this file's cross-task
+// globals, not additionally locked.
+volatile W5500TxPatchFn g_tx_patch_fn = nullptr;
+void *g_tx_patch_ctx = nullptr;
+uint16_t g_tx_patch_port = 0;
+/// Outgoing-frame tracking since the last SEND -- only touched while g_tx_patch_fn is set, so
+/// the feature costs nothing while off. frame_start is the ring address (SPI `cmd`) of this
+/// frame's first TX-buffer write; hdr/hdr_len capture up to W5500_TX_PATCH_HDR_MAX bytes of the
+/// frame itself, concatenated across a split write, for plan_ntp_tx_patch() to inspect.
+uint8_t g_tx_patch_hdr[W5500_TX_PATCH_HDR_MAX];
+uint16_t g_tx_patch_hdr_len = 0;
+uint16_t g_tx_patch_frame_start = 0;
+bool g_tx_patch_frame_started = false;
+volatile uint32_t g_patch_us = 0;
+volatile uint8_t g_patched = 0;
 // Sn_CR handshake tracking. The in-flight fields are written by whichever task issues a
 // command (the driver's RX task for RECV, the transmitting task for SEND); a race between them
 // is itself what `overlaps` exists to show, so these are diagnostic-grade, not exact.
@@ -223,11 +261,16 @@ void *w5500_custom_spi_init(const void *spi_config) {
     delete ctx;
     return nullptr;
   }
+  // LOCAL DELTA: design A needs a context to issue INTLEVEL register accesses outside the
+  // read/write callbacks (they only run from the driver's own transmit/receive paths).
+  g_spi_ctx = ctx;
   return ctx;
 }
 
 esp_err_t w5500_custom_spi_deinit(void *spi_ctx) {
   auto *ctx = static_cast<W5500CustomSpiContext *>(spi_ctx);
+  if (g_spi_ctx == ctx)
+    g_spi_ctx = nullptr;
   spi_bus_remove_device(ctx->handle);
   vSemaphoreDelete(ctx->lock);
   delete ctx;
@@ -255,21 +298,89 @@ esp_err_t w5500_custom_spi_transfer(W5500CustomSpiContext *ctx, spi_transaction_
   return ret;
 }
 
+/// LOCAL DELTA: design B. Writes `n` bytes from `src` into the TX buffer at frame-relative
+/// offset `rel_off`, using plan_ring_writes() to mirror the driver's own ring addressing
+/// (including the split at the 0x4000 wrap). Polling path only, matching every other register
+/// write in this file. Returns false (and writes as much as it could) on any transfer failure.
+bool patch_write_ring(W5500CustomSpiContext *ctx, uint16_t frame_start, uint16_t rel_off, const uint8_t *src,
+                      uint16_t n) {
+  esphome::ntp_server::RingWrite writes[2];
+  const uint8_t count = esphome::ntp_server::plan_ring_writes(frame_start, rel_off, n, writes);
+  bool ok = true;
+  for (uint8_t i = 0; i < count; i++) {
+    spi_transaction_t trans = {};
+    trans.cmd = writes[i].addr;
+    trans.addr = W5500_CTRL_S0_TXBUF_WRITE;
+    trans.length = 8 * writes[i].len;
+    trans.tx_buffer = src + writes[i].src;
+    if (w5500_custom_spi_transfer(ctx, &trans, writes[i].len) != ESP_OK)
+      ok = false;
+  }
+  return ok;
+}
+
 esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, const void *data, uint32_t len) {
   auto *ctx = static_cast<W5500CustomSpiContext *>(spi_ctx);
+  // LOCAL DELTA: design A tap. Records whatever the driver's own init wrote to INTLEVEL, so
+  // set_short_int_wait(false) can restore the value this hardware actually had rather than a
+  // hard-coded guess.
+  if (addr == W5500_CTRL_COMMON_WRITE && cmd == W5500_REG_INTLEVEL && len == 2 && data != nullptr) {
+    const auto *bytes = static_cast<const uint8_t *>(data);
+    g_driver_int_level = static_cast<uint16_t>((bytes[0] << 8) | bytes[1]);
+    g_driver_int_level_seen = true;
+  }
   if (addr == W5500_CTRL_S0_REG_WRITE && cmd == W5500_REG_SN_CR && len == 1 && data != nullptr) {
     const uint32_t now_us = micros();
-    // LOCAL DELTA: NTP T3. Stamp the instant the chip is told to transmit -- strictly earlier
-    // than sendto() returns, which is what the estimate used to learn from and why T3 ran late.
-    // g_last_tx_class is whichever frame's payload write preceded this SEND -- by construction
-    // the stock driver writes the whole payload, then issues SEND, so it names this SEND's frame.
     if (*static_cast<const uint8_t *>(data) == W5500_CMD_SEND) {
-      g_send_cmd_us = now_us;
+      // LOCAL DELTA: design B, post-write T3 patch -- BEFORE the SEND transfer below, so any
+      // rewritten bytes are already in the TX buffer when the chip is told to transmit them.
+      // Only while a patch fn is registered AND this SEND's frame was actually tracked (a
+      // registered fn with no preceding TX-buffer write since the last SEND means nothing to
+      // patch, e.g. a retransmit path that does not go through here).
+      uint32_t patch_us_local = 0;
+      uint8_t patched = 0;
+      const W5500TxPatchFn fn = g_tx_patch_fn;
+      if (fn != nullptr && g_tx_patch_frame_started) {
+        const esphome::ntp_server::NtpTxPatchPlan plan =
+            esphome::ntp_server::plan_ntp_tx_patch(g_tx_patch_hdr, g_tx_patch_hdr_len, g_tx_patch_port);
+        if (plan.ok) {
+          patch_us_local = micros();
+          uint8_t t3[8];
+          if (fn(g_tx_patch_ctx, patch_us_local, t3)) {
+            bool t3_ok = patch_write_ring(ctx, g_tx_patch_frame_start, plan.t3_off, t3, 8);
+            bool csum_ok = true;
+            if (t3_ok && plan.csum_present) {
+              const uint16_t new_csum = esphome::ntp_server::udp_csum_update(plan.old_csum, plan.old_t3, t3);
+              const uint8_t csum_bytes[2] = {static_cast<uint8_t>(new_csum >> 8),
+                                             static_cast<uint8_t>(new_csum & 0xFF)};
+              csum_ok = patch_write_ring(ctx, g_tx_patch_frame_start, plan.csum_off, csum_bytes, 2);
+              if (!csum_ok) {
+                // Best-effort restore: the checksum write failed after T3 was already rewritten,
+                // so put the original T3 bytes back rather than transmit a mismatched pair.
+                patch_write_ring(ctx, g_tx_patch_frame_start, plan.t3_off, plan.old_t3, 8);
+              }
+            }
+            if (t3_ok && csum_ok)
+              patched = 1;
+          }
+        }
+      }
+      // Reset the outgoing-frame tracking unconditionally: the next TX-buffer write, whatever
+      // frame it belongs to, must start a fresh frame rather than appending to this one's header.
+      g_tx_patch_frame_started = false;
+      g_tx_patch_hdr_len = 0;
+
+      // LOCAL DELTA: NTP T3 stamp / TX-buffer-write snapshot, as before -- g_last_tx_class is
+      // whichever frame's payload write preceded this SEND; by construction the stock driver
+      // writes the whole payload, then issues SEND, so it names this SEND's frame.
       g_send_cmd_class = g_last_tx_class;
-      // LOCAL DELTA: TX-buffer-write timing, paired with g_send_cmd_class above. Both are 0
-      // when the recorder was off for the TX buffer write this SEND belongs to (see below).
       g_send_txbuf_start_us = g_last_tx_start_us;
       g_send_txbuf_end_us = g_last_tx_end_us;
+      g_patch_us = patch_us_local;
+      g_patched = patched;
+      // Last thing before the SEND transfer itself (below), so this stamp still marks the SEND
+      // write and does not absorb the patch writes' own time.
+      g_send_cmd_us = micros();
       g_send_cmd_seq++;
     }
     // LOCAL DELTA: command handshake stats (see w5500_take_cmd_stats()).
@@ -293,6 +404,23 @@ esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, con
       // pair of timestamps forward into a SEND that may happen after the recorder is enabled.
       g_last_tx_start_us = 0;
       g_last_tx_end_us = 0;
+    }
+    // LOCAL DELTA: design B outgoing-frame tracking -- only while a patch fn is registered, so
+    // this costs nothing while the feature is off. Captures the ring address of the frame's
+    // first write and up to W5500_TX_PATCH_HDR_MAX header bytes, concatenated across a split.
+    if (g_tx_patch_fn != nullptr) {
+      if (!g_tx_patch_frame_started) {
+        g_tx_patch_frame_start = static_cast<uint16_t>(cmd);
+        g_tx_patch_hdr_len = 0;
+        g_tx_patch_frame_started = true;
+      }
+      const uint16_t room =
+          W5500_TX_PATCH_HDR_MAX > g_tx_patch_hdr_len ? static_cast<uint16_t>(W5500_TX_PATCH_HDR_MAX - g_tx_patch_hdr_len) : 0;
+      const uint16_t n_copy = static_cast<uint16_t>(std::min<uint32_t>(len, room));
+      if (n_copy > 0) {
+        memcpy(&g_tx_patch_hdr[g_tx_patch_hdr_len], data, n_copy);
+        g_tx_patch_hdr_len = static_cast<uint16_t>(g_tx_patch_hdr_len + n_copy);
+      }
     }
   }
   spi_transaction_t trans = {};
@@ -388,10 +516,57 @@ W5500RxStamps w5500_rx_stamps() {
 }
 
 W5500SendStamp w5500_send_stamp() {
-  return {g_send_cmd_us, g_send_cmd_seq, g_send_cmd_class, g_send_txbuf_start_us, g_send_txbuf_end_us};
+  return {g_send_cmd_us,       g_send_cmd_seq,       g_send_cmd_class,
+          g_send_txbuf_start_us, g_send_txbuf_end_us, g_patch_us, g_patched};
 }
 
 W5500IntStamp w5500_int_stamp() { return {g_int_edge_us, g_int_edge_seq}; }
+
+// ---- LOCAL DELTA: design A, "W5500 Short Interrupt Wait" ----
+
+bool w5500_write_int_level(uint16_t value) {
+  W5500CustomSpiContext *ctx = g_spi_ctx;
+  if (ctx == nullptr)
+    return false;
+  const uint8_t data[2] = {static_cast<uint8_t>(value >> 8), static_cast<uint8_t>(value & 0xFF)};
+  spi_transaction_t trans = {};
+  trans.cmd = W5500_REG_INTLEVEL;
+  trans.addr = W5500_CTRL_COMMON_WRITE;
+  trans.length = 8 * 2;
+  trans.tx_buffer = data;
+  return w5500_custom_spi_transfer(ctx, &trans, 2) == ESP_OK;
+}
+
+bool w5500_read_int_level(uint16_t *out) {
+  W5500CustomSpiContext *ctx = g_spi_ctx;
+  if (ctx == nullptr || out == nullptr)
+    return false;
+  spi_transaction_t trans = {};
+  trans.flags = SPI_TRANS_USE_RXDATA;
+  trans.cmd = W5500_REG_INTLEVEL;
+  trans.addr = W5500_CTRL_COMMON_READ;
+  trans.length = 8 * 2;
+  const esp_err_t ret = w5500_custom_spi_transfer(ctx, &trans, 2);
+  if (ret != ESP_OK)
+    return false;
+  *out = static_cast<uint16_t>((trans.rx_data[0] << 8) | trans.rx_data[1]);
+  return true;
+}
+
+uint16_t w5500_driver_int_level() { return g_driver_int_level_seen ? g_driver_int_level : 0; }
+
+// ---- LOCAL DELTA: design B, "NTP Post-Write T3" ----
+
+void w5500_set_tx_patch(W5500TxPatchFn fn, void *ctx, uint16_t server_port) {
+  // Disable first so a frame already mid-flight is never patched with a stale fn/ctx pair, then
+  // reset the tracking state before (re-)registering.
+  g_tx_patch_fn = nullptr;
+  g_tx_patch_frame_started = false;
+  g_tx_patch_hdr_len = 0;
+  g_tx_patch_ctx = ctx;
+  g_tx_patch_port = server_port;
+  g_tx_patch_fn = fn;
+}
 
 void w5500_set_net_recorder(bool enable) {
   if (enable && g_net_bins == nullptr) {

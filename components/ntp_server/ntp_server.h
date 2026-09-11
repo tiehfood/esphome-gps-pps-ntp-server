@@ -5,6 +5,8 @@
 #include "send_estimator.h"
 #include "hook_ring.h"
 #include "rx_admission.h"
+#include "deadman.h"
+#include "ntp_tx_patch.h"
 
 #ifdef USE_ESP_IDF
 #include <sys/socket.h>
@@ -52,6 +54,22 @@ class NTPServer : public Component {
   /// default since 2026-09-11 (verified by interleaved A/B); kept switchable for later A/Bs. The
   /// verdict is re-evaluated per request, so flipping it takes effect immediately.
   void set_strict_rx_admission(bool enable) { this->strict_rx_admission_ = enable; }
+
+  /// Design A ("W5500 Short Interrupt Wait"): shortens the chip's own INTLEVEL from the
+  /// driver's boot default (0xFFFF, ~1.748 ms) to 0x0FFF (~109 us). A live register write with
+  /// no independent recovery path if it went wrong, so this is gated by a 30-minute dead-man
+  /// timer (armed on enable, checked in loop()) as well as the caller's own switch. Off by
+  /// default; main task only.
+  void set_short_int_wait(bool enable);
+  /// True while the dead-man is armed AND the last read-back actually showed the short value --
+  /// i.e. reflects hardware state, not just "was asked for".
+  bool short_int_wait_active() const;
+
+  /// Design B ("NTP Post-Write T3"): rewrites T3 (and the UDP checksum, if present) into the
+  /// reply's bytes already queued in the W5500 TX buffer, immediately before the SEND that
+  /// transmits it -- closer to the wire than any timestamp written before sendto(). Off by
+  /// default; main task only.
+  void set_post_write_t3(bool enable);
 #endif
 
   void setup() override;
@@ -241,6 +259,12 @@ class NTPServer : public Component {
     /// missed or the size-read stamp did not provably belong to this frame.
     int32_t rx_rsr;
     int32_t frame_len;
+    /// Design B ("NTP Post-Write T3"): whether this reply's T3 (and checksum, if present) was
+    /// rewritten in the TX buffer just before SEND. patch_to_send_us/patch_pred_us are -1 when
+    /// patched == 0.
+    uint8_t patched;
+    int32_t patch_to_send_us;  ///< send_cmd_us - patch_us for this SEND
+    int32_t patch_pred_us;     ///< the patch_delay_ estimate this reply's patched T3 used
   };
   static constexpr uint8_t DIAG_HOOK_HIT = 0x01;
   static constexpr uint8_t DIAG_RX_STALLED = 0x02;
@@ -287,6 +311,25 @@ class NTPServer : public Component {
   /// delta since hook_us. Never calls gettimeofday() at the hook itself.
   NTPTimestamp hook_to_ntp_timestamp_(int64_t hook_us);
   bool anchor_epoch_us_(int64_t at_us, int64_t &out_us);
+
+  // ---- Design A: "W5500 Short Interrupt Wait" ----
+  /// Reverts the INTLEVEL write if set_short_int_wait(false) is never called -- see
+  /// .claude/CLAUDE.md on why any experimental W5500 register write needs one. Checked in
+  /// loop(); armed/disarmed only from set_short_int_wait(), main task only.
+  DeadmanTimer int_wait_deadman_;
+  /// The value actually read back after the last write, so short_int_wait_active() and the INT
+  /// diag command reflect hardware state rather than merely "was asked for".
+  uint16_t last_int_level_readback_{0};
+
+  // ---- Design B: "NTP Post-Write T3" ----
+  /// EWMA estimate of the patch-callback-to-SEND delay, learned from every SEND that was
+  /// actually patched (see recv_task_()). Independent of send_estimator_, which predicts a much
+  /// longer interval (build through sendto()).
+  PatchDelayEstimator patch_delay_;
+  /// Trampoline registered with ethernet::w5500_set_tx_patch(); runs in the transmitting task's
+  /// context, inside sendto() -- see build_patch_t3_() for what that forbids.
+  static bool tx_patch_trampoline_(void *ctx, uint32_t now_us, uint8_t t3_out[8]);
+  bool build_patch_t3_(uint32_t now_us, uint8_t t3_out[8]);
 #else
   WiFiUDP udp_;
 #endif

@@ -340,6 +340,35 @@ switch:
     turn_off_action:
       - lambda: 'id(${id_prefix}_ntp).set_strict_rx_admission(false);'
 
+  # Off by default: shortens the W5500's own INTLEVEL (interrupt assert wait time) from the
+  # driver's boot default 0xFFFF (~1.748 ms) to 0x0FFF (~109 us). A live register write with no
+  # independent recovery path if it went wrong, so it self-reverts after 30 minutes even if this
+  # switch is never turned off again (see .claude/CLAUDE.md on why that dead-man is required).
+  - platform: template
+    name: "NTP W5500 Short Interrupt Wait"
+    id: ${id_prefix}_ntp_w5500_short_int_wait
+    entity_category: "diagnostic"
+    restore_mode: ALWAYS_OFF
+    lambda: 'return id(${id_prefix}_ntp).short_int_wait_active();'
+    turn_on_action:
+      - lambda: 'id(${id_prefix}_ntp).set_short_int_wait(true);'
+    turn_off_action:
+      - lambda: 'id(${id_prefix}_ntp).set_short_int_wait(false);'
+
+  # Off by default: rewrites T3 (and the UDP checksum, if present) into the reply's bytes
+  # already queued in the W5500 TX buffer, immediately before the SEND that transmits it --
+  # closer to the wire than any timestamp written before sendto(). See ntp_tx_patch.h.
+  - platform: template
+    name: "NTP Post-Write T3"
+    id: ${id_prefix}_ntp_post_write_t3
+    entity_category: "diagnostic"
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - lambda: 'id(${id_prefix}_ntp).set_post_write_t3(true);'
+    turn_off_action:
+      - lambda: 'id(${id_prefix}_ntp).set_post_write_t3(false);'
+
   - platform: template
     name: "${name} RGB LED"
     id: ${id_prefix}_rgb_led_switch

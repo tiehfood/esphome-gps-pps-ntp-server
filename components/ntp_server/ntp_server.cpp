@@ -82,6 +82,32 @@ static const uint32_t TELEMETRY_INTERVAL_MS = 10000;
 /// UDP port answering CLK / REQ / NET while the diagnostics switch is on.
 static const uint16_t DIAG_PORT = 12301;
 
+#ifdef USE_ESP_IDF
+/// Design A ("W5500 Short Interrupt Wait"): the driver's boot default (0xFFFF, ~1.748 ms,
+/// chosen to avoid missing a quickly re-asserted interrupt on the NEGEDGE GPIO) versus the
+/// shortened value this feature switches to (0x0FFF, ~109 us) -- see .claude/CLAUDE.md.
+static const uint16_t W5500_INT_LEVEL_SHORT = 0x0FFF;
+static const uint16_t W5500_INT_LEVEL_DEFAULT = 0xFFFF;
+/// How long an enabled short-interrupt-wait reverts itself if nobody calls
+/// set_short_int_wait(false) again -- a live register write with no other recovery path.
+static const uint32_t INT_WAIT_DEADMAN_MS = 1800000;  // 30 minutes
+#endif
+
+/// Encodes an NTPTimestamp into the 8-byte big-endian wire format used for every timestamp
+/// field in an NTP packet. Shared so the post-write T3 patch (design B) writes byte-for-byte
+/// the same encoding build_ntp_response_ uses for the transmit timestamp -- see
+/// NTPServer::build_patch_t3_().
+static void encode_ntp_timestamp_(const NTPTimestamp &ts, uint8_t out[8]) {
+  out[0] = (ts.seconds >> 24) & 0xFF;
+  out[1] = (ts.seconds >> 16) & 0xFF;
+  out[2] = (ts.seconds >> 8) & 0xFF;
+  out[3] = ts.seconds & 0xFF;
+  out[4] = (ts.fraction >> 24) & 0xFF;
+  out[5] = (ts.fraction >> 16) & 0xFF;
+  out[6] = (ts.fraction >> 8) & 0xFF;
+  out[7] = ts.fraction & 0xFF;
+}
+
 // ---- Platform-specific setup / loop ----
 
 #ifdef USE_ESP_IDF
@@ -192,6 +218,20 @@ void NTPServer::setup() {
 }
 
 void NTPServer::loop() {
+  // Design A dead-man: revert the short interrupt wait if set_short_int_wait(false) was never
+  // called again. Checked every loop -- cheap when disarmed (a single bool check) -- so an
+  // unattended experiment cannot leave a live register write in place indefinitely.
+  if (this->int_wait_deadman_.expired(millis())) {
+    const uint16_t driver_default =
+        ethernet::w5500_driver_int_level() != 0 ? ethernet::w5500_driver_int_level() : W5500_INT_LEVEL_DEFAULT;
+    ethernet::w5500_write_int_level(driver_default);
+    uint16_t readback = 0;
+    ethernet::w5500_read_int_level(&readback);
+    this->last_int_level_readback_ = readback;
+    this->int_wait_deadman_.disarm();
+    ESP_LOGW(TAG, "dead-man expired: INTLEVEL restored to 0x%04X", readback);
+  }
+
   // Nothing to do on the request path itself: recv_task_() serves every request on
   // its own task, blocked in recvfrom(). Diagnostics are recorded there and in the driver
   // task, and published here -- publishing is an ESPHome API call, only safe from this
@@ -301,6 +341,9 @@ void NTPServer::recv_task_(void *param) {
       diag.send_class = -1;
       diag.tx_write_start_us = -1;
       diag.tx_write_end_us = -1;
+      diag.patched = 0;
+      diag.patch_to_send_us = -1;
+      diag.patch_pred_us = -1;
     }
 
     // ---- Admission: hook miss, or an INTn edge that is stale/missing (rx_admission.h) ----
@@ -422,6 +465,7 @@ void NTPServer::recv_task_(void *param) {
     SendEstimator::Result learned = SendEstimator::Result::IGNORED;
     int32_t actual_us = -1;
     bool send_not_ntp = false;
+    int32_t patch_pred_used_us = -1;  // design B: the patch-delay estimate this reply's T3 used
     if (after.seq != before.seq) {
       if (after.frame_class == ethernet::W5500_FC_NTP) {
         // Time from t0 to the Sn_CR = SEND write -- NOT how long sendto() took to return, which
@@ -430,6 +474,16 @@ void NTPServer::recv_task_(void *param) {
         if (actual_us > 0 && actual_us < SendEstimator::US_MAX)
           self->t3_error_win_.add(actual_us - self->send_estimator_.estimate());
         learned = self->send_estimator_.learn(actual_us, t0);
+        // Design B: learn the patch-callback-to-SEND delay from this SEND, but only when it was
+        // actually patched -- an unpatched SEND (feature off, or this frame was not recognised
+        // by plan_ntp_tx_patch()) says nothing about that interval.
+        if (after.patched != 0 && after.patch_us != 0) {
+          const int32_t patch_to_send_us = static_cast<int32_t>(after.send_cmd_us - after.patch_us);
+          // Keep the estimate this reply's patched T3 actually used (before learning from it), so
+          // the diagnostics measure the real prediction error rather than one shrunk by the update.
+          patch_pred_used_us = self->patch_delay_.estimate();
+          self->patch_delay_.learn(patch_to_send_us);
+        }
       } else {
         send_not_ntp = true;
       }
@@ -451,6 +505,12 @@ void NTPServer::recv_task_(void *param) {
           after.txbuf_start_us != 0 && after.txbuf_end_us != 0) {
         diag.tx_write_start_us = static_cast<int32_t>(after.txbuf_start_us - static_cast<uint32_t>(t0));
         diag.tx_write_end_us = static_cast<int32_t>(after.txbuf_end_us - static_cast<uint32_t>(t0));
+      }
+      // Design B fields: only meaningful for a SEND provably this reply's own.
+      if (after.seq != before.seq && after.frame_class == ethernet::W5500_FC_NTP && after.patched != 0) {
+        diag.patched = 1;
+        diag.patch_to_send_us = (after.patch_us != 0) ? static_cast<int32_t>(after.send_cmd_us - after.patch_us) : -1;
+        diag.patch_pred_us = patch_pred_used_us;
       }
       if (send_not_ntp)
         diag.flags |= DIAG_SEND_NOT_NTP;
@@ -571,6 +631,86 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
   return esp_netif_receive(self->eth_netif_, buffer, length, NULL);
 }
 
+void NTPServer::set_short_int_wait(bool enable) {
+  const uint16_t driver_default =
+      ethernet::w5500_driver_int_level() != 0 ? ethernet::w5500_driver_int_level() : W5500_INT_LEVEL_DEFAULT;
+  const uint16_t target = enable ? W5500_INT_LEVEL_SHORT : driver_default;
+
+  const bool write_ok = ethernet::w5500_write_int_level(target);
+  uint16_t readback = 0;
+  const bool read_ok = write_ok && ethernet::w5500_read_int_level(&readback);
+  this->last_int_level_readback_ = read_ok ? readback : 0;
+
+  if (enable) {
+    this->int_wait_deadman_.arm(millis(), INT_WAIT_DEADMAN_MS);
+  } else {
+    this->int_wait_deadman_.disarm();
+  }
+
+  if (!write_ok || !read_ok) {
+    if (!enable && !write_ok) {
+      // The switch's boot-time "off" runs before the W5500 exists; the driver's own init then
+      // writes its default anyway. Not a fault, so no warning on every boot.
+      ESP_LOGD(TAG, "W5500 short interrupt wait: off requested before the W5500 is ready");
+      return;
+    }
+    ESP_LOGW(TAG, "W5500 short interrupt wait: register access failed (write %s, read %s)",
+             write_ok ? "ok" : "failed", read_ok ? "ok" : "failed");
+    return;
+  }
+  ESP_LOGI(TAG, "W5500 INTLEVEL set to 0x%04X (requested 0x%04X)%s", readback, target,
+           enable ? ", dead-man armed for 30 min" : "");
+  if (readback != target)
+    ESP_LOGW(TAG, "W5500 INTLEVEL read-back 0x%04X does not match requested 0x%04X", readback, target);
+}
+
+bool NTPServer::short_int_wait_active() const {
+  return this->int_wait_deadman_.armed() && this->last_int_level_readback_ == W5500_INT_LEVEL_SHORT;
+}
+
+void NTPServer::set_post_write_t3(bool enable) {
+  if (enable) {
+    ethernet::w5500_set_tx_patch(&NTPServer::tx_patch_trampoline_, this, this->port_);
+    ESP_LOGI(TAG, "NTP post-write T3 patch enabled");
+  } else {
+    ethernet::w5500_set_tx_patch(nullptr, nullptr, 0);
+    ESP_LOGI(TAG, "NTP post-write T3 patch disabled");
+  }
+}
+
+bool NTPServer::tx_patch_trampoline_(void *ctx, uint32_t now_us, uint8_t t3_out[8]) {
+  return static_cast<NTPServer *>(ctx)->build_patch_t3_(now_us, t3_out);
+}
+
+bool NTPServer::build_patch_t3_(uint32_t now_us, uint8_t t3_out[8]) {
+  // Runs in the transmitting task's context, inside sendto(), holding lwIP's core lock: no
+  // gettimeofday(), no ESPHome API call, no blocking, no allocation, no taking that lock again.
+  if (!this->is_time_synchronized_())
+    return false;
+
+  // `now_us` is a 32-bit micros() reading taken by the SPI driver a handful of instructions
+  // ago. Reconstruct its 64-bit esp_timer instant the same wrap-safe way eth_input_hook_()
+  // reconstructs T2 (a 32-bit delta against a fresh 64-bit read), then project forward by the
+  // learned patch-to-SEND delay so T3 names roughly when Sn_CR = SEND will actually be written,
+  // not the earlier instant this callback ran.
+  //
+  // That projection makes the argument to hook_to_ntp_timestamp_() a few tens of microseconds
+  // in the FUTURE relative to esp_timer_get_time() right now. Both of its branches already
+  // handle that correctly: anchor_epoch_us_() treats its input as "elapsed micros since the PPS
+  // edge" with no sign assumption, and the system-clock fallback computes
+  // `tv - (now - hook_us)`, where a hook_us in the future makes `(now - hook_us)` negative, so
+  // subtracting it ADDS the future offset -- ordinary linear algebra, not a special case. No
+  // code change was needed for the future instant; verified by inspection, not by a change.
+  const int64_t esp_now_us = esp_timer_get_time();
+  const int32_t elapsed_since_patch_us = static_cast<int32_t>(static_cast<uint32_t>(esp_now_us) - now_us);
+  const int64_t patch_instant_us = esp_now_us - elapsed_since_patch_us;
+  const int64_t predicted_send_us = patch_instant_us + this->patch_delay_.estimate();
+
+  const NTPTimestamp ts = this->hook_to_ntp_timestamp_(predicted_send_us);
+  encode_ntp_timestamp_(ts, t3_out);
+  return true;
+}
+
 void NTPServer::set_diagnostics(bool enable) {
   if (enable && this->diag_ring_ == nullptr) {
     // ~53 KB, PSRAM first: leave the internal heap the network stack draws on alone.
@@ -687,12 +827,13 @@ void NTPServer::diag_serve_() {
       char tx_hex[17];
       for (int b = 0; b < 8; b++)
         snprintf(tx_hex + 2 * b, 3, "%02x", rec.client_tx[b]);
-      emit(line, snprintf(line, sizeof(line), "R %lld %s %x %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
+      emit(line, snprintf(line, sizeof(line), "R %lld %s %x %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
                           (long long) rec.t2_us, tx_hex, (unsigned) rec.flags, (int) rec.int_lead_us,
                           (int) rec.rx_gap_us, (int) rec.hook_latency_us, (int) rec.send_us, (int) rec.sendto_us,
                           (int) rec.lock_wait_us, (int) rec.estimate_us, (int) rec.arp_wait_us,
                           (int) rec.refuse_reason, (int) rec.send_class, (int) rec.tx_write_start_us,
-                          (int) rec.tx_write_end_us, (int) rec.rx_rsr, (int) rec.frame_len));
+                          (int) rec.tx_write_end_us, (int) rec.rx_rsr, (int) rec.frame_len, (int) rec.patched,
+                          (int) rec.patch_to_send_us, (int) rec.patch_pred_us));
       lines++;
     }
   } else if (strncmp(cmd, "NET", 3) == 0) {
@@ -729,8 +870,18 @@ void NTPServer::diag_serve_() {
                           (unsigned) t.first_us, (unsigned) t.last_us));
       lines++;
     }
+  } else if (strncmp(cmd, "INT", 3) == 0) {
+    // Design A: a fresh read-back (not the cached last_int_level_readback_, which only updates
+    // on a write) alongside the switch's own view of hardware state and the dead-man's
+    // remaining time, so a stale cache can never look identical to a live one here.
+    uint16_t readback = 0;
+    ethernet::w5500_read_int_level(&readback);
+    const uint32_t remaining_s = this->int_wait_deadman_.remaining_ms(millis()) / 1000;
+    emit(line, snprintf(line, sizeof(line), "INT %04x %d %u\n", (unsigned) readback,
+                        this->short_int_wait_active() ? 1 : 0, (unsigned) remaining_s));
+    lines = 1;
   } else {
-    emit(line, snprintf(line, sizeof(line), "ERR usage: CLK | REQ | NET | TLK\n"));
+    emit(line, snprintf(line, sizeof(line), "ERR usage: CLK | REQ | NET | TLK | INT\n"));
   }
   char kind[4] = {cmd[0], cmd[1], cmd[2], '\0'};
   emit(line, snprintf(line, sizeof(line), "END %s %u\n", kind, (unsigned) lines));
@@ -921,16 +1072,11 @@ void NTPServer::build_ntp_response_(const uint8_t *request, uint8_t *response,
   response[39] = receive_ts.fraction & 0xFF;
 
   // Transmit timestamp, advanced by the measured send duration so it names the
-  // instant the packet actually leaves rather than when we built the response.
+  // instant the packet actually leaves rather than when we built the response. May be
+  // overwritten again in the TX buffer itself by the design-B post-write patch, closer still
+  // to the instant the packet actually leaves -- see NTPServer::build_patch_t3_().
   NTPTimestamp transmit_ts = this->get_ntp_timestamp_(this->send_estimator_.estimate());
-  response[40] = (transmit_ts.seconds >> 24) & 0xFF;
-  response[41] = (transmit_ts.seconds >> 16) & 0xFF;
-  response[42] = (transmit_ts.seconds >> 8) & 0xFF;
-  response[43] = transmit_ts.seconds & 0xFF;
-  response[44] = (transmit_ts.fraction >> 24) & 0xFF;
-  response[45] = (transmit_ts.fraction >> 16) & 0xFF;
-  response[46] = (transmit_ts.fraction >> 8) & 0xFF;
-  response[47] = transmit_ts.fraction & 0xFF;
+  encode_ntp_timestamp_(transmit_ts, &response[40]);
 }
 
 NTPTimestamp NTPServer::get_ntp_timestamp_(int32_t offset_us) {
