@@ -198,7 +198,7 @@
     <span><b>Target</b> Waveshare ESP32-P4 ETH PoE</span>
     <span><b>Silicon</b> rev 1.3</span>
     <span><b>Framework</b> ESP-IDF 5.5.1, bare app</span>
-    <span><b>Status</b> phases 1–6 done &middot; server defect found and fixed &middot; phase 7 paused</span>
+    <span><b>Status</b> phases 1–6 done &middot; server defect fixed, remaining errors traced &middot; phase 7 paused</span>
   </div>
 </header>
 
@@ -315,9 +315,51 @@
     </table>
   </div>
 
+  <div class="note">
+    <span class="eyebrow">Open after this run — traced on 11 September, below</span>
+    <p><b>One 80&nbsp;ms transmit stall</b> got through: the packet left 80&nbsp;ms after the T3 written into it, and refusal only checks the receive side. <b>Nine small receive-late replies</b> (1–5&nbsp;ms) escaped the 1&nbsp;ms test. <b>The estimator hardening was untested</b>, and the stalls' root cause unidentified.</p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="eyebrow">Traced</span>
+    <h2>Where the last errors come from</h2>
+  </div>
+  <p>A diagnostics build, off by default behind a switch, recorded every request's receive and send timing on the server, plus 100&nbsp;ms bins of every frame through the W5500. We ran four experiments: web load at second :30, 25&nbsp;s of sustained downloads, and a logging A/B. The recordings were joined to the probe's hardware-stamped samples, 2,815 exchanges in all.</p>
+
+  <h3>Every reply off by more than 1 ms had a warning sign</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>What the receive hook knew</th><th class="num">Exchanges</th><th class="num">Delay excess p50 / p95</th><th class="num">Off &gt; 1&nbsp;ms</th></tr></thead>
+      <tbody>
+        <tr><td>A fresh INTn edge, under 200&nbsp;µs before the read</td><td class="num">2,772</td><td class="num">0 / 24&nbsp;µs</td><td class="num"><b>0</b></td></tr>
+        <tr><td>No usable edge at all</td><td class="num">31</td><td class="num">2.5 / 4.1&nbsp;ms</td><td class="num"><b>18</b></td></tr>
+        <tr><td>An edge 200–999&nbsp;µs old (accepted today)</td><td class="num">9</td><td class="num">1.3 / 9.9&nbsp;ms</td><td class="num"><b>3</b></td></tr>
+        <tr><td>Send took 5&nbsp;ms or more</td><td class="num">3</td><td class="num">8.3 / 18.0&nbsp;ms</td><td class="num"><b>2</b></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The escapes are frames that arrived while the server was still reading an earlier one. INTn is a level the W5500 holds low, so a queued frame gets no edge of its own, and its lateness never shows up as the lead the refusal test measures. A refusal rule of "no edge, or an edge 200&nbsp;µs or older" would remove 21 of the 23 errors over 1&nbsp;ms, at the cost of 1.4% more refused requests. The mechanism is inferred from the driver code. The threshold was picked after seeing these numbers, so it must pass a fresh run with its prediction written down first.</p>
+
+  <h3>The other findings</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Question</th><th>Answer</th><th>Confidence</th></tr></thead>
+      <tbody>
+        <tr><td>What triggers the minute-7 stalls?</td><td>A one-second multicast burst on the LAN, about 1,000 frames per second, of which ~80% are not IPv4, plus mDNS queries the server answers. Receive stalls of 20–320&nbsp;ms follow, every minute. The sender is not yet identified.</td><td><span class="pill">measured</span></td></tr>
+        <tr><td>Could the chip ignore it?</td><td>The firmware has IPv6 disabled, yet the W5500 driver's multicast block covers only IPv4. The chip has a separate IPv6-block bit for raw mode, so <em>if</em> the burst is IPv6 it could be dropped before it reaches SPI.</td><td><span class="pill gap">unverified</span></td></tr>
+        <tr><td>What causes transmit stalls?</td><td>All three came during sustained web downloads, the only time lwIP's core lock was held for 3–80&nbsp;ms. The SPI lock never waited more than 1.2&nbsp;ms.</td><td><span class="pill gap">probable</span></td></tr>
+        <tr><td>Does the re-seed hardening hold?</td><td>Yes. 25&nbsp;s of back-to-back downloads produced scattered slow sends that never agreed, so there were no re-seeds and no late T3.</td><td><span class="pill">measured</span></td></tr>
+        <tr><td>Does intensive logging cause stalls?</td><td>Not detectably, with an <code>esphome logs</code> subscriber attached: 11 vs 11 refusals, 10 vs 11 receive-late, same SPI-lock tail. Verbose logging was not tested.</td><td><span class="pill">measured</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
   <div class="note warn">
-    <span class="eyebrow">Still open</span>
-    <p><b>One 80&nbsp;ms transmit stall</b> got through: the packet left 80&nbsp;ms after the T3 written into it. Refusal checks the receive side and cannot see it. <b>Nine small receive-late replies</b> (1–5&nbsp;ms) escaped the 1&nbsp;ms test for reasons not yet understood. <b>The estimator hardening is untested</b> — no re-seed happened in either run. And the root cause of the stalls remains unidentified.</p>
+    <span class="eyebrow">Two new defects</span>
+    <p><b>A wrong send estimate can last for minutes.</b> The first send after boot took 2.6&nbsp;ms and seeded the estimate. Sparse requests afterwards agreed with it, so it never re-seeded. When the probe's steady stream began (sends ~1.0&nbsp;ms), 15 replies went out with T3 0.77&nbsp;ms late before a re-seed. <span id="idle-result">It is not idleness: after 0.25–60&nbsp;s of silence, sends still take 1.04&nbsp;ms. It is ordinary service, though. Overnight, with no test running, a quarter of the ten-second windows showed a reply leaving 1.5–1.75&nbsp;ms after its T3. In a 20-minute passive capture, every slow send went to an SNTP-style client, one that leaves the transmit field empty, and SNTP clients set their clock from T3 alone. The cause is an ARP miss. For that client the server has no cached hardware address, so the reply waits in a queue while an ARP request goes out. All four slow sends sat next to the server's ARP request and its answer, where chance alone would give about 4%. All ten requests from SNTP-style clients triggered an ARP request, and none of the ten from other clients did. Worse, about half of these delays go unmeasured: the server records the ARP request's send, which looks normal, while the reply actually leaves later. So every reply to such a client carries an early T3.</span></p>
+    <p><b>The receive hook can match a stale request.</b> Its 8-entry lookup returns the first entry with the same client transmit field and never checks age. A client that repeats that field, or leaves it zero, can be served a receive timestamp minutes old. Home Assistant's hook-latency history shows 11–574&nbsp;s matches on both the old and new firmware.</p>
   </div>
 </section>
 
