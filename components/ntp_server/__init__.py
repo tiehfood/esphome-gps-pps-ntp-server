@@ -17,6 +17,7 @@ CONF_ARP_PRIMES = "arp_primes"
 CONF_T3_ERROR = "t3_error"
 CONF_INT_LEAD = "int_lead"
 CONF_REFUSED = "refused"
+CONF_ARP_WAITS = "arp_waits"
 CONF_W5500_CMD_RETRIES = "w5500_cmd_retries"
 CONF_W5500_CMD_MAX = "w5500_cmd_max"
 
@@ -73,6 +74,13 @@ CONFIG_SCHEMA = cv.Schema(
             accuracy_decimals=0,
             state_class=STATE_CLASS_TOTAL_INCREASING,
         ),
+        # Requests whose reply needed to resolve ARP before it could be sent (a cache miss,
+        # whether or not it went on to resolve within the wait bound), total since boot.
+        cv.Optional(CONF_ARP_WAITS): sensor.sensor_schema(
+            icon="mdi:lan-alert",
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_TOTAL_INCREASING,
+        ),
         # W5500 Sn_CR command handshakes (SEND / RECV) that needed more than one poll per
         # window; each cost the calling task a 10 ms sleep in the stock driver.
         cv.Optional(CONF_W5500_CMD_RETRIES): sensor.sensor_schema(
@@ -124,6 +132,10 @@ async def to_code(config):
     if refused_config := config.get(CONF_REFUSED):
         sens = await sensor.new_sensor(refused_config)
         cg.add(var.set_refused_sensor(sens))
+
+    if arp_waits_config := config.get(CONF_ARP_WAITS):
+        sens = await sensor.new_sensor(arp_waits_config)
+        cg.add(var.set_arp_waits_sensor(sens))
 
     if cmd_retries_config := config.get(CONF_W5500_CMD_RETRIES):
         sens = await sensor.new_sensor(cmd_retries_config)

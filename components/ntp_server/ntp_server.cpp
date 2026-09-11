@@ -1,6 +1,7 @@
 #include "ntp_server.h"
 #include "esphome/core/log.h"
 #include "esphome/components/gps_pps_time/gps_pps_time.h"
+#include "arp_wait.h"
 
 #include <sys/time.h>
 #include <algorithm>
@@ -66,16 +67,14 @@ static const float ROOT_DISP_RATE_S_PER_S = 10.0e-6f;
 static const float NTP_SHORT_SCALE = 65536.0f;
 
 // The send estimate's bounds, EWMA rate and re-seed rules live in send_estimator.h.
+// The receive-admission thresholds (RX_STALL_MAX_US, RX_STALL_EDGE_MAX_AGE_US,
+// RX_EDGE_LEAD_STRICT_US) live in rx_admission.h, alongside the pure functions that use them.
 
-/// Refuse a request when its receive burst began this long after the W5500 raised INTn.
-/// Normal INTn-to-burst lead is 3-25 us. Under outbound TCP load the receive path stalls for
-/// up to ~100 ms (measured 2026-09-10 with the P4 probe: every minute, and on demand by
-/// downloading the web page), and a T2 stamped that late puts half of the delay into the
-/// client's offset. No reply beats a wrong one -- clients retry -- and 1 ms is still ~40x
-/// the normal lead.
-static const int32_t RX_STALL_MAX_US = 1000;
-/// An INTn edge older than this is not trusted as the arrival reference.
-static const int32_t RX_STALL_EDGE_MAX_AGE_US = 2000000;
+/// How long recv_task_() waits for an ARP entry to resolve before giving up and refusing the
+/// request outright. lwIP's own ARP round trip is ~1.5 ms on this network; 20 ms is a wide
+/// margin that still fits comfortably inside a task's own budget (this is not the main loop,
+/// so there is no watchdog concern -- see .claude/CLAUDE.md).
+static const int64_t ARP_WAIT_MAX_US = 20000;
 /// Per-request diagnostics are published as the largest-magnitude value per window. Publishing
 /// on every request put ~16 state messages/s through API and SSE at a 4 Hz client: outbound
 /// load of exactly the kind that stalls the receive path.
@@ -175,7 +174,7 @@ void NTPServer::setup() {
   this->precision_anchor_ = pa;
 
   ESP_LOGI(TAG, "NTP server listening on port %u (clock read %uus precision %d; anchor %uus precision %d)",
-           this->port_, best_us, this->precision_, best_anchor_us, this->precision_anchor_);
+           this->port_, (unsigned) best_us, this->precision_, (unsigned) best_anchor_us, this->precision_anchor_);
 
   // Serving moves off the shared loop entirely: Application::loop() sleeps out a
   // 16ms loop_interval_ between component polls, so stamping T2 there adds a mean
@@ -222,6 +221,8 @@ void NTPServer::loop() {
     this->hook_latency_sensor_->publish_state(v);
   if (this->refused_sensor_ != nullptr)
     this->refused_sensor_->publish_state(this->refused_.load(std::memory_order_relaxed));
+  if (this->arp_waits_sensor_ != nullptr)
+    this->arp_waits_sensor_->publish_state(this->arp_waits_.load(std::memory_order_relaxed));
 
   const ethernet::W5500CmdStats cmd = ethernet::w5500_take_cmd_stats();
   if (this->w5500_cmd_retries_sensor_ != nullptr)
@@ -258,11 +259,14 @@ void NTPServer::recv_task_(void *param) {
     if (received < NTP_PACKET_SIZE)
       continue;  // runt packet -- drop, keep serving
 
-    // The client's own transmit timestamp (bytes 40-47) is unique per request and
-    // is exactly what eth_input_hook_() keyed its ring entry on -- it saw this same
-    // request arrive, before lwIP, before this task woke.
+    // The client's own transmit timestamp (bytes 40-47) plus its source IP/port is exactly
+    // what eth_input_hook_() keyed its ring entry on -- it saw this same request arrive,
+    // before lwIP, before this task woke. Both fields are already network-order, matching the
+    // raw bytes the hook copied out of the frame, so no ntohs()/ntohl() is needed here.
     HookInfo hook;
-    const bool hook_hit = self->hook_lookup_(&buffer[40], &hook);
+    const int64_t lookup_now_us = esp_timer_get_time();
+    const bool hook_hit = self->hook_lookup_(&buffer[40], client_addr.sin_addr.s_addr,
+                                             client_addr.sin_port, lookup_now_us, &hook);
     int32_t hook_latency_us = -1;
     if (hook_hit) {
       receive_ts = self->hook_to_ntp_timestamp_(hook.t);
@@ -282,7 +286,7 @@ void NTPServer::recv_task_(void *param) {
     if (diagnostics) {
       diag.t2_us = hook_hit ? hook.t : esp_timer_get_time();
       memcpy(diag.client_tx, &buffer[40], sizeof(diag.client_tx));
-      diag.flags = (hook_hit ? DIAG_HOOK_HIT : 0) | (hook.rx_stalled ? DIAG_RX_STALLED : 0);
+      diag.flags = hook_hit ? DIAG_HOOK_HIT : 0;
       diag.int_lead_us = hook_hit ? hook.int_lead_us : -1;
       diag.rx_gap_us = hook_hit ? hook.rx_gap_us : -1;
       diag.hook_latency_us = hook_latency_us;
@@ -290,15 +294,35 @@ void NTPServer::recv_task_(void *param) {
       diag.sendto_us = -1;
       diag.lock_wait_us = -1;
       diag.estimate_us = self->send_estimator_.estimate();
+      diag.arp_wait_us = -1;  // not evaluated yet
+      diag.refuse_reason = REFUSE_NONE;
+      diag.send_class = -1;
     }
 
-    // The receive path stalled on this request: its T2 is late by up to ~100 ms, and half of
-    // that would land in the client's offset. Refuse rather than serve it; the client retries.
-    // Nothing is sent, so the T3 estimate cannot learn from a stalled send either.
-    if (hook_hit && hook.rx_stalled) {
+    // ---- Admission: hook miss, or an INTn edge that is stale/missing (rx_admission.h) ----
+    // A stale/missing edge means T2 is unverifiable or was late by up to ~100 ms; a hook miss
+    // (only possible when the hook IS installed -- eth_netif_ != nullptr) means this exact
+    // request never crossed the input-path hook, so its T2 fallback could be minutes old (a
+    // repeated or all-zero client transmit field hitting a stale ring entry, or T2 stamped only
+    // on this task's own recvfrom() return). No reply beats a wrong one; clients retry.
+    uint8_t refuse_reason = REFUSE_NONE;
+    if (self->eth_netif_ != nullptr && !hook_hit) {
+      refuse_reason = REFUSE_HOOK_MISS;
+    } else if (hook_hit) {
+      const RxVerdict verdict =
+          rx_admission(hook.capture_armed, hook.edge_usable, hook.lead_us, self->strict_rx_admission_);
+      if (verdict == RxVerdict::OLD_EDGE)
+        refuse_reason = REFUSE_OLD_EDGE;
+      else if (verdict == RxVerdict::NO_EDGE)
+        refuse_reason = REFUSE_NO_EDGE;
+    }
+    if (refuse_reason != REFUSE_NONE) {
       self->refused_.fetch_add(1, std::memory_order_relaxed);
       if (diagnostics) {
         diag.flags |= DIAG_REFUSED;
+        if (refuse_reason == REFUSE_OLD_EDGE || refuse_reason == REFUSE_NO_EDGE)
+          diag.flags |= DIAG_RX_STALLED;
+        diag.refuse_reason = refuse_reason;
         self->diag_record_(diag);
       }
       continue;
@@ -307,6 +331,64 @@ void NTPServer::recv_task_(void *param) {
     // Remember who asked, so loop() can keep their ARP entry warm. Plain store only --
     // no lwIP calls from this task beyond the socket API.
     self->note_arp_client_(client_addr.sin_addr.s_addr);
+
+    // ---- ARP resolution ----
+    // sendto() would otherwise queue the reply behind an ARP round trip (~1.5 ms) if lwIP has
+    // no entry for the next hop, and the SEND stamp read afterwards could then belong to the
+    // ARP request rather than our reply -- silently mislearning the T3 estimate (confirmed on
+    // the live device 2026-09-11). Wait for it to resolve (or give up) BEFORE the reply is
+    // built, so T3 is computed after any wait and pays no accuracy cost.
+    int32_t arp_wait_us = -1;
+    if (self->eth_netif_ != nullptr) {
+      auto *netif = static_cast<struct netif *>(esp_netif_get_netif_impl(self->eth_netif_));
+      if (netif != nullptr) {
+        const uint32_t our_ip = netif_ip4_addr(netif)->addr;
+        const uint32_t netmask = netif_ip4_netmask(netif)->addr;
+        const uint32_t gateway = netif_ip4_gw(netif)->addr;
+        const uint32_t hop = next_hop_ipv4(client_addr.sin_addr.s_addr, our_ip, netmask, gateway);
+        // hop == 0: off-subnet client with no gateway configured -- nothing sensible to
+        // resolve, and refusing every such request would be worse than the rare ARP stall.
+        if (hop != 0) {
+          ip4_addr_t hop_ip;
+          hop_ip.addr = hop;
+          auto lookup = [netif, &hop_ip]() {
+            LOCK_TCPIP_CORE();
+            struct eth_addr *eth_ret = nullptr;
+            const ip4_addr_t *ip_ret = nullptr;
+            const bool ok = etharp_find_addr(netif, &hop_ip, &eth_ret, &ip_ret) >= 0;
+            UNLOCK_TCPIP_CORE();
+            return ok;
+          };
+          auto query = [netif, &hop_ip]() {
+            LOCK_TCPIP_CORE();
+            etharp_query(netif, &hop_ip, nullptr);
+            UNLOCK_TCPIP_CORE();
+          };
+          // Never sleeps with the core lock held: the tcpip thread needs it to process the
+          // ARP reply. FREERTOS_HZ is 1000, so vTaskDelay(1) is exactly 1 ms.
+          const ArpWaitResult res =
+              wait_for_arp(lookup, query, []() { vTaskDelay(1); },
+                           []() { return esp_timer_get_time(); }, ARP_WAIT_MAX_US);
+          arp_wait_us = res.waited_us;
+          if (res.missed)
+            self->arp_waits_.fetch_add(1, std::memory_order_relaxed);
+          if (!res.resolved) {
+            self->refused_.fetch_add(1, std::memory_order_relaxed);
+            if (diagnostics) {
+              diag.flags |= DIAG_REFUSED | DIAG_ARP_MISS;
+              diag.arp_wait_us = arp_wait_us;
+              diag.refuse_reason = REFUSE_ARP_UNRESOLVED;
+              self->diag_record_(diag);
+            }
+            continue;
+          }
+          if (res.missed && diagnostics)
+            diag.flags |= DIAG_ARP_MISS;
+        }
+      }
+    }
+    if (diagnostics)
+      diag.arp_wait_us = arp_wait_us;
 
     if (diagnostics) {
       // How contended lwIP's core lock is right now -- sendto() has to take it too. Probed
@@ -328,31 +410,44 @@ void NTPServer::recv_task_(void *param) {
     int32_t dur = static_cast<int32_t>(t_after - t0);
 
     // T3 was written as build time + the send estimate, a prediction. The W5500 was actually
-    // told to transmit when the driver wrote Sn_CR = SEND: measure how wrong it was and learn.
+    // told to transmit when the driver wrote Sn_CR = SEND: measure how wrong it was and learn --
+    // but only when that SEND is provably OUR reply (frame_class == NTP). A SEND for some other
+    // frame (an ARP request queued behind ours, for instance) would mislearn the estimate in
+    // either direction, and there is no way to retroactively tell how long ours actually took.
     ethernet::W5500SendStamp after = ethernet::w5500_send_stamp();
     SendEstimator::Result learned = SendEstimator::Result::IGNORED;
     int32_t actual_us = -1;
+    bool send_not_ntp = false;
     if (after.seq != before.seq) {
-      // Time from t0 to the Sn_CR = SEND write -- NOT how long sendto() took to return, which is
-      // strictly later and made the estimate over-predict by ~180 us.
-      actual_us = static_cast<int32_t>(after.send_cmd_us - static_cast<uint32_t>(t0));
-      if (actual_us > 0 && actual_us < SendEstimator::US_MAX)
-        self->t3_error_win_.add(actual_us - self->send_estimator_.estimate());
-      learned = self->send_estimator_.learn(actual_us, t0);
-    }
-    // Fallback only: no usable hardware stamp this round (none, or outside the bounds), so learn
-    // from the sendto() duration, under the same bounds.
-    if (learned == SendEstimator::Result::IGNORED)
+      if (after.frame_class == ethernet::W5500_FC_NTP) {
+        // Time from t0 to the Sn_CR = SEND write -- NOT how long sendto() took to return, which
+        // is strictly later and made the estimate over-predict by ~180 us.
+        actual_us = static_cast<int32_t>(after.send_cmd_us - static_cast<uint32_t>(t0));
+        if (actual_us > 0 && actual_us < SendEstimator::US_MAX)
+          self->t3_error_win_.add(actual_us - self->send_estimator_.estimate());
+        learned = self->send_estimator_.learn(actual_us, t0);
+      } else {
+        send_not_ntp = true;
+      }
+    } else {
+      // No SEND happened at all this round: fall back to learning from the sendto() duration,
+      // under the same bounds. Deliberately NOT used when a SEND happened but for the wrong
+      // frame, or was out of SendEstimator's accepted range -- either way it says nothing about
+      // how long our own reply took to go out.
       self->send_estimator_.learn_fallback(dur);
+    }
 
     if (diagnostics) {
       diag.send_us = actual_us;
       diag.sendto_us = dur;
+      diag.send_class = (after.seq != before.seq) ? static_cast<int8_t>(after.frame_class) : -1;
+      if (send_not_ntp)
+        diag.flags |= DIAG_SEND_NOT_NTP;
       if (actual_us >= SendEstimator::US_MAX || dur >= SendEstimator::US_MAX)
         diag.flags |= DIAG_SEND_LONG;
       if (learned == SendEstimator::Result::RESEEDED)
         diag.flags |= DIAG_RESEEDED;
-      if (learned == SendEstimator::Result::IGNORED)
+      if (learned == SendEstimator::Result::IGNORED && after.seq == before.seq)
         diag.flags |= DIAG_FALLBACK;
       self->diag_record_(diag);
     }
@@ -381,7 +476,6 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
   static const uint32_t UDP_HDR_LEN = 8;
   static const uint16_t ETHERTYPE_IPV4 = 0x0800;
   static const uint8_t IP_PROTO_UDP = 17;
-  static const uint16_t NTP_PORT = 123;
 
   if (length >= ETH_HDR_LEN + MIN_IPV4_HDR_LEN) {
     uint16_t ethertype = (static_cast<uint16_t>(buffer[12]) << 8) | buffer[13];
@@ -392,7 +486,9 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
       if (ihl >= 5 && length >= udp_offset + UDP_HDR_LEN && buffer[ETH_HDR_LEN + 9] == IP_PROTO_UDP) {
         uint16_t dst_port = (static_cast<uint16_t>(buffer[udp_offset + 2]) << 8) | buffer[udp_offset + 3];
         uint32_t ntp_offset = udp_offset + UDP_HDR_LEN;
-        if (dst_port == NTP_PORT && length >= ntp_offset + NTP_PACKET_SIZE) {
+        // The port the socket is actually bound to, not a hard-coded 123: recv_task_() refuses any
+        // request the hook did not record, so a mismatch here would refuse every request.
+        if (dst_port == self->port_ && length >= ntp_offset + NTP_PACKET_SIZE) {
           // Phase 3 Step 3: stamp T2 at the Sn_RX_RSR read rather than here, after the
           // frame has been clocked over SPI. Measured gap 287 +/- 16 us; a one-sided T2
           // shift costs half in client-visible offset, so this recovers ~144 us.
@@ -406,17 +502,19 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
           ethernet::W5500RxStamps st = ethernet::w5500_rx_stamps();
           // The W5500 asserted INTn before any of this: hardware timestamp vs our stamp.
           // Normally 3-25 us (GPIO ISR plus driver task wake). When the receive path stalls,
-          // the burst starts up to ~100 ms after the edge, T2 is that late, and the request is
-          // refused in recv_task_(). Edges older than RX_STALL_EDGE_MAX_AGE_US are not trusted.
+          // the burst starts up to ~100 ms after the edge, T2 is that late, and rx_admission()
+          // in recv_task_() refuses the request. capture_armed/edge_usable/lead_us are the raw
+          // measurement; the admission verdict itself is computed later, against whatever
+          // set_strict_rx_admission() is set to AT REQUEST TIME, not now.
           HookInfo info;
           ethernet::W5500IntStamp ist = ethernet::w5500_int_stamp();
-          if (ist.seq != 0 && st.burst_start_us != 0) {
-            int32_t int_lead = static_cast<int32_t>(st.burst_start_us - ist.edge_us);
-            if (int_lead > 0 && int_lead < RX_STALL_EDGE_MAX_AGE_US) {
-              self->int_lead_win_.add(int_lead);
-              info.int_lead_us = int_lead;
-              info.rx_stalled = int_lead >= RX_STALL_MAX_US;
-            }
+          info.capture_armed = ist.seq != 0;
+          const RxEdgeEval edge_eval = evaluate_rx_edge(ist.seq, ist.edge_us, st.burst_start_us);
+          info.edge_usable = edge_eval.edge_usable;
+          info.lead_us = edge_eval.lead_us;
+          if (edge_eval.edge_usable) {
+            self->int_lead_win_.add(edge_eval.lead_us);
+            info.int_lead_us = edge_eval.lead_us;
           }
 
           if (st.size_read_us != 0 && st.payloads_since_size_read == 1) {
@@ -438,7 +536,14 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
             }
           }
           info.t = t2;
-          self->hook_record_(&buffer[ntp_offset + 40], info);
+          // Raw copies, network byte order, straight off the wire -- these must compare equal
+          // to sockaddr_in::sin_addr/sin_port in recv_task_(), which are also network order, so
+          // no ntohs()/ntohl() here.
+          uint32_t src_ip;
+          memcpy(&src_ip, &buffer[ETH_HDR_LEN + 12], 4);
+          uint16_t src_port;
+          memcpy(&src_port, &buffer[udp_offset + 0], 2);
+          self->hook_record_(&buffer[ntp_offset + 40], src_ip, src_port, info);
         }
       }
     }
@@ -566,9 +671,11 @@ void NTPServer::diag_serve_() {
       char tx_hex[17];
       for (int b = 0; b < 8; b++)
         snprintf(tx_hex + 2 * b, 3, "%02x", rec.client_tx[b]);
-      emit(line, snprintf(line, sizeof(line), "R %lld %s %x %d %d %d %d %d %d %d\n", (long long) rec.t2_us, tx_hex,
-                          (unsigned) rec.flags, (int) rec.int_lead_us, (int) rec.rx_gap_us, (int) rec.hook_latency_us,
-                          (int) rec.send_us, (int) rec.sendto_us, (int) rec.lock_wait_us, (int) rec.estimate_us));
+      emit(line, snprintf(line, sizeof(line), "R %lld %s %x %d %d %d %d %d %d %d %d %d %d\n",
+                          (long long) rec.t2_us, tx_hex, (unsigned) rec.flags, (int) rec.int_lead_us,
+                          (int) rec.rx_gap_us, (int) rec.hook_latency_us, (int) rec.send_us, (int) rec.sendto_us,
+                          (int) rec.lock_wait_us, (int) rec.estimate_us, (int) rec.arp_wait_us,
+                          (int) rec.refuse_reason, (int) rec.send_class));
       lines++;
     }
   } else if (strncmp(cmd, "NET", 3) == 0) {
@@ -589,53 +696,37 @@ void NTPServer::diag_serve_() {
       emit(line, len);
       lines++;
     }
+  } else if (strncmp(cmd, "TLK", 3) == 0) {
+    for (uint8_t i = 0; i < ethernet::W5500_TALKER_TABLE_SIZE; i++) {
+      ethernet::W5500Talker t;
+      if (!ethernet::w5500_talker(i, t))
+        continue;
+      char src[18];
+      char dst[18];
+      snprintf(src, sizeof(src), "%02x:%02x:%02x:%02x:%02x:%02x", t.src_mac[0], t.src_mac[1], t.src_mac[2],
+               t.src_mac[3], t.src_mac[4], t.src_mac[5]);
+      snprintf(dst, sizeof(dst), "%02x:%02x:%02x:%02x:%02x:%02x", t.first_dst_mac[0], t.first_dst_mac[1],
+               t.first_dst_mac[2], t.first_dst_mac[3], t.first_dst_mac[4], t.first_dst_mac[5]);
+      emit(line, snprintf(line, sizeof(line), "T %s %04x %s %u %u %u %u %u\n", src, (unsigned) t.ethertype, dst,
+                          (unsigned) t.frames, (unsigned) t.burst_frames, (unsigned) t.bytes,
+                          (unsigned) t.first_us, (unsigned) t.last_us));
+      lines++;
+    }
   } else {
-    emit(line, snprintf(line, sizeof(line), "ERR usage: CLK | REQ | NET\n"));
+    emit(line, snprintf(line, sizeof(line), "ERR usage: CLK | REQ | NET | TLK\n"));
   }
   char kind[4] = {cmd[0], cmd[1], cmd[2], '\0'};
   emit(line, snprintf(line, sizeof(line), "END %s %u\n", kind, (unsigned) lines));
   flush();
 }
 
-void NTPServer::hook_record_(const uint8_t *key, const HookInfo &info) {
-  HookEntry &slot = this->hook_ring_[this->hook_ring_next_];
-  this->hook_ring_next_ = static_cast<uint8_t>((this->hook_ring_next_ + 1) % HOOK_RING_SIZE);
-
-  // Seqlock write. eth_input_hook_() (via this function) is the sole writer -- the
-  // W5500 driver delivers one frame at a time from its own task, so this never races
-  // another write to the same slot -- only against hook_lookup_()'s reads from
-  // recv_task_(), possibly on the other core. Odd seq = write in progress; even = a
-  // consistent snapshot. Release fences ensure the payload writes cannot be observed
-  // out of order around the seq transitions on the reader's core.
-  uint32_t seq = slot.seq.load(std::memory_order_relaxed);
-  slot.seq.store(seq + 1, std::memory_order_relaxed);
-  std::atomic_thread_fence(std::memory_order_release);
-  memcpy(slot.key, key, sizeof(slot.key));
-  slot.info = info;
-  std::atomic_thread_fence(std::memory_order_release);
-  slot.seq.store(seq + 2, std::memory_order_relaxed);
+void NTPServer::hook_record_(const uint8_t *tx, uint32_t src_ip, uint16_t src_port, const HookInfo &info) {
+  this->hook_ring_.record(tx, src_ip, src_port, info);
 }
 
-bool NTPServer::hook_lookup_(const uint8_t *key, HookInfo *out) {
-  for (int i = 0; i < HOOK_RING_SIZE; i++) {
-    HookEntry &slot = this->hook_ring_[i];
-    uint32_t s1 = slot.seq.load(std::memory_order_relaxed);
-    if (s1 & 1)
-      continue;  // write in progress on this slot -- skip rather than spin
-    std::atomic_thread_fence(std::memory_order_acquire);
-    uint8_t k[8];
-    memcpy(k, slot.key, sizeof(k));
-    HookInfo info = slot.info;
-    std::atomic_thread_fence(std::memory_order_acquire);
-    uint32_t s2 = slot.seq.load(std::memory_order_relaxed);
-    if (s1 != s2)
-      continue;  // torn read (write happened mid-copy) -- skip, don't trust it
-    if (memcmp(k, key, sizeof(k)) == 0) {
-      *out = info;
-      return true;
-    }
-  }
-  return false;
+bool NTPServer::hook_lookup_(const uint8_t *tx, uint32_t src_ip, uint16_t src_port, int64_t now_us,
+                             HookInfo *out) {
+  return this->hook_ring_.lookup(tx, src_ip, src_port, now_us, out);
 }
 
 NTPTimestamp NTPServer::micros_epoch_to_ntp_timestamp_(int64_t unix_us) {
@@ -898,16 +989,14 @@ void NTPServer::refresh_arp_entries_() {
     // -- ARPing the client itself would never resolve and would broadcast forever.
     // (Caught by the arp_primes counter refusing to settle: the test client sits on a
     // different /24.)
-    ip4_addr_t ip;
     const uint32_t netmask = netif_ip4_netmask(netif)->addr;
     const uint32_t our_ip = netif_ip4_addr(netif)->addr;
-    if (((addr ^ our_ip) & netmask) == 0) {
-      ip.addr = addr;
-    } else {
-      ip.addr = netif_ip4_gw(netif)->addr;
-      if (ip.addr == 0)
-        continue;  // no gateway configured; nothing sensible to resolve
-    }
+    const uint32_t gateway = netif_ip4_gw(netif)->addr;
+    const uint32_t hop = next_hop_ipv4(addr, our_ip, netmask, gateway);
+    if (hop == 0)
+      continue;  // off-subnet with no gateway configured; nothing sensible to resolve
+    ip4_addr_t ip;
+    ip.addr = hop;
 
     // etharp_* are not thread-safe; this runs on the ESPHome main task, not the tcpip
     // thread, so the core lock is required (CONFIG_LWIP_TCPIP_CORE_LOCKING=y).
@@ -927,7 +1016,8 @@ void NTPServer::refresh_arp_entries_() {
   if (primed > 0) {
     this->arp_primes_ += primed;
     this->arp_primes_pending_ = true;
-    ESP_LOGD(TAG, "ARP priming: re-resolved %u cold client(s), %u total", primed, this->arp_primes_);
+    ESP_LOGD(TAG, "ARP priming: re-resolved %u cold client(s), %u total", (unsigned) primed,
+             (unsigned) this->arp_primes_);
   }
 }
 

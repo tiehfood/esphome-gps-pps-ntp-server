@@ -199,10 +199,17 @@ ntp_server:
     accuracy_decimals: 0
     state_class: total_increasing
     entity_category: "diagnostic"
-  # Requests refused because the receive path stalled (INTn to burst start >= 1 ms).
+  # Requests refused because the receive path stalled (INTn to burst start >= 1 ms), the input
+  # hook missed them entirely, or ARP never resolved before the wait bound.
   refused:
     id: ${id_prefix}_ntp_refused
     name: "NTP Refused Stalled"
+    entity_category: "diagnostic"
+  # Requests whose reply needed to resolve ARP before it could be sent (a cache miss).
+  arp_waits:
+    id: ${id_prefix}_ntp_arp_waits
+    name: "NTP ARP Waits"
+    icon: "mdi:lan-alert"
     entity_category: "diagnostic"
   # W5500 Sn_CR handshake diagnostics, per 10 s window: commands needing more than one poll
   # (each cost a 10 ms sleep in the stock driver) and the longest write-to-cleared time.
@@ -318,6 +325,20 @@ switch:
       - lambda: 'id(${id_prefix}_ntp).set_diagnostics(true);'
     turn_off_action:
       - lambda: 'id(${id_prefix}_ntp).set_diagnostics(false);'
+
+  # A/B, off until verified: refuse on a tight (200us) or missing INTn edge lead instead of the
+  # legacy 1ms-only rule. See rx_admission.h; re-evaluated per request, so this takes effect
+  # immediately either way.
+  - platform: template
+    name: "NTP Strict RX Admission"
+    id: ${id_prefix}_ntp_strict_rx_admission
+    entity_category: "diagnostic"
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - lambda: 'id(${id_prefix}_ntp).set_strict_rx_admission(true);'
+    turn_off_action:
+      - lambda: 'id(${id_prefix}_ntp).set_strict_rx_admission(false);'
 
   - platform: template
     name: "${name} RGB LED"

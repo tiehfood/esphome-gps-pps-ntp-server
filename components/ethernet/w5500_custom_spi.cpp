@@ -55,6 +55,12 @@ volatile uint32_t g_burst_start_us = 0;
 volatile uint32_t g_last_txn_us = 0;
 volatile uint32_t g_send_cmd_us = 0;
 volatile uint32_t g_send_cmd_seq = 0;
+/// Class of the frame most recently written to the socket 0 TX buffer -- kept up to date on
+/// EVERY write regardless of whether the recorder is enabled, so w5500_send_stamp() can always
+/// say what a SEND was actually for.
+volatile uint8_t g_last_tx_class = W5500_FC_OTHER;
+/// Snapshot of g_last_tx_class taken at the Sn_CR = SEND write it belongs to.
+volatile uint8_t g_send_cmd_class = W5500_FC_OTHER;
 volatile uint32_t g_int_edge_us = 0;
 volatile uint32_t g_int_edge_seq = 0;
 // Sn_CR handshake tracking. The in-flight fields are written by whichever task issues a
@@ -73,6 +79,8 @@ W5500NetBin *g_net_bins = nullptr;
 uint16_t g_net_cur = 0;
 uint32_t g_net_cur_start_us = 0;
 portMUX_TYPE g_net_mux = portMUX_INITIALIZER_UNLOCKED;
+// Talkers seen sending a broadcast/multicast frame -- guarded by g_net_mux, same as the bins.
+W5500TalkerTable g_talker_table;
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
 /// Marks the start of a receive burst. READS ONLY -- deliberately.
@@ -99,6 +107,8 @@ uint8_t classify_frame(const uint8_t *f, uint32_t len) {
   const uint16_t ethertype = static_cast<uint16_t>((f[12] << 8) | f[13]);
   if (ethertype == 0x0806)
     return W5500_FC_ARP;
+  if (ethertype == 0x86DD)
+    return W5500_FC_IPV6;
   if (ethertype != 0x0800 || len < 14 + 20)
     return W5500_FC_OTHER;
   const uint32_t ihl = static_cast<uint32_t>(f[14] & 0x0F) * 4;
@@ -144,6 +154,18 @@ void net_record_frame(bool tx, const uint8_t *f, uint32_t len) {
   if (count < UINT16_MAX)
     count++;
   (tx ? bin->tx_bytes : bin->rx_bytes) += len;
+  // Talker identification: only for RECEIVED frames addressed to a broadcast/multicast MAC
+  // (low bit of the first octet) -- built to find the source of the recurring :07 multicast
+  // burst. `burst` names whether this bin already looks like that burst (>30 received frames,
+  // counting this one), independent of frame class.
+  if (!tx && f != nullptr && len >= 14 && (f[0] & 0x01) != 0) {
+    uint32_t rx_total = 0;
+    for (int k = 0; k < W5500_FC_COUNT; k++)
+      rx_total += bin->rx[k];
+    const bool burst = rx_total > 30;
+    const uint16_t ethertype = static_cast<uint16_t>((f[12] << 8) | f[13]);
+    g_talker_table.note(&f[6], &f[0], ethertype, len, now_us, burst);
+  }
   portEXIT_CRITICAL(&g_net_mux);
 }
 
@@ -228,8 +250,11 @@ esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, con
     const uint32_t now_us = micros();
     // LOCAL DELTA: NTP T3. Stamp the instant the chip is told to transmit -- strictly earlier
     // than sendto() returns, which is what the estimate used to learn from and why T3 ran late.
+    // g_last_tx_class is whichever frame's payload write preceded this SEND -- by construction
+    // the stock driver writes the whole payload, then issues SEND, so it names this SEND's frame.
     if (*static_cast<const uint8_t *>(data) == W5500_CMD_SEND) {
       g_send_cmd_us = now_us;
+      g_send_cmd_class = g_last_tx_class;
       g_send_cmd_seq++;
     }
     // LOCAL DELTA: command handshake stats (see w5500_take_cmd_stats()).
@@ -240,9 +265,12 @@ esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, con
     g_cr_polls = 0;
     g_cr_pending = true;
   }
-  // LOCAL DELTA: network recorder. The stock driver writes each transmitted frame into the socket 0
-  // TX buffer in a single write.
+  // LOCAL DELTA: network recorder, and NTP T3's frame-class tap. The stock driver writes each
+  // transmitted frame into the socket 0 TX buffer in a single write. g_last_tx_class is kept
+  // current unconditionally -- not gated on the recorder -- because ntp_server always needs to
+  // know what a SEND was for, whether or not diagnostics are on.
   if (addr == W5500_CTRL_S0_TXBUF_WRITE && len >= 14) {
+    g_last_tx_class = classify_frame(static_cast<const uint8_t *>(data), len);
     net_record_frame(true, static_cast<const uint8_t *>(data), len);
   }
   spi_transaction_t trans = {};
@@ -320,7 +348,7 @@ W5500RxStamps w5500_rx_stamps() {
   return {g_rx_size_read_us, g_rx_payload_us, g_rx_payloads_since_size_read, g_burst_start_us};
 }
 
-W5500SendStamp w5500_send_stamp() { return {g_send_cmd_us, g_send_cmd_seq}; }
+W5500SendStamp w5500_send_stamp() { return {g_send_cmd_us, g_send_cmd_seq, g_send_cmd_class}; }
 
 W5500IntStamp w5500_int_stamp() { return {g_int_edge_us, g_int_edge_seq}; }
 
@@ -341,6 +369,14 @@ void w5500_set_net_recorder(bool enable) {
     portEXIT_CRITICAL(&g_net_mux);
   }
   g_net_enabled = enable && g_net_bins != nullptr;
+  if (g_net_enabled) {
+    // Start each diagnostics run with a clean talker table, same as the bins are implicitly
+    // fresh on first allocation -- a stale talker from a previous run would otherwise look
+    // like it is still active.
+    portENTER_CRITICAL(&g_net_mux);
+    g_talker_table.clear();
+    portEXIT_CRITICAL(&g_net_mux);
+  }
 }
 
 bool w5500_net_recorder_enabled() { return g_net_enabled; }
@@ -352,6 +388,13 @@ bool w5500_net_bin(uint16_t i, W5500NetBin &out) {
   out = g_net_bins[(g_net_cur + 1 + i) % W5500_NET_BINS];
   portEXIT_CRITICAL(&g_net_mux);
   return out.start_us != 0;
+}
+
+bool w5500_talker(uint8_t i, W5500Talker &out) {
+  portENTER_CRITICAL(&g_net_mux);
+  const bool ok = g_talker_table.get(i, out);
+  portEXIT_CRITICAL(&g_net_mux);
+  return ok;
 }
 
 W5500CmdStats w5500_take_cmd_stats() {

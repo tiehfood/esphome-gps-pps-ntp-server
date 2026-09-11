@@ -13,6 +13,8 @@
 #include <esp_eth.h>
 #endif
 
+#include "w5500_talker_table.h"
+
 namespace esphome::ethernet {
 
 // Installs a custom W5500 SPI driver that offloads the bulk frame transfers off the busy-wait path.
@@ -53,10 +55,14 @@ struct W5500RxStamps {
 W5500RxStamps w5500_rx_stamps();
 
 /// micros() at the Sn_CR = SEND write for socket 0 -- when the chip was actually told to
-/// transmit. seq lets a reader tell a fresh stamp from a stale one.
+/// transmit. seq lets a reader tell a fresh stamp from a stale one. frame_class is the class of
+/// the frame most recently written to the TX buffer before this SEND -- ntp_server only learns
+/// its T3 estimate from a SEND provably for W5500_FC_NTP, never from an ARP request (or
+/// anything else) that happened to be sent around the same time.
 struct W5500SendStamp {
   uint32_t send_cmd_us;
   uint32_t seq;
+  uint8_t frame_class;
 };
 W5500SendStamp w5500_send_stamp();
 
@@ -99,6 +105,7 @@ enum W5500FrameClass : uint8_t {
   W5500_FC_ARP,
   W5500_FC_TCP,      // any other TCP
   W5500_FC_UDP,      // any other UDP
+  W5500_FC_IPV6,     // EtherType 0x86DD -- lwIP's own IPv6 is off; identifies the :07 multicast burst
   W5500_FC_OTHER,
   W5500_FC_COUNT
 };
@@ -118,6 +125,12 @@ bool w5500_net_recorder_enabled();
 /// Copies bin i, oldest first (0 .. W5500_NET_BINS-1). False if the recorder never ran or the
 /// bin is unused.
 bool w5500_net_bin(uint16_t i, W5500NetBin &out);
+
+/// Talkers seen sending a broadcast/multicast frame -- see w5500_talker_table.h. Cleared
+/// whenever the recorder is (re-)enabled, alongside the bins above.
+static constexpr uint8_t W5500_TALKER_TABLE_SIZE = W5500TalkerTable::SIZE;
+/// Copies out entry i (insertion order). False if i is out of range or unused.
+bool w5500_talker(uint8_t i, W5500Talker &out);
 
 }  // namespace esphome::ethernet
 

@@ -3,6 +3,8 @@
 #include "esphome/core/component.h"
 #include "esphome/components/sensor/sensor.h"
 #include "send_estimator.h"
+#include "hook_ring.h"
+#include "rx_admission.h"
 
 #ifdef USE_ESP_IDF
 #include <sys/socket.h>
@@ -40,11 +42,16 @@ class NTPServer : public Component {
   void set_use_pps_anchor(bool enable) { this->use_pps_anchor_ = enable; }
   void set_int_lead_sensor(sensor::Sensor *sensor) { this->int_lead_sensor_ = sensor; }
   void set_refused_sensor(sensor::Sensor *sensor) { this->refused_sensor_ = sensor; }
+  void set_arp_waits_sensor(sensor::Sensor *sensor) { this->arp_waits_sensor_ = sensor; }
   void set_w5500_cmd_retries_sensor(sensor::Sensor *sensor) { this->w5500_cmd_retries_sensor_ = sensor; }
   void set_w5500_cmd_max_sensor(sensor::Sensor *sensor) { this->w5500_cmd_max_sensor_ = sensor; }
   /// Stall investigation: per-request records and the W5500 network recorder, pulled over
   /// UDP DIAG_PORT after a run. Off by default; adds no traffic while on.
   void set_diagnostics(bool enable);
+  /// A/B: refuse on a tight (200us) or missing INTn edge lead, not just the legacy 1ms one.
+  /// Off by default until verified; the verdict is re-evaluated per request against whatever
+  /// this is currently set to, so flipping it takes effect immediately.
+  void set_strict_rx_admission(bool enable) { this->strict_rx_admission_ = enable; }
 #endif
 
   void setup() override;
@@ -93,30 +100,28 @@ class NTPServer : public Component {
   // FreeRTOS scheduling gap between "frame delivered" and "our task resumes" from
   // the T2 measurement. See docs/superpowers/plans/2026-09-03-ntp-serving-latency.md.
 
-  /// Ring slot: maps a client's own NTP transmit timestamp (echoed back to us in the
-  /// request, and unique enough per request for this purpose) to the arrival time
-  /// eth_input_hook_() captured for it. eth_input_hook_() is the sole writer -- the
-  /// W5500 driver delivers one frame at a time from its own task, so slot writes never
-  /// race each other -- recv_task_() is the sole reader. `seq` is a seqlock: odd means
-  /// a write is in progress, even means key/t are a consistent snapshot. Needed because
-  /// a 64-bit `t` (and the 8-byte `key`) tears on Xtensa; see .claude/rules/firmware.md.
-  /// What the hook learned about one request, handed from the driver task to recv_task_().
+  /// What the hook learned about one request, handed from the driver task to recv_task_()
+  /// via hook_ring_. eth_input_hook_() is the sole writer -- the W5500 driver delivers one
+  /// frame at a time from its own task, so writes never race each other -- recv_task_() is
+  /// the sole reader. `t` also serves as hook_ring_'s newest-wins ordering key.
   struct HookInfo {
     int64_t t{0};
-    /// The receive burst began long after the W5500 raised INTn: T2 is late, refuse.
-    bool rx_stalled{false};
+    /// Diagnostic only: the usable INTn-to-burst lead, or -1 (kept for the existing sensor and
+    /// REQ dump; the admission verdict is computed fresh in recv_task_() from edge_usable/lead_us
+    /// below, against whatever set_strict_rx_admission() is currently set to).
     int32_t int_lead_us{-1};
     int32_t rx_gap_us{-1};
+    /// Raw evaluate_rx_edge() output for this request's INTn edge, unfiltered by int_lead_us's
+    /// usable-only convention -- rx_admission() needs the lead even when it is not "usable".
+    bool edge_usable{false};
+    int32_t lead_us{0};
+    /// Whether an INTn edge had EVER been captured (w5500_int_stamp().seq != 0) as of this
+    /// request -- distinguishes "no edge because it's early boot" from "no edge, and it should
+    /// have had one".
+    bool capture_armed{false};
   };
-  struct HookEntry {
-    std::atomic<uint32_t> seq{0};
-    uint8_t key[8]{};
-    HookInfo info;
-  };
-  static const int HOOK_RING_SIZE = 8;
-  HookEntry hook_ring_[HOOK_RING_SIZE];
-  /// Next slot to write. Touched only by eth_input_hook_() (single writer).
-  uint8_t hook_ring_next_{0};
+  /// Keyed on the client's transmit timestamp + source IP + source port; see hook_ring.h for why.
+  HookRing<HookInfo, 8> hook_ring_;
 
   /// esp_netif every frame must be forwarded to. Captured once in setup(); null means
   /// the hook was never installed (get_eth_netif() failed) -- eth_input_hook_() is then
@@ -167,6 +172,11 @@ class NTPServer : public Component {
   void note_arp_client_(uint32_t addr);
   void refresh_arp_entries_();
 
+  /// Requests whose reply needed to resolve ARP before it could be sent -- i.e. wait_for_arp()
+  /// had a cache miss, whether or not it went on to resolve within ARP_WAIT_MAX_US.
+  std::atomic<uint32_t> arp_waits_{0};
+  sensor::Sensor *arp_waits_sensor_{nullptr};
+
   /// Microseconds from the hardware INTn edge to our burst-start T2 stamp: GPIO ISR latency
   /// plus driver task wake, normally 3-25 us. A stalled receive shows here as ~100 ms.
   WindowMax int_lead_win_;
@@ -185,6 +195,17 @@ class NTPServer : public Component {
   sensor::Sensor *w5500_cmd_max_sensor_{nullptr};
   uint32_t telemetry_last_ms_{0};
 
+  /// A/B, off by default: refuse on a tight (200us) or missing INTn edge lead. See
+  /// rx_admission.h. Evaluated fresh per request, so flipping this takes effect immediately.
+  volatile bool strict_rx_admission_{false};
+
+  /// Reasons a request can be refused, recorded in DiagRecord::refuse_reason and the REQ dump.
+  static constexpr uint8_t REFUSE_NONE = 0;
+  static constexpr uint8_t REFUSE_OLD_EDGE = 1;
+  static constexpr uint8_t REFUSE_NO_EDGE = 2;
+  static constexpr uint8_t REFUSE_HOOK_MISS = 3;
+  static constexpr uint8_t REFUSE_ARP_UNRESOLVED = 4;
+
   // ---- Stall investigation diagnostics (switch-gated, pulled over UDP DIAG_PORT) ----
   /// One served or refused request, as the server saw it. client_tx joins it to the client's
   /// own record of the same exchange; -1 means not measured.
@@ -199,6 +220,9 @@ class NTPServer : public Component {
     int32_t sendto_us;
     int32_t lock_wait_us;   ///< taking lwIP's core lock just before the reply was built
     int32_t estimate_us;    ///< send estimate this reply's T3 used
+    int32_t arp_wait_us;    ///< -1 not evaluated (refused before the ARP step), 0 cached, >0 waited
+    uint8_t refuse_reason;  ///< REFUSE_* above; REFUSE_NONE when served
+    int8_t send_class;      ///< frame class of the stamped SEND (ethernet::W5500FrameClass), -1 if none
   };
   static constexpr uint8_t DIAG_HOOK_HIT = 0x01;
   static constexpr uint8_t DIAG_RX_STALLED = 0x02;
@@ -206,6 +230,8 @@ class NTPServer : public Component {
   static constexpr uint8_t DIAG_RESEEDED = 0x08;
   static constexpr uint8_t DIAG_SEND_LONG = 0x10;
   static constexpr uint8_t DIAG_FALLBACK = 0x20;
+  static constexpr uint8_t DIAG_ARP_MISS = 0x40;
+  static constexpr uint8_t DIAG_SEND_NOT_NTP = 0x80;
   /// 1024 records: 4.3 min at a 4 Hz client, so a whole test run joins without a mid-run dump
   /// (a dump is itself outbound traffic).
   static constexpr uint16_t DIAG_RING_SIZE = 1024;
@@ -229,10 +255,12 @@ class NTPServer : public Component {
   /// blocking, no allocation, no gettimeofday(). Must call esp_netif_receive() on every
   /// path: failing to forward a frame here takes down all networking on the device.
   static esp_err_t eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffer, uint32_t length, void *priv);
-  /// Records (key, t) in the ring. Called only from eth_input_hook_() (driver task).
-  void hook_record_(const uint8_t *key, const HookInfo &info);
-  /// Looks up a key written by hook_record_(). Called only from recv_task_() (our task).
-  bool hook_lookup_(const uint8_t *key, HookInfo *out);
+  /// Records one request in hook_ring_, keyed on (tx, src_ip, src_port). Called only from
+  /// eth_input_hook_() (driver task).
+  void hook_record_(const uint8_t *tx, uint32_t src_ip, uint16_t src_port, const HookInfo &info);
+  /// Looks up the newest hook_record_() entry for (tx, src_ip, src_port) no older than
+  /// HookRing::MAX_AGE_US as of now_us. Called only from recv_task_() (our task).
+  bool hook_lookup_(const uint8_t *tx, uint32_t src_ip, uint16_t src_port, int64_t now_us, HookInfo *out);
   /// Converts an absolute Unix-epoch microsecond value to an NTPTimestamp.
   static NTPTimestamp micros_epoch_to_ntp_timestamp_(int64_t unix_us);
   /// Reconstructs the wall-clock time at a past esp_timer_get_time() reading, the same
