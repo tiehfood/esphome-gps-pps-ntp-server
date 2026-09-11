@@ -415,10 +415,23 @@
     </table>
   </div>
 
+  <h3>Two follow-ups, also predicted before the run</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Question</th><th>Prediction</th><th>Measured</th><th>State</th></tr></thead>
+      <tbody>
+        <tr><td>Why did late T3 move the mean offset?</td><td>The old path read its clock 15–27&nbsp;µs before the point its send time is measured from</td><td><b>16.0&nbsp;µs</b></td><td><span class="pill">passed</span></td></tr>
+        <tr><td></td><td>That gap reproduces the offset shift within ±3&nbsp;µs</td><td>model <b>+9.0&nbsp;µs</b>, measured +10.0&nbsp;µs</td><td><span class="pill">passed</span></td></tr>
+        <tr><td>Can the short wait skip the extra refusals?</td><td>Refusals rise at most 0.5 points</td><td><b>+0.08 points</b></td><td><span class="pill">passed</span></td></tr>
+        <tr><td></td><td>Late replies over 150&nbsp;µs at most 0.15% of all served</td><td>0.53% → 0.42%</td><td><span class="pill gap">failed</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
   <div class="note warn">
-    <span class="eyebrow">Why neither is on by default yet</span>
-    <p><b>The shorter interrupt wait works, but it collides with the strict refusal rule.</b> With the chip re-raising interrupts quickly, the edge the rule relies on sometimes lands after the read it should explain. So the rule refused 30 more requests that were probably on time. Nothing was lost, but that fails the test as written.</p>
-    <p><b>Writing T3 late cuts the per-sample noise by 2.5 times, but it also moves the mean offset by 11.7&nbsp;µs</b>, more than the bound set in advance. The likely reason is that the old path computed T3 slightly before the point its send estimate is measured from, which would make the old T3 the biased one. But the probe has no absolute reference, so it cannot say which is closer to true time. That is exactly what the absolute-reference phase would answer.</p>
+    <span class="eyebrow">Where the two fixes stand</span>
+    <p><b>Late T3 is explained, and the explanation favours it.</b> The old path wrote a T3 about 21&nbsp;µs too early: its clock read came 16&nbsp;µs before the send timer started, and the send itself ran 5&nbsp;µs late. The patched T3 is early by only 3&nbsp;µs. The offset shift therefore comes from removing a bias, not adding one, and late T3 is proposed as the default.</p>
+    <p><b>The shorter interrupt wait still has no good trade.</b> The strict rule either refuses about 30 requests that are probably on time, or, when told to accept requests with nothing queued behind them, lets through replies where 9 of 20 were late. Both variants stay off.</p>
   </div>
 </section>
 
