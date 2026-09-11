@@ -46,11 +46,15 @@ void install_w5500_async_spi(eth_w5500_config_t &config);
 /// burst (the driver servicing INTn), the Sn_RX_RSR read, and the payload read.
 /// payloads_since_size_read == 1 means the size_read stamp belongs to the frame being
 /// delivered right now rather than to an earlier one in the same burst.
+/// size_value is the Sn_RX_RSR value itself (bytes waiting in the RX buffer, including the
+/// frame this size_read stamp belongs to) -- diagnostic-only, to tell whether another frame
+/// was already queued behind ours when it arrived.
 struct W5500RxStamps {
   uint32_t size_read_us;
   uint32_t payload_us;
   uint32_t payloads_since_size_read;
   uint32_t burst_start_us;
+  uint16_t size_value;
 };
 W5500RxStamps w5500_rx_stamps();
 
@@ -58,11 +62,16 @@ W5500RxStamps w5500_rx_stamps();
 /// transmit. seq lets a reader tell a fresh stamp from a stale one. frame_class is the class of
 /// the frame most recently written to the TX buffer before this SEND -- ntp_server only learns
 /// its T3 estimate from a SEND provably for W5500_FC_NTP, never from an ARP request (or
-/// anything else) that happened to be sent around the same time.
+/// anything else) that happened to be sent around the same time. txbuf_start_us/txbuf_end_us
+/// bracket the SPI transfer that wrote that frame's payload into the TX buffer -- diagnostic
+/// only (0 when the network recorder is off, meaning "not measured"), to split the send path
+/// into "before the frame reached the W5500" vs "between that and Sn_CR = SEND".
 struct W5500SendStamp {
   uint32_t send_cmd_us;
   uint32_t seq;
   uint8_t frame_class;
+  uint32_t txbuf_start_us;
+  uint32_t txbuf_end_us;
 };
 W5500SendStamp w5500_send_stamp();
 

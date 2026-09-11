@@ -48,9 +48,9 @@ class NTPServer : public Component {
   /// Stall investigation: per-request records and the W5500 network recorder, pulled over
   /// UDP DIAG_PORT after a run. Off by default; adds no traffic while on.
   void set_diagnostics(bool enable);
-  /// A/B: refuse on a tight (200us) or missing INTn edge lead, not just the legacy 1ms one.
-  /// Off by default until verified; the verdict is re-evaluated per request against whatever
-  /// this is currently set to, so flipping it takes effect immediately.
+  /// Refuse on a tight (200us) or missing INTn edge lead, not just the legacy 1ms one. On by
+  /// default since 2026-09-11 (verified by interleaved A/B); kept switchable for later A/Bs. The
+  /// verdict is re-evaluated per request, so flipping it takes effect immediately.
   void set_strict_rx_admission(bool enable) { this->strict_rx_admission_ = enable; }
 #endif
 
@@ -119,6 +119,11 @@ class NTPServer : public Component {
     /// request -- distinguishes "no edge because it's early boot" from "no edge, and it should
     /// have had one".
     bool capture_armed{false};
+    /// Sn_RX_RSR value and the hook's own `length` argument at this frame's arrival --
+    /// diagnostic-only, set only when the size-read stamp provably belongs to this frame (same
+    /// condition as the T2 stamp above). -1 when not measured.
+    int32_t rx_rsr{-1};
+    int32_t frame_len{-1};
   };
   /// Keyed on the client's transmit timestamp + source IP + source port; see hook_ring.h for why.
   HookRing<HookInfo, 8> hook_ring_;
@@ -225,6 +230,17 @@ class NTPServer : public Component {
     int32_t arp_wait_us;    ///< -1 not evaluated (refused before the ARP step), 0 cached, >0 waited
     uint8_t refuse_reason;  ///< REFUSE_* above; REFUSE_NONE when served
     int8_t send_class;      ///< frame class of the stamped SEND (ethernet::W5500FrameClass), -1 if none
+    /// t0 to the start/end of the SPI transfer that wrote this reply's payload into the W5500 TX
+    /// buffer -- splits the send path into "before the frame reached the W5500" (build + lwIP +
+    /// core lock, ending at tx_write_start_us) vs "SPI transfer + Sn_CR=SEND" (tx_write_end_us to
+    /// send_us). -1 unless this SEND is provably this reply (send_class == NTP) and both
+    /// snapshots were measured (see w5500_send_stamp()).
+    int32_t tx_write_start_us;
+    int32_t tx_write_end_us;
+    /// Sn_RX_RSR value and hook `length` at this request's arrival; see HookInfo. -1 if the hook
+    /// missed or the size-read stamp did not provably belong to this frame.
+    int32_t rx_rsr;
+    int32_t frame_len;
   };
   static constexpr uint8_t DIAG_HOOK_HIT = 0x01;
   static constexpr uint8_t DIAG_RX_STALLED = 0x02;

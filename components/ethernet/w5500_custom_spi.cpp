@@ -61,6 +61,17 @@ volatile uint32_t g_send_cmd_seq = 0;
 volatile uint8_t g_last_tx_class = W5500_FC_OTHER;
 /// Snapshot of g_last_tx_class taken at the Sn_CR = SEND write it belongs to.
 volatile uint8_t g_send_cmd_class = W5500_FC_OTHER;
+/// micros() bracketing the SPI transfer of the most recent socket 0 TX buffer write -- only
+/// while g_net_enabled; 0 while off (see w5500_custom_spi_write()'s comment on why).
+volatile uint32_t g_last_tx_start_us = 0;
+volatile uint32_t g_last_tx_end_us = 0;
+/// Snapshots of the two above, taken at the Sn_CR = SEND write they belong to -- same pairing
+/// as g_send_cmd_class/g_last_tx_class.
+volatile uint32_t g_send_txbuf_start_us = 0;
+volatile uint32_t g_send_txbuf_end_us = 0;
+/// Sn_RX_RSR value as last read (big-endian on the wire, decoded here) -- diagnostic-only,
+/// unconditional single-assignment store, whether or not the recorder is on.
+volatile uint16_t g_rx_size_value = 0;
 volatile uint32_t g_int_edge_us = 0;
 volatile uint32_t g_int_edge_seq = 0;
 // Sn_CR handshake tracking. The in-flight fields are written by whichever task issues a
@@ -255,6 +266,10 @@ esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, con
     if (*static_cast<const uint8_t *>(data) == W5500_CMD_SEND) {
       g_send_cmd_us = now_us;
       g_send_cmd_class = g_last_tx_class;
+      // LOCAL DELTA: TX-buffer-write timing, paired with g_send_cmd_class above. Both are 0
+      // when the recorder was off for the TX buffer write this SEND belongs to (see below).
+      g_send_txbuf_start_us = g_last_tx_start_us;
+      g_send_txbuf_end_us = g_last_tx_end_us;
       g_send_cmd_seq++;
     }
     // LOCAL DELTA: command handshake stats (see w5500_take_cmd_stats()).
@@ -269,16 +284,31 @@ esp_err_t w5500_custom_spi_write(void *spi_ctx, uint32_t cmd, uint32_t addr, con
   // transmitted frame into the socket 0 TX buffer in a single write. g_last_tx_class is kept
   // current unconditionally -- not gated on the recorder -- because ntp_server always needs to
   // know what a SEND was for, whether or not diagnostics are on.
-  if (addr == W5500_CTRL_S0_TXBUF_WRITE && len >= 14) {
+  const bool is_txbuf_write = addr == W5500_CTRL_S0_TXBUF_WRITE && len >= 14;
+  if (is_txbuf_write) {
     g_last_tx_class = classify_frame(static_cast<const uint8_t *>(data), len);
     net_record_frame(true, static_cast<const uint8_t *>(data), len);
+    if (!g_net_enabled) {
+      // Recorder off: keep the snapshot fields at "not measured" rather than carrying a stale
+      // pair of timestamps forward into a SEND that may happen after the recorder is enabled.
+      g_last_tx_start_us = 0;
+      g_last_tx_end_us = 0;
+    }
   }
   spi_transaction_t trans = {};
   trans.cmd = static_cast<uint16_t>(cmd);
   trans.addr = addr;
   trans.length = 8 * len;
   trans.tx_buffer = data;
-  return w5500_custom_spi_transfer(ctx, &trans, len);
+  // LOCAL DELTA: bracket the TX buffer write's SPI transfer, while the recorder is on, to split
+  // the send path into "before the frame reached the W5500" vs "between that and Sn_CR = SEND".
+  const bool stamp_txbuf = g_net_enabled && is_txbuf_write;
+  if (stamp_txbuf)
+    g_last_tx_start_us = micros();
+  esp_err_t ret = w5500_custom_spi_transfer(ctx, &trans, len);
+  if (stamp_txbuf)
+    g_last_tx_end_us = micros();
+  return ret;
 }
 
 esp_err_t w5500_custom_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void *data, uint32_t len) {
@@ -305,6 +335,15 @@ esp_err_t w5500_custom_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void
   esp_err_t ret = w5500_custom_spi_transfer(ctx, &trans, len);
   if (use_rxdata && (ret == ESP_OK)) {
     memcpy(data, trans.rx_data, len);
+  }
+  // LOCAL DELTA: Sn_RX_RSR value. The stock driver (esp_eth_mac_w5500.c) reads this register
+  // twice and retries until both reads agree, guarding against being interrupted between the
+  // high/low bytes; that means this callback runs twice (or more) per logical read, and keeping
+  // the last stored value is exactly the value the driver itself settled on. Data is big-endian
+  // on the wire, as the W5500 sends it.
+  if (ret == ESP_OK && len == 2 && addr == W5500_CTRL_S0_REG_READ && cmd == W5500_REG_SN_RX_RSR) {
+    const auto *bytes = static_cast<const uint8_t *>(data);
+    g_rx_size_value = static_cast<uint16_t>((bytes[0] << 8) | bytes[1]);
   }
   // LOCAL DELTA: the driver polls Sn_CR until the chip clears the command it just wrote.
   if (ret == ESP_OK && g_cr_pending && addr == W5500_CTRL_S0_REG_READ && cmd == W5500_REG_SN_CR && len == 1) {
@@ -345,10 +384,12 @@ bool IRAM_ATTR int_capture_cb(mcpwm_cap_channel_handle_t chan, const mcpwm_captu
 }  // namespace
 
 W5500RxStamps w5500_rx_stamps() {
-  return {g_rx_size_read_us, g_rx_payload_us, g_rx_payloads_since_size_read, g_burst_start_us};
+  return {g_rx_size_read_us, g_rx_payload_us, g_rx_payloads_since_size_read, g_burst_start_us, g_rx_size_value};
 }
 
-W5500SendStamp w5500_send_stamp() { return {g_send_cmd_us, g_send_cmd_seq, g_send_cmd_class}; }
+W5500SendStamp w5500_send_stamp() {
+  return {g_send_cmd_us, g_send_cmd_seq, g_send_cmd_class, g_send_txbuf_start_us, g_send_txbuf_end_us};
+}
 
 W5500IntStamp w5500_int_stamp() { return {g_int_edge_us, g_int_edge_seq}; }
 

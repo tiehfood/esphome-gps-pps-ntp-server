@@ -290,6 +290,8 @@ void NTPServer::recv_task_(void *param) {
       diag.int_lead_us = hook_hit ? hook.int_lead_us : -1;
       diag.rx_gap_us = hook_hit ? hook.rx_gap_us : -1;
       diag.hook_latency_us = hook_latency_us;
+      diag.rx_rsr = hook_hit ? hook.rx_rsr : -1;
+      diag.frame_len = hook_hit ? hook.frame_len : -1;
       diag.send_us = -1;
       diag.sendto_us = -1;
       diag.lock_wait_us = -1;
@@ -297,6 +299,8 @@ void NTPServer::recv_task_(void *param) {
       diag.arp_wait_us = -1;  // not evaluated yet
       diag.refuse_reason = REFUSE_NONE;
       diag.send_class = -1;
+      diag.tx_write_start_us = -1;
+      diag.tx_write_end_us = -1;
     }
 
     // ---- Admission: hook miss, or an INTn edge that is stale/missing (rx_admission.h) ----
@@ -441,6 +445,13 @@ void NTPServer::recv_task_(void *param) {
       diag.send_us = actual_us;
       diag.sendto_us = dur;
       diag.send_class = (after.seq != before.seq) ? static_cast<int8_t>(after.frame_class) : -1;
+      // TX-buffer-write split: only meaningful when this SEND is provably our own reply and
+      // the SPI callback actually measured it (both 0 means the recorder was off for that write).
+      if (after.seq != before.seq && after.frame_class == ethernet::W5500_FC_NTP &&
+          after.txbuf_start_us != 0 && after.txbuf_end_us != 0) {
+        diag.tx_write_start_us = static_cast<int32_t>(after.txbuf_start_us - static_cast<uint32_t>(t0));
+        diag.tx_write_end_us = static_cast<int32_t>(after.txbuf_end_us - static_cast<uint32_t>(t0));
+      }
       if (send_not_ntp)
         diag.flags |= DIAG_SEND_NOT_NTP;
       if (actual_us >= SendEstimator::US_MAX || dur >= SendEstimator::US_MAX)
@@ -518,6 +529,11 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
           }
 
           if (st.size_read_us != 0 && st.payloads_since_size_read == 1) {
+            // Diagnostic only: what Sn_RX_RSR reported at this frame's arrival, and our own
+            // frame length -- rx_rsr > frame_len means another frame was already queued behind
+            // ours in the W5500's RX buffer when it arrived.
+            info.rx_rsr = static_cast<int32_t>(st.size_value);
+            info.frame_len = static_cast<int32_t>(length);
             uint32_t stamp = st.size_read_us;
             // Earlier still: the interrupt-service transaction that opened this burst.
             // Requires a plausible lead, so a stale or misdetected burst start cannot
@@ -671,11 +687,12 @@ void NTPServer::diag_serve_() {
       char tx_hex[17];
       for (int b = 0; b < 8; b++)
         snprintf(tx_hex + 2 * b, 3, "%02x", rec.client_tx[b]);
-      emit(line, snprintf(line, sizeof(line), "R %lld %s %x %d %d %d %d %d %d %d %d %d %d\n",
+      emit(line, snprintf(line, sizeof(line), "R %lld %s %x %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
                           (long long) rec.t2_us, tx_hex, (unsigned) rec.flags, (int) rec.int_lead_us,
                           (int) rec.rx_gap_us, (int) rec.hook_latency_us, (int) rec.send_us, (int) rec.sendto_us,
                           (int) rec.lock_wait_us, (int) rec.estimate_us, (int) rec.arp_wait_us,
-                          (int) rec.refuse_reason, (int) rec.send_class));
+                          (int) rec.refuse_reason, (int) rec.send_class, (int) rec.tx_write_start_us,
+                          (int) rec.tx_write_end_us, (int) rec.rx_rsr, (int) rec.frame_len));
       lines++;
     }
   } else if (strncmp(cmd, "NET", 3) == 0) {
