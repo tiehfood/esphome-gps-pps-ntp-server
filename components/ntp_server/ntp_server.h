@@ -82,7 +82,11 @@ class NTPServer : public Component {
   // not taken internally -- on the ESP-IDF path that call site is recv_task_(), and
   // T2 must reflect arrival, not whatever this function does first.
   void build_ntp_response_(const uint8_t *request, uint8_t *response, const NTPTimestamp &receive_ts);
-  NTPTimestamp get_ntp_timestamp_(int32_t offset_us = 0);
+  /// `clock_read_us`, if non-null, receives the esp_timer_get_time() reading this timestamp was
+  /// actually computed from (the anchor path's input, or one taken immediately next to the
+  /// gettimeofday() fallback) -- ESP-IDF only; see the "T3-computation gap" diagnostic (design C)
+  /// in recv_task_(). Left untouched on non-ESP-IDF builds.
+  NTPTimestamp get_ntp_timestamp_(int32_t offset_us = 0, int64_t *clock_read_us = nullptr);
   bool is_time_synchronized_();
 
   uint16_t port_{123};
@@ -106,6 +110,13 @@ class NTPServer : public Component {
   /// runs the SPI write inline. Rules and their tests: send_estimator.h,
   /// tests/send_estimator_test.cpp.
   SendEstimator send_estimator_;
+
+  /// Design C ("T3-computation gap" diagnostic): the exact esp_timer_get_time() reading the
+  /// estimate path's most recent T3 was computed from -- set by get_ntp_timestamp_()'s
+  /// out-parameter, via build_ntp_response_(), and read back in recv_task_() against its own
+  /// `t0` to measure the gap the old (pre-design-B) T3 was early by. Diagnostic only; never
+  /// read on the served-timestamp path.
+  int64_t last_t3_clock_read_us_{0};
 
   /// Dedicated FreeRTOS task blocked in recvfrom() -- stamps T2 on return instead of
   /// whenever ESPHome's shared loop next polls us. Runs for the component's lifetime;
@@ -265,6 +276,10 @@ class NTPServer : public Component {
     uint8_t patched;
     int32_t patch_to_send_us;  ///< send_cmd_us - patch_us for this SEND
     int32_t patch_pred_us;     ///< the patch_delay_ estimate this reply's patched T3 used
+    /// Design C ("T3-computation gap" diagnostic): t0 - last_t3_clock_read_us_, i.e. how much
+    /// earlier the estimate path's T3 read its clock than recv_task_()'s own t0. -1 when not
+    /// measured (e.g. refused requests, which never reach build_ntp_response_()).
+    int32_t t3_calc_to_t0_us;
   };
   static constexpr uint8_t DIAG_HOOK_HIT = 0x01;
   static constexpr uint8_t DIAG_RX_STALLED = 0x02;
@@ -320,6 +335,13 @@ class NTPServer : public Component {
   /// The value actually read back after the last write, so short_int_wait_active() and the INT
   /// diag command reflect hardware state rather than merely "was asked for".
   uint16_t last_int_level_readback_{0};
+  /// Design A' (edge-aware admission): true only once set_short_int_wait(true) has both written
+  /// AND read back W5500_INT_LEVEL_SHORT -- i.e. reflects hardware state, not just "was asked
+  /// for". Set false on disable, on the dead-man revert in loop(), and on any failed or
+  /// mismatched read-back. recv_task_() reads this plain bool directly rather than calling
+  /// short_int_wait_active() (a public, const-qualified convenience for callers outside the hot
+  /// path, e.g. the INT diag command) -- one fewer function call per request, same value.
+  volatile bool short_wait_effective_{false};
 
   // ---- Design B: "NTP Post-Write T3" ----
   /// EWMA estimate of the patch-callback-to-SEND delay, learned from every SEND that was

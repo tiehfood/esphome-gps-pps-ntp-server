@@ -13,6 +13,7 @@
 #include <cstdlib>
 
 using esphome::ntp_server::evaluate_rx_edge;
+using esphome::ntp_server::queued_behind_bytes;
 using esphome::ntp_server::rx_admission;
 using esphome::ntp_server::RxEdgeEval;
 using esphome::ntp_server::RxVerdict;
@@ -25,23 +26,40 @@ static void check(bool ok, const char *name) {
     g_failures++;
 }
 
+// Every case below the design A' block passes short_wait_active=false, queued=-1 -- i.e. the
+// short-wait rule is not in play, so this reproduces the pre-A' behaviour exactly.
+static const bool kNoShortWait = false;
+static const int32_t kNoQueued = -1;
+
 int main() {
   // ---- Threshold boundaries, both regimes ----
-  check(rx_admission(true, true, 199, false) == RxVerdict::ACCEPT, "legacy: 199us lead accepted");
-  check(rx_admission(true, true, 999, false) == RxVerdict::ACCEPT, "legacy: 999us lead accepted");
-  check(rx_admission(true, true, 1000, false) == RxVerdict::OLD_EDGE, "legacy: 1000us lead is OLD_EDGE");
-  check(rx_admission(true, true, 200, false) == RxVerdict::ACCEPT, "legacy: 200us lead accepted (only 1000us matters)");
+  check(rx_admission(true, true, 199, false, kNoShortWait, kNoQueued) == RxVerdict::ACCEPT,
+        "legacy: 199us lead accepted");
+  check(rx_admission(true, true, 999, false, kNoShortWait, kNoQueued) == RxVerdict::ACCEPT,
+        "legacy: 999us lead accepted");
+  check(rx_admission(true, true, 1000, false, kNoShortWait, kNoQueued) == RxVerdict::OLD_EDGE,
+        "legacy: 1000us lead is OLD_EDGE");
+  check(rx_admission(true, true, 200, false, kNoShortWait, kNoQueued) == RxVerdict::ACCEPT,
+        "legacy: 200us lead accepted (only 1000us matters)");
 
-  check(rx_admission(true, true, 199, true) == RxVerdict::ACCEPT, "strict: 199us lead accepted");
-  check(rx_admission(true, true, 200, true) == RxVerdict::OLD_EDGE, "strict: 200us lead is OLD_EDGE");
-  check(rx_admission(true, true, 999, true) == RxVerdict::OLD_EDGE, "strict: 999us lead is OLD_EDGE");
-  check(rx_admission(true, true, 1000, true) == RxVerdict::OLD_EDGE, "strict: 1000us lead is OLD_EDGE");
+  check(rx_admission(true, true, 199, true, kNoShortWait, kNoQueued) == RxVerdict::ACCEPT,
+        "strict: 199us lead accepted");
+  check(rx_admission(true, true, 200, true, kNoShortWait, kNoQueued) == RxVerdict::OLD_EDGE,
+        "strict: 200us lead is OLD_EDGE");
+  check(rx_admission(true, true, 999, true, kNoShortWait, kNoQueued) == RxVerdict::OLD_EDGE,
+        "strict: 999us lead is OLD_EDGE");
+  check(rx_admission(true, true, 1000, true, kNoShortWait, kNoQueued) == RxVerdict::OLD_EDGE,
+        "strict: 1000us lead is OLD_EDGE");
 
   // ---- No usable edge ----
-  check(rx_admission(true, false, 0, true) == RxVerdict::NO_EDGE, "strict + armed + no edge -> NO_EDGE");
-  check(rx_admission(true, false, 0, false) == RxVerdict::ACCEPT, "legacy never reports NO_EDGE");
-  check(rx_admission(false, false, 0, true) == RxVerdict::ACCEPT, "capture never armed -> never NO_EDGE, even strict");
-  check(rx_admission(false, false, 0, false) == RxVerdict::ACCEPT, "capture never armed, legacy -> ACCEPT");
+  check(rx_admission(true, false, 0, true, kNoShortWait, kNoQueued) == RxVerdict::NO_EDGE,
+        "strict + armed + no edge -> NO_EDGE");
+  check(rx_admission(true, false, 0, false, kNoShortWait, kNoQueued) == RxVerdict::ACCEPT,
+        "legacy never reports NO_EDGE");
+  check(rx_admission(false, false, 0, true, kNoShortWait, kNoQueued) == RxVerdict::ACCEPT,
+        "capture never armed -> never NO_EDGE, even strict");
+  check(rx_admission(false, false, 0, false, kNoShortWait, kNoQueued) == RxVerdict::ACCEPT,
+        "capture never armed, legacy -> ACCEPT");
 
   // ---- evaluate_rx_edge(): boot state and wrap-safety ----
   {
@@ -76,9 +94,66 @@ int main() {
     check(e.edge_usable && e.lead_us == 32, "lead computes correctly across a 32-bit micros() wrap");
   }
   {
-    RxVerdict v = rx_admission(true, true, 32, true);
+    RxVerdict v = rx_admission(true, true, 32, true, kNoShortWait, kNoQueued);
     check(v == RxVerdict::ACCEPT, "a wrap-safe small lead is accepted under the strict rule too");
   }
+
+  // ---- Design A' ("W5500 Short Interrupt Wait" live): edge-aware admission ----
+  check(rx_admission(true, false, 0, true, true, 0) == RxVerdict::ACCEPT,
+        "short wait: no usable edge, nothing queued behind -> ACCEPT");
+  check(rx_admission(true, false, 0, true, true, 59) == RxVerdict::ACCEPT,
+        "short wait: no usable edge, 59 bytes queued behind -> ACCEPT");
+  check(rx_admission(true, false, 0, true, true, 60) == RxVerdict::NO_EDGE,
+        "short wait: no usable edge, 60 bytes queued behind -> NO_EDGE");
+  check(rx_admission(true, false, 0, true, true, -1) == RxVerdict::NO_EDGE,
+        "short wait: no usable edge, queued unknown (-1) -> NO_EDGE (treated as queued)");
+  check(rx_admission(true, true, 199, true, true, 0) == RxVerdict::ACCEPT,
+        "short wait: usable edge, 199us lead -> ACCEPT");
+  check(rx_admission(true, true, 200, true, true, 0) == RxVerdict::OLD_EDGE,
+        "short wait: usable edge, 200us lead -> OLD_EDGE (unchanged threshold)");
+  check(rx_admission(false, false, 0, true, true, 0) == RxVerdict::ACCEPT,
+        "short wait: capture not armed, no edge -> ACCEPT");
+
+  // Strict off entirely overrides short_wait_active -- legacy behaviour, regardless of queued.
+  check(rx_admission(true, false, 0, false, true, 60) == RxVerdict::ACCEPT,
+        "short wait active but strict off -> legacy behaviour (no NO_EDGE at all)");
+  check(rx_admission(true, true, 1000, false, true, 60) == RxVerdict::OLD_EDGE,
+        "short wait active but strict off -> legacy OLD_EDGE threshold (1ms) still applies");
+
+  // ---- Mutation check: if short_wait_active were ignored (today's strict rule applied
+  // unconditionally), exactly the two short-wait-only ACCEPT cases above must fail. Restored
+  // immediately after -- this does not change the shipped function, only this check's local
+  // stand-in for it. ----
+  {
+    auto rx_admission_ignoring_short_wait = [](bool capture_armed, bool edge_usable, int32_t lead_us,
+                                                bool strict) {
+      const int32_t threshold = strict ? 200 : 1000;
+      if (edge_usable && lead_us >= threshold)
+        return RxVerdict::OLD_EDGE;
+      if (strict && capture_armed && !edge_usable)
+        return RxVerdict::NO_EDGE;
+      return RxVerdict::ACCEPT;
+    };
+    const bool queued0_would_fail = rx_admission_ignoring_short_wait(true, false, 0, true) != RxVerdict::ACCEPT;
+    const bool queued59_would_fail = rx_admission_ignoring_short_wait(true, false, 0, true) != RxVerdict::ACCEPT;
+    // (queued 0 and queued 59 collapse to the same call once short_wait_active/queued_bytes are
+    // dropped -- both are "armed, no edge", which is exactly the case the mutation must flip.)
+    check(queued0_would_fail, "mutation: ignoring short_wait_active flips the queued=0 ACCEPT case");
+    check(queued59_would_fail, "mutation: ignoring short_wait_active flips the queued=59 ACCEPT case");
+    // Cases NOT expected to flip: edge lead 199 (usable edge -> ACCEPT regardless), capture not
+    // armed (-> ACCEPT regardless).
+    check(rx_admission_ignoring_short_wait(true, true, 199, true) == RxVerdict::ACCEPT,
+          "mutation: usable-edge ACCEPT case is unaffected");
+    check(rx_admission_ignoring_short_wait(false, false, 0, true) == RxVerdict::ACCEPT,
+          "mutation: capture-not-armed ACCEPT case is unaffected");
+  }
+
+  // ---- queued_behind_bytes() ----
+  check(queued_behind_bytes(92, 90) == 0, "queued_behind_bytes: normal exchange (92/90) -> 0");
+  check(queued_behind_bytes(154, 90) == 62, "queued_behind_bytes: 154/90 -> 62");
+  check(queued_behind_bytes(-1, 90) == -1, "queued_behind_bytes: rx_rsr unknown -> -1");
+  check(queued_behind_bytes(92, -1) == -1, "queued_behind_bytes: frame_len unknown -> -1");
+  check(queued_behind_bytes(-1, -1) == -1, "queued_behind_bytes: both unknown -> -1");
 
   std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "OK", g_failures);
   return g_failures ? EXIT_FAILURE : EXIT_SUCCESS;

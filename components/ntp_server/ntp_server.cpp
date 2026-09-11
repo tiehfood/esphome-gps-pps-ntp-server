@@ -229,6 +229,7 @@ void NTPServer::loop() {
     ethernet::w5500_read_int_level(&readback);
     this->last_int_level_readback_ = readback;
     this->int_wait_deadman_.disarm();
+    this->short_wait_effective_ = false;
     ESP_LOGW(TAG, "dead-man expired: INTLEVEL restored to 0x%04X", readback);
   }
 
@@ -344,6 +345,7 @@ void NTPServer::recv_task_(void *param) {
       diag.patched = 0;
       diag.patch_to_send_us = -1;
       diag.patch_pred_us = -1;
+      diag.t3_calc_to_t0_us = -1;
     }
 
     // ---- Admission: hook miss, or an INTn edge that is stale/missing (rx_admission.h) ----
@@ -356,8 +358,9 @@ void NTPServer::recv_task_(void *param) {
     if (self->eth_netif_ != nullptr && !hook_hit) {
       refuse_reason = REFUSE_HOOK_MISS;
     } else if (hook_hit) {
-      const RxVerdict verdict =
-          rx_admission(hook.capture_armed, hook.edge_usable, hook.lead_us, self->strict_rx_admission_);
+      const int32_t queued = queued_behind_bytes(hook.rx_rsr, hook.frame_len);
+      const RxVerdict verdict = rx_admission(hook.capture_armed, hook.edge_usable, hook.lead_us,
+                                             self->strict_rx_admission_, self->short_wait_effective_, queued);
       if (verdict == RxVerdict::OLD_EDGE)
         refuse_reason = REFUSE_OLD_EDGE;
       else if (verdict == RxVerdict::NO_EDGE)
@@ -451,6 +454,10 @@ void NTPServer::recv_task_(void *param) {
 
     ethernet::W5500SendStamp before = ethernet::w5500_send_stamp();
     int64_t t0 = esp_timer_get_time();
+    // Design C ("T3-computation gap" diagnostic): how much earlier the estimate path's T3 read
+    // its clock than this t0 -- see NTPServer::last_t3_clock_read_us_.
+    if (diagnostics)
+      diag.t3_calc_to_t0_us = static_cast<int32_t>(t0 - self->last_t3_clock_read_us_);
     sendto(self->socket_fd_, response, NTP_PACKET_SIZE, 0,
            (struct sockaddr *) &client_addr, client_len);
     int64_t t_after = esp_timer_get_time();
@@ -647,6 +654,10 @@ void NTPServer::set_short_int_wait(bool enable) {
     this->int_wait_deadman_.disarm();
   }
 
+  // Design A': reflects hardware state, not just "was asked for" -- false on disable, and on
+  // any failed write or a read-back that does not match what was requested.
+  this->short_wait_effective_ = enable && write_ok && read_ok && readback == target;
+
   if (!write_ok || !read_ok) {
     if (!enable && !write_ok) {
       // The switch's boot-time "off" runs before the W5500 exists; the driver's own init then
@@ -827,13 +838,13 @@ void NTPServer::diag_serve_() {
       char tx_hex[17];
       for (int b = 0; b < 8; b++)
         snprintf(tx_hex + 2 * b, 3, "%02x", rec.client_tx[b]);
-      emit(line, snprintf(line, sizeof(line), "R %lld %s %x %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
+      emit(line, snprintf(line, sizeof(line), "R %lld %s %x %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
                           (long long) rec.t2_us, tx_hex, (unsigned) rec.flags, (int) rec.int_lead_us,
                           (int) rec.rx_gap_us, (int) rec.hook_latency_us, (int) rec.send_us, (int) rec.sendto_us,
                           (int) rec.lock_wait_us, (int) rec.estimate_us, (int) rec.arp_wait_us,
                           (int) rec.refuse_reason, (int) rec.send_class, (int) rec.tx_write_start_us,
                           (int) rec.tx_write_end_us, (int) rec.rx_rsr, (int) rec.frame_len, (int) rec.patched,
-                          (int) rec.patch_to_send_us, (int) rec.patch_pred_us));
+                          (int) rec.patch_to_send_us, (int) rec.patch_pred_us, (int) rec.t3_calc_to_t0_us));
       lines++;
     }
   } else if (strncmp(cmd, "NET", 3) == 0) {
@@ -1075,17 +1086,37 @@ void NTPServer::build_ntp_response_(const uint8_t *request, uint8_t *response,
   // instant the packet actually leaves rather than when we built the response. May be
   // overwritten again in the TX buffer itself by the design-B post-write patch, closer still
   // to the instant the packet actually leaves -- see NTPServer::build_patch_t3_().
+#ifdef USE_ESP_IDF
+  int64_t t3_clock_read_us = 0;
+  NTPTimestamp transmit_ts = this->get_ntp_timestamp_(this->send_estimator_.estimate(), &t3_clock_read_us);
+  // Design C ("T3-computation gap" diagnostic): recv_task_() reads this back against its own t0
+  // right after this call returns.
+  this->last_t3_clock_read_us_ = t3_clock_read_us;
+#else
   NTPTimestamp transmit_ts = this->get_ntp_timestamp_(this->send_estimator_.estimate());
+#endif
   encode_ntp_timestamp_(transmit_ts, &response[40]);
 }
 
-NTPTimestamp NTPServer::get_ntp_timestamp_(int32_t offset_us) {
+NTPTimestamp NTPServer::get_ntp_timestamp_(int32_t offset_us, int64_t *clock_read_us) {
+#ifdef USE_ESP_IDF
   int64_t anchored_us;
-  if (this->use_pps_anchor_ && this->anchor_epoch_us_(esp_timer_get_time(), anchored_us))
+  const int64_t clock_us = esp_timer_get_time();
+  if (this->use_pps_anchor_ && this->anchor_epoch_us_(clock_us, anchored_us)) {
+    if (clock_read_us != nullptr)
+      *clock_read_us = clock_us;
     return NTPServer::micros_epoch_to_ntp_timestamp_(anchored_us + offset_us);
+  }
+#endif
 
   struct timeval tv;
   gettimeofday(&tv, nullptr);
+#ifdef USE_ESP_IDF
+  // Fallback path's T3 clock read: taken immediately next to gettimeofday() above, so the gap
+  // this diagnostic measures is entirely the anchor branch's own math, not this fallback's.
+  if (clock_read_us != nullptr)
+    *clock_read_us = esp_timer_get_time();
+#endif
 
   time_t sec = tv.tv_sec;
   int64_t usec = static_cast<int64_t>(tv.tv_usec) + offset_us;
