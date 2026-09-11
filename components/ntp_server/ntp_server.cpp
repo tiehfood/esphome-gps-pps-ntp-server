@@ -202,6 +202,13 @@ void NTPServer::setup() {
   ESP_LOGI(TAG, "NTP server listening on port %u (clock read %uus precision %d; anchor %uus precision %d)",
            this->port_, (unsigned) best_us, this->precision_, (unsigned) best_anchor_us, this->precision_anchor_);
 
+  // Post-write T3 is on by default since 2026-09-11. Pre-registered A/B: per-sample offset sigma
+  // 7.14 -> 2.83 us with no checksum errors at a client. A follow-up showed its +10 us offset
+  // shift is the removal of the estimate path's ~21 us early T3. Registering it only sets the
+  // fork's callback; until time is synchronized the callback declines and the estimate path's T3
+  // is sent. The "NTP Post-Write T3" switch can still turn it off for A/Bs.
+  this->set_post_write_t3(true);
+
   // Serving moves off the shared loop entirely: Application::loop() sleeps out a
   // 16ms loop_interval_ between component polls, so stamping T2 there adds a mean
   // ~4.4ms queueing delay to BOTH T2 and T3. That shifts the client's computed

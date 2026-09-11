@@ -355,15 +355,16 @@ switch:
     turn_off_action:
       - lambda: 'id(${id_prefix}_ntp).set_short_int_wait(false);'
 
-  # Off by default: rewrites T3 (and the UDP checksum, if present) into the reply's bytes
-  # already queued in the W5500 TX buffer, immediately before the SEND that transmits it --
-  # closer to the wire than any timestamp written before sendto(). See ntp_tx_patch.h.
+  # On by default (verified 2026-09-11: per-sample offset sigma 7.14 -> 2.83 us, no checksum
+  # errors; its +10 us offset shift removes the old path's early T3). Rewrites T3 and the UDP
+  # checksum into the reply's bytes already queued in the W5500 TX buffer, immediately before
+  # the SEND that transmits it. See ntp_tx_patch.h. Kept as a switch for later A/Bs.
   - platform: template
     name: "NTP Post-Write T3"
     id: ${id_prefix}_ntp_post_write_t3
     entity_category: "diagnostic"
     optimistic: true
-    restore_mode: ALWAYS_OFF
+    restore_mode: ALWAYS_ON
     turn_on_action:
       - lambda: 'id(${id_prefix}_ntp).set_post_write_t3(true);'
     turn_off_action:

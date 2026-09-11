@@ -67,8 +67,8 @@ class NTPServer : public Component {
 
   /// Design B ("NTP Post-Write T3"): rewrites T3 (and the UDP checksum, if present) into the
   /// reply's bytes already queued in the W5500 TX buffer, immediately before the SEND that
-  /// transmits it -- closer to the wire than any timestamp written before sendto(). Off by
-  /// default; main task only.
+  /// transmits it -- closer to the wire than any timestamp written before sendto(). On by
+  /// default since 2026-09-11 (enabled at the end of setup()); main task only.
   void set_post_write_t3(bool enable);
 #endif
 
