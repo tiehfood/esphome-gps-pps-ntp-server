@@ -191,14 +191,14 @@
 <div class="wrap">
 
 <header class="masthead">
-  <span class="eyebrow">Implementation plan &middot; 2026-09-10</span>
+  <span class="eyebrow">Implementation plan &middot; updated 2026-09-10</span>
   <h1>P4 Timing Probe</h1>
   <p class="lede">A hardware-timestamped measurement instrument for the GPS/PPS stratum-1 NTP server — built because we can no longer measure our own improvements.</p>
   <div class="meta">
     <span><b>Target</b> Waveshare ESP32-P4 ETH PoE</span>
     <span><b>Silicon</b> rev 1.3</span>
     <span><b>Framework</b> ESP-IDF 5.5.1, bare app</span>
-    <span><b>Status</b> awaiting review</span>
+    <span><b>Status</b> phases 1–6 done &middot; server defect found and fixed &middot; phase 7 paused</span>
   </div>
 </header>
 
@@ -210,6 +210,115 @@
   <p>The server's own GPS-referenced clock holds 4–6&nbsp;µs. But every client we own reports it 60–100&nbsp;µs away, and that number moved by 105&nbsp;µs across one evening while the device itself never budged.</p>
   <p>The cause is not the network. Moving the server onto the client's own network segment cut round-trip delay from 674&nbsp;µs to 129&nbsp;µs and left the offset unchanged. The clients are simply not references: one is disciplined by the very server it measures, the other tracks an internet stratum-1 with ±4&nbsp;ms root distance.</p>
   <p>So changes below roughly 20&nbsp;µs are currently unfalsifiable. Last session's rate-term fix — a real correctness bug — could not be shown to help. This probe exists to end that.</p>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="eyebrow">Results</span>
+    <h2>Five phases passed, one assumption broken</h2>
+  </div>
+  <p>Everything below was measured on the board against the live server, on the same /24, with competing traffic running.</p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Phase</th><th>State</th><th>Evidence</th></tr></thead>
+      <tbody>
+        <tr><td>1 &middot; Bring-up</td><td><span class="pill">passed</span></td><td>Link at 2.4&nbsp;s, DHCP <code>192.168.34.172</code> — already in the server's subnet. Silicon v1.3 confirmed by boot log and esptool.</td></tr>
+        <tr><td>2 &middot; PTP clock</td><td><span class="pill">passed</span></td><td>One-second steps settle at 999&nbsp;999&nbsp;960 – 1&nbsp;000&nbsp;000&nbsp;040&nbsp;ns: the fixed 40&nbsp;ns tick.</td></tr>
+        <tr><td>3 &middot; RX stamps</td><td><span class="pill">passed</span></td><td>With <code>ts4all</code> set, DHCP, ARP and ICMP frames carry SFD stamps; cleared, every stamp reads zero; set again, stamps return on the next frame. Reproduced twice in one boot.</td></tr>
+        <tr><td>4 &middot; TX stamps</td><td><span class="pill">passed</span></td><td>500 frames at 10&nbsp;Hz under ping contention: no timeouts, no out-of-bracket or out-of-order stamps.</td></tr>
+        <tr><td>5 &middot; NTP probe</td><td><span class="pill">passed</span></td><td>500 exchanges, 100% answered and stamped. Delay median 114&nbsp;µs. Next hop learned as the server's own W5500.</td></tr>
+        <tr><td>6 &middot; Floor</td><td><span class="pill">passed</span></td><td>A/B resolution established, live A/Bs run — and they exposed a defect in the server itself (below).</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <span class="eyebrow">The trap that would have faked Phase 3</span>
+    <p>On the P4 the driver passes a timestamp pointer on <em>every</em> frame — it is never NULL. Counting non-NULL pointers reported 86 of 86 frames stamped regardless. Only a zero stamp means "not latched", and only switching <code>ts4all</code> off and on within one boot proved the stamps were real.</p>
+  </div>
+
+  <div class="note warn">
+    <span class="eyebrow">The assumption that broke</span>
+    <p>The plan treated the probe's clock offset as constant across a measurement window. It is not: the free-running PTP clock gains <b>34.1&nbsp;ppm</b> on the GPS-disciplined server. It does so cleanly — R²&nbsp;0.9999, the same slope to within 0.07&nbsp;ppm across two runs, and the second run began 8.6&nbsp;µs from where the first run's ramp predicted, 247&nbsp;s later. So raw offsets are a ramp; removed, they are usable.</p>
+  </div>
+
+  <h3>What the instrument can resolve</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Quantity</th><th class="num">Run 1</th><th class="num">Run 2</th></tr></thead>
+      <tbody>
+        <tr><td>Round-trip delay, median</td><td class="num">114.9 µs</td><td class="num">114.4 µs</td></tr>
+        <tr><td>Detrended offset, std</td><td class="num">8.18 µs</td><td class="num">7.45 µs</td></tr>
+        <tr><td>&nbsp;&nbsp;coupled to delay (slope)</td><td class="num">7.64 µs (−0.52)</td><td class="num">6.21 µs (−0.41)</td></tr>
+        <tr><td>&nbsp;&nbsp;remainder</td><td class="num">2.92 µs</td><td class="num">4.13 µs</td></tr>
+        <tr><td>Integrated autocorrelation time</td><td class="num">1.00</td><td class="num">1.13</td></tr>
+        <tr><td><b>A/B 95% CI at 1000 samples per arm</b></td><td class="num"><b>±0.72 µs</b></td><td class="num"><b>±0.70 µs</b></td></tr>
+        <tr><td>A/A null test, worst |difference| / SE</td><td class="num">0.61</td><td class="num">0.92</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><b>Per sample, the floor is not sub-microsecond</b> — about 8&nbsp;µs. <b>As an A/B resolution it is</b>: ±0.7&nbsp;µs from 1000 samples per arm, roughly eight and a half minutes of exchanges. The samples are effectively independent, and the null test reports no effect when nothing changed. Resolution in an A/B comparison is what the plan's go/no-go actually needed.</p>
+  <p>Most of the per-sample noise is not the probe's. It moves offset by half the delay change in the <em>opposite</em> direction — the signature of a transmit timestamp stamped early — and the server's T3 is a prediction. The instrument is now seeing the device under test.</p>
+
+  <div class="note">
+    <span class="eyebrow">Found on the way</span>
+    <p><code>CONFIG_ETH_TRANSMIT_MUTEX</code> defaults to off, and the DMA transmit ring has no lock of its own. Any second task transmitting alongside lwIP risks intermittent ring corruption that would look like a network fault. Enabled for the probe.</p>
+    <p>A first estimate of the server's internal latency also falls out: wire and store-and-forward account for about 30&nbsp;µs of round trip, against 59&nbsp;µs minimum and 114&nbsp;µs median measured — roughly 30–85&nbsp;µs spent inside the W5500 path.</p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="eyebrow">Found</span>
+    <h2>The noise was the server</h2>
+  </div>
+  <p>The first live A/Bs came back at ±13&nbsp;µs instead of the projected ±0.7&nbsp;µs. The cause was not the probe: about 1% of the server's replies arrive in bursts that are wrong by milliseconds, and the instrument is precise enough to see exactly how.</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Stage</th><th>What happens on the server</th><th>What a client receives</th></tr></thead>
+      <tbody>
+        <tr><td>Trigger</td><td>Outbound TCP through the W5500 — a periodic burst once a minute, a page load of the device's own web UI, per-request telemetry</td><td>—</td></tr>
+        <tr><td>1 · receive stall</td><td>For about a second, requests are serviced up to ~100&nbsp;ms after they arrive, so T2 is stamped that late</td><td>Offset up to +50&nbsp;ms. Delay-weighting clients reject most; one-shot SNTP clients accept them.</td></tr>
+        <tr><td>2 · estimator poisoned</td><td>The same episode's slow sends re-seed the shared send estimate milliseconds high</td><td>3–5 replies with T3 1.4–2.9&nbsp;ms late and <em>negative</em> delay — the samples min-delay filters prefer.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The stalls were wall-clocked to second 7 of every minute, and a causal test settled what drives them: downloading the device's web page at second :30 produced a receive stall at :30 in four minutes out of four. Five candidate mechanisms were proposed and ruled out along the way, the last — the driver's 10&nbsp;ms command-poll loop — by instrumenting it directly and counting zero retries. What starts the stall is still open.</p>
+
+  <div class="note">
+    <span class="eyebrow">The rate-term fix, measured</span>
+    <p>With the bursts excluded, switching the anchor's rate term moves offset by −3.11&nbsp;±&nbsp;0.70&nbsp;µs, and the legacy term leaves a +3.41&nbsp;±&nbsp;1.75&nbsp;µs sawtooth across each second that the hardware-measured rate removes — both inside the prediction written down before the run. Stated plainly: the analysis exactly as registered, with bursts included, was null; the confirmation needed a cleaning step that was not pre-registered.</p>
+  </div>
+
+  <h3>What was changed on the server</h3>
+  <ul>
+    <li><b>Stalled requests are refused.</b> The hardware-captured INTn edge already marked each frame's arrival; a request serviced ≥&nbsp;1&nbsp;ms after it gets no reply. Clients retry.</li>
+    <li><b>The send estimate cannot be poisoned by a stall.</b> Re-seeding needs rejects that agree with each other and a run longer than a stall lasts.</li>
+    <li><b>Per-request telemetry is throttled</b> to one worst-case value per 10&nbsp;s — it had been ~16 messages per second of the very load that causes stalls.</li>
+    <li><b>The driver's command handshake is instrumented</b> from the existing SPI taps, without forking the driver.</li>
+  </ul>
+
+  <h3>Before and after, same load test</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Measure</th><th class="num">Before</th><th class="num">After</th></tr></thead>
+      <tbody>
+        <tr><td>Replies off by more than 1 ms, per 1000</td><td class="num">31.2</td><td class="num"><b>6.3</b></td></tr>
+        <tr><td>Replies off by more than 100 µs, per 1000</td><td class="num">51.0</td><td class="num"><b>25.4</b></td></tr>
+        <tr><td>Worst offset error</td><td class="num">56.1 ms</td><td class="num">38.1 ms</td></tr>
+        <tr><td>Receive-stall replies (5σ)</td><td class="num">27</td><td class="num">9, all under 3 ms</td></tr>
+        <tr><td>Transmit-stall replies (5σ)</td><td class="num">11</td><td class="num">1</td></tr>
+        <tr><td>Noise floor, robust σ</td><td class="num">7.30 µs</td><td class="num"><b>6.87 µs</b></td></tr>
+        <tr><td>Requests refused</td><td class="num">0</td><td class="num">15 (= probe timeouts)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn">
+    <span class="eyebrow">Still open</span>
+    <p><b>One 80&nbsp;ms transmit stall</b> got through: the packet left 80&nbsp;ms after the T3 written into it. Refusal checks the receive side and cannot see it. <b>Nine small receive-late replies</b> (1–5&nbsp;ms) escaped the 1&nbsp;ms test for reasons not yet understood. <b>The estimator hardening is untested</b> — no re-seed happened in either run. And the root cause of the stalls remains unidentified.</p>
+  </div>
 </section>
 
 <section>
@@ -348,7 +457,7 @@ flowchart TD
     <div class="phase">
       <span class="pnum">1</span>
       <div class="pbody">
-        <div class="ptitle"><h3>Bring-up</h3></div>
+        <div class="ptitle"><h3>Bring-up</h3><span class="pill">passed</span></div>
         <p>Standalone ESP-IDF project outside the ESPHome tree. Internal EMAC with the IP101 over RMII, external 50&nbsp;MHz clock in on GPIO50 — the arrangement that avoids the MPLL/PSRAM conflict that can fail EMAC init.</p>
         <p class="accept"><b>Done when</b> the board takes a DHCP lease and answers ping from the Mac Studio.</p>
       </div>
@@ -357,7 +466,7 @@ flowchart TD
     <div class="phase">
       <span class="pnum">2</span>
       <div class="pbody">
-        <div class="ptitle"><h3>PTP clock alive</h3></div>
+        <div class="ptitle"><h3>PTP clock alive</h3><span class="pill">passed</span></div>
         <p>Enable timestamping through the ioctl interface and poll the clock.</p>
         <p class="accept"><b>Done when</b> the PTP clock advances monotonically at 1&nbsp;s/s with no rollover glitch between the seconds and nanoseconds registers.</p>
       </div>
@@ -366,7 +475,7 @@ flowchart TD
     <div class="phase gate">
       <span class="pnum">3</span>
       <div class="pbody">
-        <div class="ptitle"><h3>ts4all and RX timestamps</h3><span class="pill gap">risk gate</span></div>
+        <div class="ptitle"><h3>ts4all and RX timestamps</h3><span class="pill gap">risk gate</span><span class="pill">passed</span></div>
         <p>Set the <code>en_ts4all</code> bit after <code>ptp_start</code>, register the receive callback, resolve the concrete type behind its <code>void *info</code>, and send the board an ordinary UDP packet.</p>
         <p class="accept"><b>Done when</b> a hardware timestamp arrives for a <b>non-PTP</b> UDP frame and tracks the PTP clock. If it does not — stop here and reassess rather than build on it.</p>
       </div>
@@ -375,7 +484,7 @@ flowchart TD
     <div class="phase">
       <span class="pnum">4</span>
       <div class="pbody">
-        <div class="ptitle"><h3>TX timestamps</h3></div>
+        <div class="ptitle"><h3>TX timestamps</h3><span class="pill">passed</span></div>
         <p>Transmit through the control path with a timestamp structure attached. The driver polls the descriptor for the stamp; Espressif's own comment notes a maximum of 31 loops observed on the P4 for a 1500-byte frame.</p>
         <p class="accept"><b>Done when</b> every frame returns a plausible, monotonic stamp with no timeouts.</p>
       </div>
@@ -384,7 +493,7 @@ flowchart TD
     <div class="phase">
       <span class="pnum">5</span>
       <div class="pbody">
-        <div class="ptitle"><h3>NTP probe</h3></div>
+        <div class="ptitle"><h3>NTP probe</h3><span class="pill">passed</span></div>
         <p>Hand-built Ethernet/IP/UDP frame carrying a 48-byte NTP request, so transmission goes through the control path. Parse T2 and T3 from the reply; return raw quadruples over a UDP command interface.</p>
         <p class="accept"><b>Done when</b> delay and offset computed on the Mac match the existing Python probe in magnitude, with visibly tighter scatter.</p>
       </div>
@@ -393,7 +502,7 @@ flowchart TD
     <div class="phase gate">
       <span class="pnum">6</span>
       <div class="pbody">
-        <div class="ptitle"><h3>Characterise the floor</h3><span class="pill gap">go / no-go</span></div>
+        <div class="ptitle"><h3>Characterise the floor</h3><span class="pill gap">go / no-go</span><span class="pill">passed</span></div>
         <p>Move the probe onto the server's own VLAN so no routed hop remains, then measure repeatability and compare delay against the computed physical minimum. Re-run the anchor A/B and the PPS rate-term change with the new instrument.</p>
         <p class="accept"><b>Done when</b> we can state a defensible A/B resolution figure. This is the deliverable — if it is not well under 1&nbsp;µs, Phase 7 is not worth building.</p>
       </div>
@@ -420,7 +529,7 @@ flowchart TD
       <thead><tr><th>Quantity</th><th class="num">Today</th><th class="num">After Phase 6</th><th class="num">After Phase 7</th></tr></thead>
       <tbody>
         <tr><td>Round-trip delay</td><td class="num">±100 µs</td><td class="num">nanoseconds</td><td class="num">nanoseconds</td></tr>
-        <tr><td>A/B difference in offset</td><td class="num">±19 µs</td><td class="num">sub-µs (target)</td><td class="num">sub-µs</td></tr>
+        <tr><td>A/B difference in offset</td><td class="num">±19 µs</td><td class="num">±0.7 µs at 1000/arm, burst-free</td><td class="num">sub-µs</td></tr>
         <tr><td>Absolute offset</td><td class="num">unmeasurable</td><td class="num">unmeasurable</td><td class="num">±1–5 µs</td></tr>
       </tbody>
     </table>
@@ -440,12 +549,14 @@ flowchart TD
     <table>
       <thead><tr><th>Risk</th><th>Impact</th><th>Response</th></tr></thead>
       <tbody>
-        <tr><td><code>ts4all</code> does not stamp plain UDP</td><td>Blocks everything downstream</td><td>Phase 3 gate; fall back to a newer ESP-IDF where the API is public</td></tr>
+        <tr><td><code>ts4all</code> does not stamp plain UDP</td><td>Blocks everything downstream</td><td><b>Resolved</b> — works; proven by toggling the bit within one boot</td></tr>
         <tr><td><code>ptp_start</code> clears <code>en_ts4all</code></td><td>Silent loss of stamps</td><td>Set the bit after, re-verify after every link event</td></tr>
-        <tr><td>Type behind the RX <code>info</code> pointer unknown</td><td>Minor — resolved by reading source</td><td>Determine during Phase 3</td></tr>
+        <tr><td>Type behind the RX <code>info</code> pointer unknown</td><td>Minor — resolved by reading source</td><td><b>Resolved</b> — <code>eth_mac_time_t*</code>, never NULL; zero means not latched</td></tr>
         <tr><td>Free GPIO for the PPS input unconfirmed</td><td>Blocks Phase 7 wiring</td><td>Confirm against the board pinout before wiring</td></tr>
         <tr><td>Both boards are PoE-powered and isolated</td><td>Signal wire without a reference is meaningless</td><td>Ground wire is mandatory, plus a ~100 Ω series resistor</td></tr>
         <tr><td>IP101 PHY latency asymmetry uncharacterised</td><td>Bounds absolute accuracy below ~1 µs</td><td>Affects Phase 7 only — delay and differential offset are immune</td></tr>
+        <tr><td>Concurrent transmits corrupt the DMA ring</td><td>Intermittent, looks like a network fault</td><td><b>Resolved</b> — <code>CONFIG_ETH_TRANSMIT_MUTEX=y</code></td></tr>
+        <tr><td>Probe clock drifts 34&nbsp;ppm</td><td>Raw offsets are a ramp, not a constant</td><td><b>Resolved</b> — linear and repeatable; detrend, or steer the clock</td></tr>
       </tbody>
     </table>
   </div>
@@ -459,7 +570,7 @@ flowchart TD
   <div class="asks">
     <div class="ask">
       <h3>Move the probe's switch port</h3>
-      <p>Phase 6 needs the P4 on the server's VLAN so no routed hop remains. This is the expendable device, so it carries none of the risk we declined earlier for the Pi and the Mac Studio.</p>
+      <p><b>No longer needed.</b> The probe's port already sits in the server's subnet, so there is no routed hop between them.</p>
     </div>
     <div class="ask">
       <h3>Wire the PPS split</h3>
@@ -473,7 +584,7 @@ flowchart TD
 </section>
 
 <footer>
-  Plan source: <code>docs/superpowers/plans/2026-09-09-p4-ntp-probe.md</code>. Capabilities verified against <code>~/.platformio/packages/framework-espidf</code> 5.5.1 on 2026-09-09. Implementation begins at Phase 1 on approval, reporting back at the Phase 3 gate before proceeding.
+  Plan source: <code>docs/superpowers/plans/2026-09-09-p4-ntp-probe.md</code>. Capabilities verified against <code>~/.platformio/packages/framework-espidf</code> 5.5.1 on 2026-09-09. Phases 1–6 on hardware 2026-09-10, server fixes verified the same night; the plan file carries the full evidence, including every hypothesis that was ruled out.
 </footer>
 
 </div>

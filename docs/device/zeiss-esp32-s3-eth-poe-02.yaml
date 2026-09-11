@@ -124,6 +124,14 @@ time:
       accuracy_decimals: 0                                                                                                                                                         
       state_class: measurement                                                                                                                                                     
       entity_category: "diagnostic"
+    pps_interval_ppb:
+      id: ${id_prefix}_pps_interval_ppb
+      name: "PPS Interval Error"
+      icon: "mdi:sine-wave"
+      unit_of_measurement: "ppb"
+      accuracy_decimals: 0
+      state_class: measurement
+      entity_category: "diagnostic"
     pps_drift:
       id: ${id_prefix}_pps_raw_drift
       name: "PPS Drift"
@@ -190,6 +198,21 @@ ntp_server:
     icon: "mdi:lan-connect"
     accuracy_decimals: 0
     state_class: total_increasing
+    entity_category: "diagnostic"
+  # Requests refused because the receive path stalled (INTn to burst start >= 1 ms).
+  refused:
+    id: ${id_prefix}_ntp_refused
+    name: "NTP Refused Stalled"
+    entity_category: "diagnostic"
+  # W5500 Sn_CR handshake diagnostics, per 10 s window: commands needing more than one poll
+  # (each cost a 10 ms sleep in the stock driver) and the longest write-to-cleared time.
+  w5500_cmd_retries:
+    id: ${id_prefix}_w5500_cmd_retries
+    name: "W5500 Command Retries"
+    entity_category: "diagnostic"
+  w5500_cmd_max:
+    id: ${id_prefix}_w5500_cmd_max
+    name: "W5500 Command Max"
     entity_category: "diagnostic"
 
 # RESEARCH SPIKE -- CLOSED 2026-09-04, disabled. The W5500 has ONE INTn pin shared by all
@@ -269,6 +292,19 @@ switch:
       - lambda: 'id(${id_prefix}_ntp).set_use_pps_anchor(true);'
     turn_off_action:
       - lambda: 'id(${id_prefix}_ntp).set_use_pps_anchor(false);'
+
+  # A/B: the anchor's frequency term from the MCPWM-captured crystal rate (ON, default) versus
+  # the legacy position-mean estimate it replaced (OFF). Measured with the P4 probe.
+  - platform: template
+    name: "NTP HW Rate Term"
+    id: ${id_prefix}_hw_rate_term
+    entity_category: "diagnostic"
+    optimistic: true
+    restore_mode: ALWAYS_ON
+    turn_on_action:
+      - lambda: 'id(${id_prefix}_pps).set_use_hw_rate(true);'
+    turn_off_action:
+      - lambda: 'id(${id_prefix}_pps).set_use_hw_rate(false);'
 
   - platform: template
     name: "${name} RGB LED"
