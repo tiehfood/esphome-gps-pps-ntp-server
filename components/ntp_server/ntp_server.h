@@ -55,14 +55,20 @@ class NTPServer : public Component {
   /// verdict is re-evaluated per request, so flipping it takes effect immediately.
   void set_strict_rx_admission(bool enable) { this->strict_rx_admission_ = enable; }
 
-  /// Design A ("W5500 Short Interrupt Wait"): shortens the chip's own INTLEVEL from the
-  /// driver's boot default (0xFFFF, ~1.748 ms) to 0x0FFF (~109 us). A live register write with
-  /// no independent recovery path if it went wrong, so this is gated by a 30-minute dead-man
-  /// timer (armed on enable, checked in loop()) as well as the caller's own switch. Off by
-  /// default; main task only.
+  /// Design A'' ("W5500 Short Interrupt Wait"): shortens the chip's own INTLEVEL from the
+  /// driver's boot default (0xFFFF, ~1.748 ms) to 0x0FFF (~109 us). On by default since
+  /// 2026-09-13 (verified interleaved A/B: replies served late > 150 us 0.64 -> 0.19%, for
+  /// +0.18 points of refusals). A live register write with no independent recovery path if it
+  /// went wrong, so the policy is applied only after a deferred boot delay -- see loop() and
+  /// SHORT_INT_WAIT_BOOT_DELAY_MS -- which guarantees every boot an OTA window with the
+  /// driver's own 0xFFFF in place, rather than the time-bounded dead-man revert this replaced.
+  /// Always sets short_int_wait_policy_, whether or not the register write itself succeeds.
+  /// Main task only.
   void set_short_int_wait(bool enable);
-  /// True while the dead-man is armed AND the last read-back actually showed the short value --
-  /// i.e. reflects hardware state, not just "was asked for".
+  /// True once the last INTLEVEL write AND read-back actually verified the short value is live
+  /// in hardware (short_wait_effective_) -- not just "was asked for". Public and const-qualified
+  /// for callers outside the hot path (the YAML switch's state lambda, the INT diag command);
+  /// recv_task_() reads short_wait_effective_ directly instead.
   bool short_int_wait_active() const;
 
   /// Design B ("NTP Post-Write T3"): rewrites T3 (and the UDP checksum, if present) into the
@@ -327,23 +333,27 @@ class NTPServer : public Component {
   NTPTimestamp hook_to_ntp_timestamp_(int64_t hook_us);
   bool anchor_epoch_us_(int64_t at_us, int64_t &out_us);
 
-  // ---- Design A: "W5500 Short Interrupt Wait" ----
-  /// Reverts the INTLEVEL write if set_short_int_wait(false) is never called -- see
-  /// .claude/CLAUDE.md on why any experimental W5500 register write needs one. Checked in
-  /// loop(); armed/disarmed only from set_short_int_wait(), main task only.
-  DeadmanTimer int_wait_deadman_;
+  // ---- Design A'': "W5500 Short Interrupt Wait", on by default since 2026-09-13 ----
+  /// The policy the switch asked for, independent of short_wait_effective_ (the verified
+  /// hardware state). Load-bearing: without this separation, loop()'s deferred boot-enable
+  /// would silently re-enable an A/B "off" block 60 s later, corrupting every future A/B.
+  /// Defaults on to match the switch's ALWAYS_ON restore_mode. Set only from
+  /// set_short_int_wait(); main task only.
+  bool short_int_wait_policy_{true};
   /// The value actually read back after the last write, so short_int_wait_active() and the INT
   /// diag command reflect hardware state rather than merely "was asked for".
   uint16_t last_int_level_readback_{0};
   /// Design A' (edge-aware admission): true only once set_short_int_wait(true) has both written
   /// AND read back W5500_INT_LEVEL_SHORT -- i.e. reflects hardware state, not just "was asked
-  /// for". Set false on disable, on the dead-man revert in loop(), and on any failed or
-  /// mismatched read-back. recv_task_() reads this plain bool directly rather than calling
+  /// for". Set false on disable and on any failed or mismatched read-back (see loop()'s
+  /// steady-state re-check). recv_task_() reads this plain bool directly rather than calling
   /// short_int_wait_active() (a public, const-qualified convenience for callers outside the hot
   /// path, e.g. the INT diag command) -- one fewer function call per request, same value.
   volatile bool short_wait_effective_{false};
-  /// millis() of the last INTLEVEL re-check while short_wait_effective_ was true (see loop()) --
-  /// wrap-safe against the same subtraction idiom used by int_wait_deadman_. Main task only.
+  /// millis() deadline for the next INTLEVEL action: loop()'s deferred boot-enable (while
+  /// !short_wait_effective_) or its steady-state re-check (while short_wait_effective_) -- the
+  /// two are mutually exclusive, so one timer serves both. Wrap-safe via the same subtraction
+  /// idiom used elsewhere (e.g. the ARP refresh timer). Main task only.
   uint32_t int_level_recheck_ms_{0};
 
   // ---- Design B: "NTP Post-Write T3" ----

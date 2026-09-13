@@ -340,15 +340,17 @@ switch:
     turn_off_action:
       - lambda: 'id(${id_prefix}_ntp).set_strict_rx_admission(false);'
 
-  # Off by default: shortens the W5500's own INTLEVEL (interrupt assert wait time) from the
-  # driver's boot default 0xFFFF (~1.748 ms) to 0x0FFF (~109 us). A live register write with no
-  # independent recovery path if it went wrong, so it self-reverts after 30 minutes even if this
-  # switch is never turned off again (see .claude/CLAUDE.md on why that dead-man is required).
+  # On by default since 2026-09-13 (A'' verified: replies served late > 150 us 0.64 -> 0.19%,
+  # for +0.18 points of refusals). Shortens the W5500's own INTLEVEL (interrupt assert wait time)
+  # from the driver's boot default 0xFFFF (~1.748 ms) to 0x0FFF (~109 us). A live register write
+  # with no independent recovery path if it went wrong, so the firmware defers applying it for
+  # 60 s after every boot -- a guaranteed OTA window with the driver's own 0xFFFF still in place
+  # -- instead of the time-bounded dead-man revert this replaced.
   - platform: template
     name: "NTP W5500 Short Interrupt Wait"
     id: ${id_prefix}_ntp_w5500_short_int_wait
     entity_category: "diagnostic"
-    restore_mode: ALWAYS_OFF
+    restore_mode: ALWAYS_ON
     lambda: 'return id(${id_prefix}_ntp).short_int_wait_active();'
     turn_on_action:
       - lambda: 'id(${id_prefix}_ntp).set_short_int_wait(true);'

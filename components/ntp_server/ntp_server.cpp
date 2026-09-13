@@ -88,12 +88,16 @@ static const uint16_t DIAG_PORT = 12301;
 /// shortened value this feature switches to (0x0FFF, ~109 us) -- see .claude/CLAUDE.md.
 static const uint16_t W5500_INT_LEVEL_SHORT = 0x0FFF;
 static const uint16_t W5500_INT_LEVEL_DEFAULT = 0xFFFF;
-/// How long an enabled short-interrupt-wait reverts itself if nobody calls
-/// set_short_int_wait(false) again -- a live register write with no other recovery path.
-static const uint32_t INT_WAIT_DEADMAN_MS = 1800000;  // 30 minutes
+/// Design A'': every boot keeps the ESP-IDF driver's own 0xFFFF for at least this long before
+/// the on-by-default policy is allowed to write 0x0FFF -- guarantees an OTA window if the short
+/// wait ever wedges the receive path. See the plan's "A'' default-on" section
+/// (docs/superpowers/plans/2026-09-09-p4-ntp-probe.md, pre-registered 2026-09-13). This is the
+/// recovery path that replaced the 30-minute dead-man.
+static const uint32_t SHORT_INT_WAIT_BOOT_DELAY_MS = 60000;  // 60 seconds
 /// How often loop() re-reads INTLEVEL while short_wait_effective_ is true, to catch the ESP-IDF
 /// driver silently restoring its own 0xFFFF default (e.g. after re-initialising the W5500) --
-/// see int_level_still_short() in deadman.h.
+/// see int_level_still_short() in deadman.h. Also the retry interval for the deferred
+/// boot-enable above, while it has not yet succeeded.
 static const uint32_t INT_LEVEL_RECHECK_MS = 60000;  // 60 seconds
 #endif
 
@@ -229,19 +233,18 @@ void NTPServer::setup() {
 }
 
 void NTPServer::loop() {
-  // Design A dead-man: revert the short interrupt wait if set_short_int_wait(false) was never
-  // called again. Checked every loop -- cheap when disarmed (a single bool check) -- so an
-  // unattended experiment cannot leave a live register write in place indefinitely.
-  if (this->int_wait_deadman_.expired(millis())) {
-    const uint16_t driver_default =
-        ethernet::w5500_driver_int_level() != 0 ? ethernet::w5500_driver_int_level() : W5500_INT_LEVEL_DEFAULT;
-    ethernet::w5500_write_int_level(driver_default);
-    uint16_t readback = 0;
-    ethernet::w5500_read_int_level(&readback);
-    this->last_int_level_readback_ = readback;
-    this->int_wait_deadman_.disarm();
-    this->short_wait_effective_ = false;
-    ESP_LOGW(TAG, "dead-man expired: INTLEVEL restored to 0x%04X", readback);
+  // Design A'' deferred boot-enable: the recovery path that replaced the 30-minute dead-man.
+  // Every boot keeps the driver's own 0xFFFF for at least SHORT_INT_WAIT_BOOT_DELAY_MS,
+  // guaranteeing an OTA window before the on-by-default policy can write 0x0FFF. Only applied
+  // once the ESP-IDF driver has itself written INTLEVEL (w5500_driver_int_level() != 0), so
+  // this can never race the driver's own init. Retried at most once per INT_LEVEL_RECHECK_MS,
+  // sharing int_level_recheck_ms_ with the steady-state re-check below -- the two conditions
+  // are mutually exclusive (this one only fires while not yet effective).
+  if (this->short_int_wait_policy_ && !this->short_wait_effective_ &&
+      millis() >= SHORT_INT_WAIT_BOOT_DELAY_MS && ethernet::w5500_driver_int_level() != 0 &&
+      static_cast<int32_t>(millis() - this->int_level_recheck_ms_) >= 0) {
+    this->int_level_recheck_ms_ = millis() + INT_LEVEL_RECHECK_MS;
+    this->set_short_int_wait(true);  // logs its own INFO/WARN; see set_short_int_wait()
   }
 
   // Design A guard: the ESP-IDF driver can re-initialise the W5500 (e.g. after a link-recovery
@@ -256,10 +259,29 @@ void NTPServer::loop() {
     const bool read_ok = ethernet::w5500_read_int_level(&readback);
     this->last_int_level_readback_ = read_ok ? readback : 0;
     if (!int_level_still_short(read_ok, readback)) {
-      this->short_wait_effective_ = false;
-      this->int_wait_deadman_.disarm();  // nothing left to revert -- the register is not short
-      ESP_LOGW(TAG, "INTLEVEL is 0x%04X, not the short wait: edge-aware admission disabled",
-               readback);
+      if (this->short_int_wait_policy_) {
+        // The driver re-initialised the W5500 and silently restored its own 0xFFFF default --
+        // re-apply the on-by-default policy instead of leaving it off until the next boot. At
+        // most one attempt per re-check interval (this guard's own cadence), so a persistently
+        // wedged register cannot busy-loop here.
+        const bool rewrite_ok = ethernet::w5500_write_int_level(W5500_INT_LEVEL_SHORT);
+        uint16_t reapplied = 0;
+        const bool reapplied_ok = rewrite_ok && ethernet::w5500_read_int_level(&reapplied);
+        this->last_int_level_readback_ = reapplied_ok ? reapplied : 0;
+        if (reapplied_ok && reapplied == W5500_INT_LEVEL_SHORT) {
+          this->short_wait_effective_ = true;
+          ESP_LOGI(TAG, "INTLEVEL was reset to 0x%04X by the driver; re-applied the short wait (0x%04X)",
+                   readback, reapplied);
+        } else {
+          this->short_wait_effective_ = false;
+          ESP_LOGW(TAG, "INTLEVEL is 0x%04X, not the short wait: edge-aware admission disabled",
+                   readback);
+        }
+      } else {
+        this->short_wait_effective_ = false;
+        ESP_LOGW(TAG, "INTLEVEL is 0x%04X, not the short wait: edge-aware admission disabled",
+                 readback);
+      }
     }
   }
 
@@ -670,6 +692,11 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
 }
 
 void NTPServer::set_short_int_wait(bool enable) {
+  // The policy the caller asked for, independent of whether the register write below actually
+  // succeeds -- load-bearing: without this, loop()'s deferred boot-enable would re-enable an
+  // A/B "off" block on its own 60 s later.
+  this->short_int_wait_policy_ = enable;
+
   const uint16_t driver_default =
       ethernet::w5500_driver_int_level() != 0 ? ethernet::w5500_driver_int_level() : W5500_INT_LEVEL_DEFAULT;
   const uint16_t target = enable ? W5500_INT_LEVEL_SHORT : driver_default;
@@ -679,12 +706,6 @@ void NTPServer::set_short_int_wait(bool enable) {
   const bool read_ok = write_ok && ethernet::w5500_read_int_level(&readback);
   this->last_int_level_readback_ = read_ok ? readback : 0;
 
-  if (enable) {
-    this->int_wait_deadman_.arm(millis(), INT_WAIT_DEADMAN_MS);
-  } else {
-    this->int_wait_deadman_.disarm();
-  }
-
   // Design A': reflects hardware state, not just "was asked for" -- false on disable, and on
   // any failed write or a read-back that does not match what was requested.
   this->short_wait_effective_ = enable && write_ok && read_ok && readback == target;
@@ -692,24 +713,25 @@ void NTPServer::set_short_int_wait(bool enable) {
     this->int_level_recheck_ms_ = millis() + INT_LEVEL_RECHECK_MS;
 
   if (!write_ok || !read_ok) {
-    if (!enable && !write_ok) {
-      // The switch's boot-time "off" runs before the W5500 exists; the driver's own init then
-      // writes its default anyway. Not a fault, so no warning on every boot.
-      ESP_LOGD(TAG, "W5500 short interrupt wait: off requested before the W5500 is ready");
+    if (!write_ok) {
+      // The switch's boot-time action can run before the W5500 exists -- with restore_mode
+      // ALWAYS_ON that is now true for "on" as well as "off". Not a fault, so no warning on
+      // every boot; the deferred boot-enable in loop() retries once the driver is ready.
+      ESP_LOGD(TAG, "W5500 short interrupt wait: %s requested before the W5500 is ready",
+               enable ? "on" : "off");
       return;
     }
     ESP_LOGW(TAG, "W5500 short interrupt wait: register access failed (write %s, read %s)",
              write_ok ? "ok" : "failed", read_ok ? "ok" : "failed");
     return;
   }
-  ESP_LOGI(TAG, "W5500 INTLEVEL set to 0x%04X (requested 0x%04X)%s", readback, target,
-           enable ? ", dead-man armed for 30 min" : "");
+  ESP_LOGI(TAG, "W5500 INTLEVEL set to 0x%04X (requested 0x%04X)", readback, target);
   if (readback != target)
     ESP_LOGW(TAG, "W5500 INTLEVEL read-back 0x%04X does not match requested 0x%04X", readback, target);
 }
 
 bool NTPServer::short_int_wait_active() const {
-  return this->int_wait_deadman_.armed() && this->last_int_level_readback_ == W5500_INT_LEVEL_SHORT;
+  return this->short_wait_effective_;
 }
 
 void NTPServer::set_post_write_t3(bool enable) {
@@ -915,12 +937,15 @@ void NTPServer::diag_serve_() {
       lines++;
     }
   } else if (strncmp(cmd, "INT", 3) == 0) {
-    // Design A: a fresh read-back (not the cached last_int_level_readback_, which only updates
-    // on a write) alongside the switch's own view of hardware state and the dead-man's
-    // remaining time, so a stale cache can never look identical to a live one here.
+    // Design A'': a fresh read-back (not the cached last_int_level_readback_, which only
+    // updates on a write) alongside the verified hardware state and seconds until the next
+    // scheduled INTLEVEL action (the deferred boot-enable or the steady-state re-check --
+    // whichever applies right now), so a stale cache can never look identical to a live one
+    // here.
     uint16_t readback = 0;
     ethernet::w5500_read_int_level(&readback);
-    const uint32_t remaining_s = this->int_wait_deadman_.remaining_ms(millis()) / 1000;
+    const int32_t remaining_ms = static_cast<int32_t>(this->int_level_recheck_ms_ - millis());
+    const uint32_t remaining_s = remaining_ms > 0 ? static_cast<uint32_t>(remaining_ms) / 1000 : 0;
     emit(line, snprintf(line, sizeof(line), "INT %04x %d %u\n", (unsigned) readback,
                         this->short_int_wait_active() ? 1 : 0, (unsigned) remaining_s));
     lines = 1;
