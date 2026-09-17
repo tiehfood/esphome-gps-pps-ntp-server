@@ -372,6 +372,22 @@ switch:
     turn_off_action:
       - lambda: 'id(${id_prefix}_ntp).set_post_write_t3(false);'
 
+  # Design E, pre-registered 2026-09-17 (see docs/superpowers/plans/2026-09-09-p4-ntp-probe.md):
+  # stamp T2 from the W5500's own INTn hardware edge instead of the burst-start SPI transaction.
+  # Phase 7 found a +10 us positive bias in served time and the INT Lead floor is 16 us -- a T2
+  # stamped that late biases the client offset by +8...+10.5 us, so this should remove most of
+  # it. Default OFF for the A/B; the decision rule for turning it on by default is in the plan.
+  - platform: template
+    name: "NTP INT Edge T2"
+    id: ${id_prefix}_ntp_int_edge_t2
+    entity_category: "diagnostic"
+    restore_mode: ALWAYS_OFF
+    lambda: 'return id(${id_prefix}_ntp).int_edge_t2_active();'
+    turn_on_action:
+      - lambda: 'id(${id_prefix}_ntp).set_int_edge_t2(true);'
+    turn_off_action:
+      - lambda: 'id(${id_prefix}_ntp).set_int_edge_t2(false);'
+
   - platform: template
     name: "${name} RGB LED"
     id: ${id_prefix}_rgb_led_switch

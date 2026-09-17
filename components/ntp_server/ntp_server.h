@@ -55,6 +55,22 @@ class NTPServer : public Component {
   /// verdict is re-evaluated per request, so flipping it takes effect immediately.
   void set_strict_rx_admission(bool enable) { this->strict_rx_admission_ = enable; }
 
+  /// Design E ("NTP INT Edge T2"): stamp T2 from the W5500's own INTn hardware edge instead of
+  /// the burst-start SPI transaction, when the edge is usable, its lead is a sane
+  /// 0 < lead_us < RX_EDGE_LEAD_STRICT_US, and it has not already been consumed for another
+  /// frame in the same read burst (see eth_input_hook_()'s dedup against
+  /// last_int_edge_seq_for_t2_). Default OFF for the pre-registered A/B; see
+  /// docs/superpowers/plans/2026-09-09-p4-ntp-probe.md. Read on the receive path
+  /// (eth_input_hook_(), the W5500 driver's own task), written only from the main task via this
+  /// setter -- same volatile-bool cross-task pattern as strict_rx_admission_ above, chosen for
+  /// the same reason: a single plain flag, evaluated fresh per frame, needs no stronger
+  /// synchronisation than that.
+  void set_int_edge_t2(bool enable) { this->int_edge_t2_ = enable; }
+  /// For the YAML switch's state lambda (mirrors short_int_wait_active()'s role for that
+  /// switch), so the UI reflects the policy actually in effect rather than assuming turn_on/
+  /// turn_off always succeeded.
+  bool int_edge_t2_active() const { return this->int_edge_t2_; }
+
   /// Design A'' ("W5500 Short Interrupt Wait"): shortens the chip's own INTLEVEL from the
   /// driver's boot default (0xFFFF, ~1.748 ms) to 0x0FFF (~109 us). On by default since
   /// 2026-09-13 (verified interleaved A/B: replies served late > 150 us 0.64 -> 0.19%, for
@@ -159,6 +175,12 @@ class NTPServer : public Component {
     /// condition as the T2 stamp above). -1 when not measured.
     int32_t rx_rsr{-1};
     int32_t frame_len{-1};
+    /// Design E ("NTP INT Edge T2"): true when this request's T2 (the `t` field above) was
+    /// taken from the INTn hardware edge rather than the burst-start SPI transaction. Set only
+    /// in eth_input_hook_(); recv_task_() copies it into DiagRecord::flags's DIAG_INT_EDGE_T2
+    /// bit and nowhere else -- it does not change how T2 is used, only where it diagnostically
+    /// says the value came from.
+    bool t2_from_edge{false};
   };
   /// Keyed on the client's transmit timestamp + source IP + source port; see hook_ring.h for why.
   HookRing<HookInfo, 8> hook_ring_;
@@ -241,6 +263,19 @@ class NTPServer : public Component {
   /// A/Bs; evaluated fresh per request, so flipping it takes effect immediately.
   volatile bool strict_rx_admission_{true};
 
+  /// Design E ("NTP INT Edge T2"), pre-registered 2026-09-17. Default OFF for the A/B; see
+  /// set_int_edge_t2() for the cross-task treatment.
+  volatile bool int_edge_t2_{false};
+  /// Dedup state for design E: the last INTn edge `seq` (w5500_int_stamp()) already consumed as
+  /// a T2 stamp. evaluate_rx_edge() has no sequence de-duplication of its own -- two frames in
+  /// one driver read burst would otherwise both see the same edge, back-dating the second
+  /// frame's T2 by the inter-frame gap (the exact failure mode that shelved this feature in
+  /// 2026-09-04). Written and read ONLY inside eth_input_hook_(), which the W5500 driver calls
+  /// once per frame, sequentially, from its own single task -- so this needs no volatile/atomic,
+  /// unlike the cross-task flags above. 0 means "never consumed" and is never a real seq (a real
+  /// edge's seq is nonzero, same convention as HookInfo::capture_armed).
+  uint32_t last_int_edge_seq_for_t2_{0};
+
   /// Reasons a request can be refused, recorded in DiagRecord::refuse_reason and the REQ dump.
   static constexpr uint8_t REFUSE_NONE = 0;
   static constexpr uint8_t REFUSE_OLD_EDGE = 1;
@@ -254,7 +289,10 @@ class NTPServer : public Component {
   struct DiagRecord {
     int64_t t2_us;          ///< esp_timer at T2 (hook stamp; at lookup time if the hook missed)
     uint8_t client_tx[8];   ///< the client's transmit field
-    uint8_t flags;          ///< DIAG_* bits
+    /// DIAG_* bits. Widened from uint8_t to uint16_t 2026-09-17 (design E): the 8 bits below
+    /// were all already assigned, so DIAG_INT_EDGE_T2 needed a 9th. The REQ dump's `%x` format
+    /// is unaffected -- it already prints however many hex digits the value needs.
+    uint16_t flags;
     int32_t int_lead_us;
     int32_t rx_gap_us;
     int32_t hook_latency_us;
@@ -287,14 +325,18 @@ class NTPServer : public Component {
     /// measured (e.g. refused requests, which never reach build_ntp_response_()).
     int32_t t3_calc_to_t0_us;
   };
-  static constexpr uint8_t DIAG_HOOK_HIT = 0x01;
-  static constexpr uint8_t DIAG_RX_STALLED = 0x02;
-  static constexpr uint8_t DIAG_REFUSED = 0x04;
-  static constexpr uint8_t DIAG_RESEEDED = 0x08;
-  static constexpr uint8_t DIAG_SEND_LONG = 0x10;
-  static constexpr uint8_t DIAG_FALLBACK = 0x20;
-  static constexpr uint8_t DIAG_ARP_MISS = 0x40;
-  static constexpr uint8_t DIAG_SEND_NOT_NTP = 0x80;
+  static constexpr uint16_t DIAG_HOOK_HIT = 0x01;
+  static constexpr uint16_t DIAG_RX_STALLED = 0x02;
+  static constexpr uint16_t DIAG_REFUSED = 0x04;
+  static constexpr uint16_t DIAG_RESEEDED = 0x08;
+  static constexpr uint16_t DIAG_SEND_LONG = 0x10;
+  static constexpr uint16_t DIAG_FALLBACK = 0x20;
+  static constexpr uint16_t DIAG_ARP_MISS = 0x40;
+  static constexpr uint16_t DIAG_SEND_NOT_NTP = 0x80;
+  /// Design E ("NTP INT Edge T2"): this reply's T2 came from the INTn hardware edge rather than
+  /// the burst-start SPI transaction (HookInfo::t2_from_edge). The 8 bits above were all taken,
+  /// hence the field's uint8_t -> uint16_t widening above.
+  static constexpr uint16_t DIAG_INT_EDGE_T2 = 0x100;
   /// 1024 records: 4.3 min at a 4 Hz client, so a whole test run joins without a mid-run dump
   /// (a dump is itself outbound traffic).
   static constexpr uint16_t DIAG_RING_SIZE = 1024;

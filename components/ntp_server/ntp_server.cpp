@@ -380,6 +380,8 @@ void NTPServer::recv_task_(void *param) {
       diag.t2_us = hook_hit ? hook.t : esp_timer_get_time();
       memcpy(diag.client_tx, &buffer[40], sizeof(diag.client_tx));
       diag.flags = hook_hit ? DIAG_HOOK_HIT : 0;
+      if (hook_hit && hook.t2_from_edge)
+        diag.flags |= DIAG_INT_EDGE_T2;
       diag.int_lead_us = hook_hit ? hook.int_lead_us : -1;
       diag.rx_gap_us = hook_hit ? hook.rx_gap_us : -1;
       diag.hook_latency_us = hook_latency_us;
@@ -669,6 +671,27 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
               t2 = t - gap;
               self->rx_stamp_gap_win_.add(gap);
               info.rx_gap_us = gap;
+            }
+          }
+
+          // Design E ("NTP INT Edge T2"), pre-registered 2026-09-17: prefer the INTn hardware
+          // edge over whatever t2 is at this point (raw hook stamp or burst-start-refined).
+          // Reconstructed the same wrap-safe way as the gap refinement just above -- directly
+          // from `t` (this call's own 64-bit reading), never from the burst-start value -- so it
+          // applies regardless of whether that refinement above fired. Guarded on:
+          //   - edge_usable and a sane, tight lead (reuses RX_EDGE_LEAD_STRICT_US, the strict
+          //     admission threshold -- not a new magic number);
+          //   - the edge not already spent on an earlier frame in this same read burst
+          //     (last_int_edge_seq_for_t2_ -- see its declaration for why this is mandatory).
+          // last_int_edge_seq_for_t2_ is touched only here, only on the W5500 driver's own task,
+          // once per frame, sequentially -- no synchronisation needed.
+          if (self->int_edge_t2_ && edge_eval.edge_usable && edge_eval.lead_us > 0 &&
+              edge_eval.lead_us < RX_EDGE_LEAD_STRICT_US && ist.seq != self->last_int_edge_seq_for_t2_) {
+            int32_t edge_gap = static_cast<int32_t>(static_cast<uint32_t>(t) - ist.edge_us);
+            if (edge_gap > 0 && edge_gap < RX_STALL_EDGE_MAX_AGE_US) {
+              t2 = t - edge_gap;
+              self->last_int_edge_seq_for_t2_ = ist.seq;
+              info.t2_from_edge = true;
             }
           }
           info.t = t2;
