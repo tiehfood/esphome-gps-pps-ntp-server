@@ -372,16 +372,17 @@ switch:
     turn_off_action:
       - lambda: 'id(${id_prefix}_ntp).set_post_write_t3(false);'
 
-  # Design E, pre-registered 2026-09-17 (see docs/superpowers/plans/2026-09-09-p4-ntp-probe.md):
-  # stamp T2 from the W5500's own INTn hardware edge instead of the burst-start SPI transaction.
-  # Phase 7 found a +10 us positive bias in served time and the INT Lead floor is 16 us -- a T2
-  # stamped that late biases the client offset by +8...+10.5 us, so this should remove most of
-  # it. Default OFF for the A/B; the decision rule for turning it on by default is in the plan.
+  # Design E (see docs/superpowers/plans/2026-09-09-p4-ntp-probe.md): stamp T2 from the W5500's own
+  # INTn hardware edge instead of the burst-start SPI transaction, which is a measured 4-18 us
+  # (median 13) later. A T2 stamped L late biases the client-visible offset by +L/2, so this
+  # removes ~6.5 us of the +10 us positive bias Phase 7 measured against GPS.
+  # ON by default since 2026-09-18: 100 % of served requests corrected, two interleaved Pi A/Bs at
+  # -7.23 and -7.00 us vs a -6.5 us prediction, and a clean 23 h soak. Kept switchable for A/Bs.
   - platform: template
     name: "NTP INT Edge T2"
     id: ${id_prefix}_ntp_int_edge_t2
     entity_category: "diagnostic"
-    restore_mode: ALWAYS_OFF
+    restore_mode: ALWAYS_ON
     lambda: 'return id(${id_prefix}_ntp).int_edge_t2_active();'
     turn_on_action:
       - lambda: 'id(${id_prefix}_ntp).set_int_edge_t2(true);'

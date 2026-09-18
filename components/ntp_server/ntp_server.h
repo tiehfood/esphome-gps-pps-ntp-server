@@ -263,9 +263,17 @@ class NTPServer : public Component {
   /// A/Bs; evaluated fresh per request, so flipping it takes effect immediately.
   volatile bool strict_rx_admission_{true};
 
-  /// Design E ("NTP INT Edge T2"), pre-registered 2026-09-17. Default OFF for the A/B; see
-  /// set_int_edge_t2() for the cross-task treatment.
-  volatile bool int_edge_t2_{false};
+  /// Design E ("NTP INT Edge T2"), pre-registered 2026-09-17, **ON by default since 2026-09-18**.
+  /// Stamps T2 from the W5500's own INTn edge rather than the burst-start SPI transaction, which
+  /// is a measured 4-18 us (median 13) later -- worth ~6.5 us of client-visible offset, since a
+  /// T2 stamped L late biases the offset by +L/2. Verification: E1 100 % of served requests
+  /// corrected; two interleaved Pi A/Bs at -7.23 and -7.00 us against a -6.5 us prediction made
+  /// before the code existed; 23 h soak clean (refusals 12.3/h, hook latency max 6.4 ms, no
+  /// reboot). The accuracy gain itself could NOT be verified end-to-end -- that needed the P4
+  /// probe, which was repurposed on 2026-09-17 -- so it rests on those two agreeing measurements
+  /// plus the physics: the INTn edge provably precedes our stamp. See set_int_edge_t2() for the
+  /// cross-task treatment.
+  volatile bool int_edge_t2_{true};
   /// Dedup state for design E: the last INTn edge `seq` (w5500_int_stamp()) already consumed as
   /// a T2 stamp. evaluate_rx_edge() has no sequence de-duplication of its own -- two frames in
   /// one driver read burst would otherwise both see the same edge, back-dating the second
