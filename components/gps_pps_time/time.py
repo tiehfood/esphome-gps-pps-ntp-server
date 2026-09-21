@@ -19,6 +19,7 @@ CONF_GLONASS_SATELLITES = "glonass_satellites"
 CONF_GALILEO_SATELLITES = "galileo_satellites"
 CONF_CRASH_INFO = "crash_info"
 CONF_NMEA_CLOCK_DELTA = "nmea_clock_delta"
+CONF_ANCHOR_PRED_ERROR = "anchor_pred_error"
 
 DEPENDENCIES = ["gps"]
 AUTO_LOAD = ["sensor", "text_sensor"]
@@ -83,6 +84,16 @@ CONFIG_SCHEMA = time_.TIME_SCHEMA.extend(
         cv.Optional(CONF_CRASH_INFO): text_sensor.text_sensor_schema(
             icon="mdi:alert-circle-outline",
         ),
+        # Design K diagnostic (docs/superpowers/plans/2026-09-09-p4-ntp-probe.md): the
+        # previous PPS anchor's prediction error at the next edge, i.e. the served-time error
+        # accumulated between two edges. Diagnostic only -- never fed back into the correction
+        # loop or the anchor itself.
+        cv.Optional(CONF_ANCHOR_PRED_ERROR): sensor.sensor_schema(
+            unit_of_measurement="µs",
+            icon="mdi:target-variant",
+            accuracy_decimals=1,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
     }
 ).extend(cv.polling_component_schema("60s"))
 
@@ -137,3 +148,7 @@ async def to_code(config):
     if nmea_delta_config := config.get(CONF_NMEA_CLOCK_DELTA):
         sens = await sensor.new_sensor(nmea_delta_config)
         cg.add(var.set_nmea_clock_delta_sensor(sens))
+
+    if anchor_pred_error_config := config.get(CONF_ANCHOR_PRED_ERROR):
+        sens = await sensor.new_sensor(anchor_pred_error_config)
+        cg.add(var.set_anchor_pred_error_sensor(sens))

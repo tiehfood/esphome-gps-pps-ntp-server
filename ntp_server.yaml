@@ -53,6 +53,15 @@ time:
       unit_of_measurement: "µs"
       accuracy_decimals: 0
       state_class: measurement
+    # Design K diagnostic (docs/superpowers/plans/2026-09-09-p4-ntp-probe.md): diagnostic only.
+    anchor_pred_error:
+      id: ntp_anchor_pred_error
+      name: "NTP Anchor Prediction Error"
+      icon: "mdi:target-variant"
+      unit_of_measurement: "µs"
+      accuracy_decimals: 1
+      state_class: measurement
+      entity_category: "diagnostic"
     gps_time:
       id: gps_current_time
       name: "GPS Time"

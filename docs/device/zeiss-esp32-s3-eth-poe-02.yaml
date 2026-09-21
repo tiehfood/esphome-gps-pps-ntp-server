@@ -139,6 +139,17 @@ time:
       unit_of_measurement: "µs"
       accuracy_decimals: 0
       state_class: measurement
+    # Design K diagnostic (docs/superpowers/plans/2026-09-09-p4-ntp-probe.md): the previous
+    # PPS anchor's prediction error evaluated at the next edge -- measures whether the
+    # server's own anchor math is the source of the residual GPS offset. Diagnostic only.
+    anchor_pred_error:
+      id: ${id_prefix}_anchor_pred_error
+      name: "NTP Anchor Prediction Error"
+      icon: "mdi:target-variant"
+      unit_of_measurement: "µs"
+      accuracy_decimals: 1
+      state_class: measurement
+      entity_category: "diagnostic"
     gps_satellites:
       id: ${id_prefix}_gps_sat_count
       name: "GPS Satellites"

@@ -416,6 +416,45 @@ void GPSPPSTime::apply_pps_correction_() {
       // as a rate -- roughly half the true crystal error (see .claude/CLAUDE.md).
       rate_ppb = static_cast<int32_t>(this->drift_mean_x256_ / 256) * 1000;
     }
+
+    // ---- Design K diagnostic: previous anchor's prediction error at THIS edge ----
+    // (docs/superpowers/plans/2026-09-09-p4-ntp-probe.md, "Design K"). Comparing an anchor
+    // against the edge it was published at is meaningless -- anchor_epoch_us_() returns
+    // exactly `epoch` there by construction -- so instead evaluate the anchor about to be
+    // REPLACED below at THIS edge's instant, and compare it against this edge's known-exact
+    // second. Read the still-current (soon to be previous) anchor before publish_pps_anchor_()
+    // overwrites it. Diagnostic only: this reads the anchor but writes nothing the correction
+    // loop or anchor_epoch_us_() ever consults.
+    {
+      GPSPPSTime::PpsAnchor prev;
+      const bool prev_valid = this->get_pps_anchor(prev);
+      if (prev_valid && !this->anchor_pred_error_skip_next_) {
+        // Same wraparound-safe uint32 subtraction anchor_epoch_us_() uses -- correct across
+        // the 71.6 min micros() wrap for the ~1 s span expected here.
+        const uint32_t elapsed = pps_micros - prev.micros;
+        // Only meaningful across a genuine single, undisturbed second: a missed pulse
+        // (extra_epochs > 0 above) or a hard-sync branch cycle (which does not publish a new
+        // anchor, so `prev` would be one or more edges further back than expected) both leave
+        // `elapsed` off by whole seconds. +/-100ms comfortably clears normal ppm-level jitter
+        // while rejecting any such multi-second gap.
+        if (elapsed > 900000u && elapsed < 1100000u) {
+          // PINNED to NTPServer::anchor_epoch_us_() (components/ntp_server/ntp_server.cpp) --
+          // duplicated, not called: gps_pps_time cannot depend on ntp_server (the dependency
+          // runs the other way), and reusing it would mean editing the live serving function
+          // for a diagnostic. Any change to that function's arithmetic must be mirrored here.
+          int64_t corrected = static_cast<int64_t>(elapsed);
+          if (prev.drift_ppb > -100000 && prev.drift_ppb < 100000)
+            corrected -= (static_cast<int64_t>(elapsed) * prev.drift_ppb) / 1000000000LL;
+          const int64_t predicted_us = static_cast<int64_t>(prev.epoch) * 1000000LL + corrected;
+          const int64_t actual_us = static_cast<int64_t>(corrected_epoch) * 1000000LL;
+          // Positive means the previous anchor would have served time ahead of GPS.
+          this->anchor_pred_error_us_ = static_cast<float>(predicted_us - actual_us);
+          this->anchor_pred_error_valid_ = true;
+        }
+      }
+      this->anchor_pred_error_skip_next_ = false;
+    }
+
     this->publish_pps_anchor_(corrected_epoch, pps_micros, rate_ppb);
 #else
     // Platforms without adjtime(): always correct, protect EMA from spikes
@@ -518,6 +557,10 @@ void GPSPPSTime::on_update(TinyGPSPlus &tiny_gps) {
 #endif
         ESP_LOGW(TAG, "Epoch corrected by %+d s from NMEA", -epoch_err_s);
         this->epoch_error_streak_ = 0;
+        // Design K diagnostic: this steps last_gps_epoch_/the wall clock outside the normal
+        // one-edge-per-second cadence apply_pps_correction_() expects. Skip the next
+        // anchor_pred_error_us_ sample rather than report a fake ~epoch_err_s second glitch.
+        this->anchor_pred_error_skip_next_ = true;
       }
     }
   }
@@ -609,6 +652,12 @@ void GPSPPSTime::update() {
     // Raw PPS drift: unfiltered measurement at each PPS edge.
     // Shows ISR contention and measurement anomalies for diagnostics.
     this->pps_drift_sensor_->publish_state(static_cast<float>(this->last_drift_us_));
+  }
+  if (this->anchor_pred_error_sensor_ != nullptr && this->anchor_pred_error_valid_) {
+    // Design K diagnostic: see set_anchor_pred_error_sensor(). Not gated on pps_synced_ like
+    // the sensors above -- anchor_pred_error_valid_ already implies a normal-branch anchor
+    // was published, which cannot happen unless synced.
+    this->anchor_pred_error_sensor_->publish_state(this->anchor_pred_error_us_);
   }
 
   if (this->pps_synced_) {

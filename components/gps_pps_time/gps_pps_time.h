@@ -24,6 +24,13 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   void set_galileo_satellites_sensor(sensor::Sensor *sensor) { this->galileo_satellites_sensor_ = sensor; }
   void set_crash_info_sensor(text_sensor::TextSensor *sensor) { this->crash_info_sensor_ = sensor; }
   void set_nmea_clock_delta_sensor(sensor::Sensor *sensor) { this->nmea_clock_delta_sensor_ = sensor; }
+  /// Design K diagnostic (docs/superpowers/plans/2026-09-09-p4-ntp-probe.md): how far the
+  /// PREVIOUS anchor's prediction would have been from the actual GPS second at THIS edge --
+  /// i.e. the served-time error that accumulates BETWEEN two PPS edges, not at the edge
+  /// itself (where NTPServer::anchor_epoch_us_() is exact by construction). Positive means
+  /// the server would have served time ahead of GPS. Diagnostic only: computed in
+  /// apply_pps_correction_(), never read by the correction loop or fed back into the anchor.
+  void set_anchor_pred_error_sensor(sensor::Sensor *sensor) { this->anchor_pred_error_sensor_ = sensor; }
 
   void setup() override;
   void loop() override;
@@ -90,6 +97,7 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   sensor::Sensor *galileo_satellites_sensor_{nullptr};
   text_sensor::TextSensor *crash_info_sensor_{nullptr};
   sensor::Sensor *nmea_clock_delta_sensor_{nullptr};
+  sensor::Sensor *anchor_pred_error_sensor_{nullptr};
 
   /// System clock minus the NMEA epoch, ms. NMEA carries absolute time and always
   /// arrives a sub-second delay AFTER the edge it describes, so a correct clock puts
@@ -199,6 +207,23 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   uint32_t prev_pps_micros_{0};
   /// Running mean of drift in fixed-point x256 for display centering (ESP-IDF)
   int64_t drift_mean_x256_{0};
+
+  /// Design K diagnostic: most recent previous-anchor-vs-new-edge prediction error (see
+  /// set_anchor_pred_error_sensor()), computed in apply_pps_correction_() and published in
+  /// update() alongside the other PPS sensors. The arithmetic is PINNED to
+  /// NTPServer::anchor_epoch_us_() (components/ntp_server/ntp_server.cpp) -- duplicated
+  /// rather than shared because gps_pps_time cannot depend on ntp_server (the dependency
+  /// runs the other way: ntp_server forward-declares GPSPPSTime) and because reusing it would
+  /// mean editing the live serving function for a diagnostic-only feature. Any change to that
+  /// function's arithmetic must be mirrored here.
+  float anchor_pred_error_us_{0};
+  bool anchor_pred_error_valid_{false};
+  /// Set when on_update()'s NMEA epoch-streak correction steps last_gps_epoch_ and the wall
+  /// clock between two PPS edges -- a deliberate counter correction, not a real prediction
+  /// failure. Consumed and cleared by the next apply_pps_correction_() normal-branch pass to
+  /// skip exactly one otherwise-fake multi-second sample. Diagnostic-only: never read outside
+  /// the anchor_pred_error_us_ computation.
+  bool anchor_pred_error_skip_next_{false};
   /// Millis timestamp of last processed PPS (for timeout detection).
   /// volatile: read cross-thread by NTPServer::recv_task_() via is_synchronized().
   volatile uint32_t last_pps_millis_{0};
