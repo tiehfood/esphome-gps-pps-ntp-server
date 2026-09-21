@@ -99,6 +99,24 @@ static const uint32_t SHORT_INT_WAIT_BOOT_DELAY_MS = 60000;  // 60 seconds
 /// see int_level_still_short() in deadman.h. Also the retry interval for the deferred
 /// boot-enable above, while it has not yet succeeded.
 static const uint32_t INT_LEVEL_RECHECK_MS = 60000;  // 60 seconds
+
+/// Design G ("NTP T2 Frame Start"), pre-registered 2026-09-21: corrects T2 from "frame fully
+/// received" (design E's INTn edge, or the burst-start/gap-refined stamp if E is off) to "frame
+/// arrival began" -- the SFD, which is where the P4 probe's GPS-referenced T1/T4 are stamped.
+/// At 100 Mbps a bit takes 10 ns, so a byte takes 80 ns; the correction is
+/// (frame length + FCS) x 80 ns. Deliberately excludes the 8-byte preamble, which precedes the
+/// SFD and is not part of the frame's own on-wire duration.
+static const uint32_t FRAME_START_NS_PER_BYTE = 80;
+/// esp_eth's W5500 MAC driver never includes the 4-byte FCS in the `length` it hands upward --
+/// verified against esp_eth_mac_w5500.c's own runt-frame guard, which checks
+/// `copy_len >= ETH_MIN_PACKET_SIZE - ETH_CRC_LEN`, i.e. the length it is comparing is already
+/// CRC-less. So the FCS must be added back here.
+static const uint32_t FRAME_START_FCS_BYTES = 4;
+/// Sanity ceiling on the correction itself, not just on `length`: a maximum-size 1522 B Ethernet
+/// frame is (1522 + 4) x 80 ns = ~122 us. Anything asking for more than this means `length` is
+/// corrupt (SPI glitch, truncated read, etc.) -- refuse rather than apply an implausible shift,
+/// the same philosophy as design E's edge-gap bounds.
+static const int32_t FRAME_START_MAX_CORRECTION_US = 130;
 #endif
 
 /// Encodes an NTPTimestamp into the 8-byte big-endian wire format used for every timestamp
@@ -382,6 +400,8 @@ void NTPServer::recv_task_(void *param) {
       diag.flags = hook_hit ? DIAG_HOOK_HIT : 0;
       if (hook_hit && hook.t2_from_edge)
         diag.flags |= DIAG_INT_EDGE_T2;
+      if (hook_hit && hook.t2_from_frame_start)
+        diag.flags |= DIAG_T2_FRAME_START;
       diag.int_lead_us = hook_hit ? hook.int_lead_us : -1;
       diag.rx_gap_us = hook_hit ? hook.rx_gap_us : -1;
       diag.hook_latency_us = hook_latency_us;
@@ -693,6 +713,42 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
               self->last_int_edge_seq_for_t2_ = ist.seq;
               info.t2_from_edge = true;
             }
+          }
+
+          // Design G ("NTP T2 Frame Start"), pre-registered 2026-09-21: applied AFTER design E,
+          // never before. Design E's edge is the closest we have to "frame fully received"; only
+          // once t2 sits there does subtracting the frame's own on-wire duration land on "frame
+          // started" (the SFD). Subtracting from an earlier, jitterier stamp instead (burst-start
+          // or the raw hook stamp) would still be directionally correct -- the duration is a
+          // property of the frame, not of which stamp we started from -- but would double up part
+          // of the same gap the INTn edge already accounts for whenever the edge substitution
+          // above did NOT fire. There is no such double-count here because this always runs last.
+          //
+          // Composability: independent of int_edge_t2_. If design E is off (or did not apply to
+          // this frame), this still subtracts the duration from whatever t2 currently is -- still
+          // correct, since it is only ever a property of the frame's length, not of the specific
+          // point t2 already marks (as long as that point means "frame received", which every
+          // path above guarantees).
+          //
+          // `length` is this frame's Ethernet-header-through-payload size as delivered by esp_eth
+          // (see FRAME_START_FCS_BYTES above for why the FCS is added back); already bounds-checked
+          // sane on the low end by the `length >= ntp_offset + NTP_PACKET_SIZE` gate above this
+          // whole block. The duration bound below is the only guard needed on the high end: it is
+          // stricter than any plausible `length` ever reached by a legitimate Ethernet frame.
+          if (self->t2_frame_start_) {
+            uint32_t duration_ns = (length + FRAME_START_FCS_BYTES) * FRAME_START_NS_PER_BYTE;
+            // Single division at the end, not accumulated per byte -- ns per byte (80) is a
+            // sub-microsecond quantity, so dividing early and re-multiplying would lose precision
+            // repeatedly. Truncates toward zero; T2 already lives at 1us native resolution
+            // (esp_timer_get_time()), so this loses at most the same sub-us slop every other
+            // integer-microsecond quantity in this function already carries.
+            int32_t duration_us = static_cast<int32_t>(duration_ns / 1000u);
+            if (duration_us > 0 && duration_us <= FRAME_START_MAX_CORRECTION_US) {
+              t2 -= duration_us;
+              info.t2_from_frame_start = true;
+            }
+            // Else: length must be corrupt for a real Ethernet frame this size -- fall back by
+            // doing nothing, leaving t2 exactly where design E (or the stamps before it) left it.
           }
           info.t = t2;
           // Raw copies, network byte order, straight off the wire -- these must compare equal

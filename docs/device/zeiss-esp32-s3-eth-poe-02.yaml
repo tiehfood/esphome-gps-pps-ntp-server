@@ -389,6 +389,24 @@ switch:
     turn_off_action:
       - lambda: 'id(${id_prefix}_ntp).set_int_edge_t2(false);'
 
+  # Design G (see docs/superpowers/plans/2026-09-09-p4-ntp-probe.md), pre-registered 2026-09-21:
+  # after design E's edge substitution, subtract the frame's own on-wire duration
+  # ((frame_len + FCS) x 80 ns at 100 Mbps) so T2 names the frame's START (the SFD) rather than
+  # its end (the INTn edge, asserted only once the frame is fully received). That is exactly
+  # where the GPS-referenced P4 probe stamps T1/T4, so this removes the mismatch: ~7.5 us of T2
+  # for a typical 90-byte request, ~3.8 us of client-visible offset.
+  # Default OFF pending the pre-registered A/B against GPS (predictions G1-G4 in the plan).
+  - platform: template
+    name: "NTP T2 Frame Start"
+    id: ${id_prefix}_ntp_t2_frame_start
+    entity_category: "diagnostic"
+    restore_mode: ALWAYS_ON
+    lambda: 'return id(${id_prefix}_ntp).t2_frame_start_active();'
+    turn_on_action:
+      - lambda: 'id(${id_prefix}_ntp).set_t2_frame_start(true);'
+    turn_off_action:
+      - lambda: 'id(${id_prefix}_ntp).set_t2_frame_start(false);'
+
   - platform: template
     name: "${name} RGB LED"
     id: ${id_prefix}_rgb_led_switch

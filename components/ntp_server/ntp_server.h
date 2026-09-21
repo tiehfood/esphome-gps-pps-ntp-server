@@ -71,6 +71,20 @@ class NTPServer : public Component {
   /// turn_off always succeeded.
   bool int_edge_t2_active() const { return this->int_edge_t2_; }
 
+  /// Design G ("NTP T2 Frame Start"), pre-registered 2026-09-21: after T2 is settled (whatever
+  /// design E left it at -- the INTn edge if enabled and usable, otherwise the burst-start/
+  /// gap-refined hook stamp), subtract the frame's own on-wire duration so T2 names the frame's
+  /// FIRST bit (the SFD) instead of its last. That matches where the GPS-referenced P4 probe
+  /// stamps T1/T4, removing a ~+3.8 us client-visible bias for a typical 90-byte request. Default
+  /// OFF for the pre-registered A/B; see docs/superpowers/plans/2026-09-09-p4-ntp-probe.md.
+  /// Composes with design E rather than replacing it -- see eth_input_hook_() for why the order
+  /// (edge substitution first, duration subtraction second) is the physically correct one. Same
+  /// cross-task volatile-bool pattern as int_edge_t2_ above: read on the receive path
+  /// (eth_input_hook_(), the W5500 driver's own task), written only from the main task here.
+  void set_t2_frame_start(bool enable) { this->t2_frame_start_ = enable; }
+  /// For the YAML switch's state lambda.
+  bool t2_frame_start_active() const { return this->t2_frame_start_; }
+
   /// Design A'' ("W5500 Short Interrupt Wait"): shortens the chip's own INTLEVEL from the
   /// driver's boot default (0xFFFF, ~1.748 ms) to 0x0FFF (~109 us). On by default since
   /// 2026-09-13 (verified interleaved A/B: replies served late > 150 us 0.64 -> 0.19%, for
@@ -181,6 +195,11 @@ class NTPServer : public Component {
     /// bit and nowhere else -- it does not change how T2 is used, only where it diagnostically
     /// says the value came from.
     bool t2_from_edge{false};
+    /// Design G ("NTP T2 Frame Start"): true when this request's T2 (the `t` field above) was
+    /// further shifted from "frame received" to "frame started" by subtracting the frame's
+    /// on-wire duration. Set only in eth_input_hook_(); recv_task_() copies it into
+    /// DiagRecord::flags's DIAG_T2_FRAME_START bit and nowhere else.
+    bool t2_from_frame_start{false};
   };
   /// Keyed on the client's transmit timestamp + source IP + source port; see hook_ring.h for why.
   HookRing<HookInfo, 8> hook_ring_;
@@ -274,6 +293,14 @@ class NTPServer : public Component {
   /// plus the physics: the INTn edge provably precedes our stamp. See set_int_edge_t2() for the
   /// cross-task treatment.
   volatile bool int_edge_t2_{true};
+
+  /// Design G ("NTP T2 Frame Start"), **ON by default since 2026-09-21**. Subtracts
+  /// (frame_len + FCS) x 80 ns/byte from T2 -- see set_t2_frame_start() and eth_input_hook_() for
+  /// the rationale and guard bounds. Verified by a GPS-referenced interleaved A/B: ON +3.67 us vs
+  /// OFF +6.27 us, difference **-2.60 us** against a -3.8 +/- 2 us prediction committed before the
+  /// code existed; the OFF arm reproduced that day's independent baseline (+8.16 us over 3 runs).
+  /// Every block 100 % clean. Composes with design E; both are needed for the full correction.
+  volatile bool t2_frame_start_{true};
   /// Dedup state for design E: the last INTn edge `seq` (w5500_int_stamp()) already consumed as
   /// a T2 stamp. evaluate_rx_edge() has no sequence de-duplication of its own -- two frames in
   /// one driver read burst would otherwise both see the same edge, back-dating the second
@@ -345,6 +372,9 @@ class NTPServer : public Component {
   /// the burst-start SPI transaction (HookInfo::t2_from_edge). The 8 bits above were all taken,
   /// hence the field's uint8_t -> uint16_t widening above.
   static constexpr uint16_t DIAG_INT_EDGE_T2 = 0x100;
+  /// Design G ("NTP T2 Frame Start"): this reply's T2 was further shifted to the frame's start
+  /// by subtracting its on-wire duration (HookInfo::t2_from_frame_start).
+  static constexpr uint16_t DIAG_T2_FRAME_START = 0x200;
   /// 1024 records: 4.3 min at a 4 Hz client, so a whole test run joins without a mid-run dump
   /// (a dump is itself outbound traffic).
   static constexpr uint16_t DIAG_RING_SIZE = 1024;
