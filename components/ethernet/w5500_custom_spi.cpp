@@ -43,6 +43,11 @@ constexpr uint8_t W5500_CTRL_S0_RXBUF_READ = 0x18;
 constexpr uint16_t W5500_REG_SN_RX_RSR = 0x0026;
 constexpr uint16_t W5500_REG_SN_CR = 0x0001;
 constexpr uint8_t W5500_CMD_SEND = 0x20;
+// LOCAL DELTA: design H, "SEND->wire latency" (measurement only). Sn_IR is register 0x0002;
+// the driver's own completion poll in emac_w5500_transmit() (esp_eth_mac_w5500.c) reads it on
+// the same socket-0 register-read path as Sn_RX_RSR above, looking for the SEND_OK bit.
+constexpr uint16_t W5500_REG_SN_IR = 0x0002;
+constexpr uint8_t W5500_SN_IR_SEND_OK = 0x10;
 /// Socket 0 TX buffer (BSB=2) write: every transmitted frame is one write with this control byte.
 constexpr uint8_t W5500_CTRL_S0_TXBUF_WRITE = 0x14;
 /// SPI silence longer than this means the previous burst ended; intra-burst spacing is a
@@ -70,6 +75,10 @@ volatile uint32_t g_burst_start_us = 0;
 volatile uint32_t g_last_txn_us = 0;
 volatile uint32_t g_send_cmd_us = 0;
 volatile uint32_t g_send_cmd_seq = 0;
+/// Design H ("SEND->wire latency", measurement only): micros() at the first observed SEND_OK
+/// for g_send_cmd_seq, and which seq it belongs to -- see W5500SendStamp::sendok_us/sendok_seq.
+volatile uint32_t g_sendok_us = 0;
+volatile uint32_t g_sendok_seq = 0;
 /// Class of the frame most recently written to the socket 0 TX buffer -- kept up to date on
 /// EVERY write regardless of whether the recorder is enabled, so w5500_send_stamp() can always
 /// say what a SEND was actually for.
@@ -489,6 +498,21 @@ esp_err_t w5500_custom_spi_read(void *spi_ctx, uint32_t cmd, uint32_t addr, void
       }
     }
   }
+  // LOCAL DELTA: design H, "SEND->wire latency" (measurement only, no register writes). The
+  // driver's own completion poll (emac_w5500_transmit(), after Sn_CR = SEND) reads Sn_IR
+  // looking for the SEND_OK bit; record the first such read that observes it set for the SEND
+  // currently in flight, so a consumer can derive Sn_CR=SEND -> SEND_OK entirely from stamps the
+  // driver already takes. Ordered cheapest-first (addr, then cmd, then the bit test) since this
+  // runs on every small register read. Guarded by g_sendok_seq != g_send_cmd_seq so only the
+  // FIRST observation per SEND is kept -- later reads (retries, or the RX task's own Sn_IR poll
+  // for RECV) would otherwise keep re-stamping the same already-observed transition.
+  if (ret == ESP_OK && addr == W5500_CTRL_S0_REG_READ && cmd == W5500_REG_SN_IR && len == 1) {
+    const uint8_t status = static_cast<const uint8_t *>(data)[0];
+    if ((status & W5500_SN_IR_SEND_OK) != 0 && g_sendok_seq != g_send_cmd_seq) {
+      g_sendok_us = micros();
+      g_sendok_seq = g_send_cmd_seq;
+    }
+  }
   // LOCAL DELTA: network recorder. A received frame's payload read starts at its Ethernet header.
   if (ret == ESP_OK && addr == W5500_CTRL_S0_RXBUF_READ && len > 4) {
     net_record_frame(false, static_cast<const uint8_t *>(data), len);
@@ -516,8 +540,9 @@ W5500RxStamps w5500_rx_stamps() {
 }
 
 W5500SendStamp w5500_send_stamp() {
-  return {g_send_cmd_us,       g_send_cmd_seq,       g_send_cmd_class,
-          g_send_txbuf_start_us, g_send_txbuf_end_us, g_patch_us, g_patched};
+  return {g_send_cmd_us,         g_send_cmd_seq,     g_send_cmd_class,   g_send_txbuf_start_us,
+          g_send_txbuf_end_us,   g_patch_us,         g_patched,          g_sendok_us,
+          g_sendok_seq};
 }
 
 W5500IntStamp w5500_int_stamp() { return {g_int_edge_us, g_int_edge_seq}; }

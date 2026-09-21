@@ -359,6 +359,14 @@ class NTPServer : public Component {
     /// earlier the estimate path's T3 read its clock than recv_task_()'s own t0. -1 when not
     /// measured (e.g. refused requests, which never reach build_ntp_response_()).
     int32_t t3_calc_to_t0_us;
+    /// Design H ("SEND->wire latency", measurement only): send_cmd_us - sendok_us for this
+    /// reply's own SEND (see w5500_send_stamp()), i.e. how long the W5500's own SEND_OK poll
+    /// took to observe completion after the Sn_CR = SEND write. -1 unless this SEND is provably
+    /// our own reply (send_class == NTP) AND its SEND_OK was actually observed
+    /// (after.sendok_seq == after.seq) -- a reply whose completion was never seen (driver's
+    /// retry cap fired, or a differently-shaped read pattern) must read as "not measured", not
+    /// as a plausible-looking zero.
+    int32_t sendok_interval_us;
   };
   static constexpr uint16_t DIAG_HOOK_HIT = 0x01;
   static constexpr uint16_t DIAG_RX_STALLED = 0x02;

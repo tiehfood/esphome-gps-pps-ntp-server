@@ -80,6 +80,16 @@ struct W5500SendStamp {
   /// still gate on frame_class == W5500_FC_NTP the same way they already do for T3 learning.
   uint32_t patch_us;
   uint8_t patched;
+  /// Design H ("SEND->wire latency", measurement only): micros() at the first SPI read of
+  /// socket 0's Sn_IR that observed the chip's own SEND_OK bit set for this SEND -- i.e. the
+  /// driver's own completion poll in emac_w5500_transmit(), read passively. sendok_seq is the
+  /// value of `seq` above at the moment that read happened; a caller must compare it against
+  /// this same W5500SendStamp's `seq` to know the SEND_OK provably belongs to THIS SEND rather
+  /// than being stale (never re-observed since an earlier one, e.g. the driver's own retry cap
+  /// fired and the frame never got a fresh SEND_OK before the next SEND was issued). sendok_us
+  /// is meaningless unless sendok_seq == seq.
+  uint32_t sendok_us;
+  uint32_t sendok_seq;
 };
 W5500SendStamp w5500_send_stamp();
 

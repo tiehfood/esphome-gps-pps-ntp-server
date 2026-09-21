@@ -420,6 +420,7 @@ void NTPServer::recv_task_(void *param) {
       diag.patch_to_send_us = -1;
       diag.patch_pred_us = -1;
       diag.t3_calc_to_t0_us = -1;
+      diag.sendok_interval_us = -1;
     }
 
     // ---- Admission: hook miss, or an INTn edge that is stale/missing (rx_admission.h) ----
@@ -548,6 +549,9 @@ void NTPServer::recv_task_(void *param) {
     int32_t actual_us = -1;
     bool send_not_ntp = false;
     int32_t patch_pred_used_us = -1;  // design B: the patch-delay estimate this reply's T3 used
+    // Design H ("SEND->wire latency", measurement only): -1 unless this SEND is provably our own
+    // reply AND its SEND_OK was actually observed (see W5500SendStamp::sendok_seq).
+    int32_t sendok_interval_us = -1;
     if (after.seq != before.seq) {
       if (after.frame_class == ethernet::W5500_FC_NTP) {
         // Time from t0 to the Sn_CR = SEND write -- NOT how long sendto() took to return, which
@@ -556,6 +560,8 @@ void NTPServer::recv_task_(void *param) {
         if (actual_us > 0 && actual_us < SendEstimator::US_MAX)
           self->t3_error_win_.add(actual_us - self->send_estimator_.estimate());
         learned = self->send_estimator_.learn(actual_us, t0);
+        if (after.sendok_seq == after.seq)
+          sendok_interval_us = static_cast<int32_t>(after.sendok_us - after.send_cmd_us);
         // Design B: learn the patch-callback-to-SEND delay from this SEND, but only when it was
         // actually patched -- an unpatched SEND (feature off, or this frame was not recognised
         // by plan_ntp_tx_patch()) says nothing about that interval.
@@ -580,6 +586,7 @@ void NTPServer::recv_task_(void *param) {
     if (diagnostics) {
       diag.send_us = actual_us;
       diag.sendto_us = dur;
+      diag.sendok_interval_us = sendok_interval_us;
       diag.send_class = (after.seq != before.seq) ? static_cast<int8_t>(after.frame_class) : -1;
       // TX-buffer-write split: only meaningful when this SEND is provably our own reply and
       // the SPI callback actually measured it (both 0 means the recorder was off for that write).
@@ -972,13 +979,15 @@ void NTPServer::diag_serve_() {
       char tx_hex[17];
       for (int b = 0; b < 8; b++)
         snprintf(tx_hex + 2 * b, 3, "%02x", rec.client_tx[b]);
-      emit(line, snprintf(line, sizeof(line), "R %lld %s %x %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
+      emit(line, snprintf(line, sizeof(line),
+                          "R %lld %s %x %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
                           (long long) rec.t2_us, tx_hex, (unsigned) rec.flags, (int) rec.int_lead_us,
                           (int) rec.rx_gap_us, (int) rec.hook_latency_us, (int) rec.send_us, (int) rec.sendto_us,
                           (int) rec.lock_wait_us, (int) rec.estimate_us, (int) rec.arp_wait_us,
                           (int) rec.refuse_reason, (int) rec.send_class, (int) rec.tx_write_start_us,
                           (int) rec.tx_write_end_us, (int) rec.rx_rsr, (int) rec.frame_len, (int) rec.patched,
-                          (int) rec.patch_to_send_us, (int) rec.patch_pred_us, (int) rec.t3_calc_to_t0_us));
+                          (int) rec.patch_to_send_us, (int) rec.patch_pred_us, (int) rec.t3_calc_to_t0_us,
+                          (int) rec.sendok_interval_us));
       lines++;
     }
   } else if (strncmp(cmd, "NET", 3) == 0) {
