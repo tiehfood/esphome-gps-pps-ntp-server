@@ -407,6 +407,26 @@ switch:
     turn_off_action:
       - lambda: 'id(${id_prefix}_ntp).set_t2_frame_start(false);'
 
+  # Design J (see docs/superpowers/plans/2026-09-09-p4-ntp-probe.md), pre-registered 2026-09-21:
+  # corrects both served timestamps by the W5500's own measured stamping latencies, from a
+  # GPS-referenced one-way-leg measurement (design I) validated size-independent across a 90-byte
+  # and a 500-byte request. T2 (already at the frame's start via design G) is corrected -17 us
+  # (W5500_RX_STAMP_LATE_US -- the chip asserts INTn this long after the frame's last bit really
+  # arrived); T3 is corrected +57 us (W5500_TX_STAMP_EARLY_US -- the reply's first bit leaves the
+  # wire this long after the Sn_CR = SEND write T3 is stamped from). Predicted net effect on the
+  # client-visible offset: +(57-17)/2 = +20 us.
+  # Default OFF pending the pre-registered A/B against GPS (predictions J1-J4 in the plan).
+  - platform: template
+    name: "NTP Chip Latency"
+    id: ${id_prefix}_ntp_chip_latency
+    entity_category: "diagnostic"
+    restore_mode: ALWAYS_ON
+    lambda: 'return id(${id_prefix}_ntp).chip_latency_active();'
+    turn_on_action:
+      - lambda: 'id(${id_prefix}_ntp).set_chip_latency(true);'
+    turn_off_action:
+      - lambda: 'id(${id_prefix}_ntp).set_chip_latency(false);'
+
   - platform: template
     name: "${name} RGB LED"
     id: ${id_prefix}_rgb_led_switch

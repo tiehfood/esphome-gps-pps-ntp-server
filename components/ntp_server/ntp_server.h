@@ -85,6 +85,22 @@ class NTPServer : public Component {
   /// For the YAML switch's state lambda.
   bool t2_frame_start_active() const { return this->t2_frame_start_; }
 
+  /// Design J ("NTP Chip Latency"), pre-registered 2026-09-21: corrects BOTH served timestamps
+  /// by the W5500's own measured stamping latencies -- W5500_RX_STAMP_LATE_US (T2 is late by
+  /// this much) and W5500_TX_STAMP_EARLY_US (T3 is early by this much), both defined in
+  /// ntp_server.cpp next to design J's block comment. These are GPS-referenced one-way-leg
+  /// measurements (design I), validated size-independent across 90 B and 500 B requests -- see
+  /// docs/superpowers/plans/2026-09-09-p4-ntp-probe.md. Default OFF for the pre-registered A/B.
+  /// One switch drives both corrections: T2 in eth_input_hook_() (the W5500 driver's own task),
+  /// T3 in both places a served T3 is produced -- the post-write patch's build_patch_t3_() (the
+  /// transmitting task, inside sendto()) and the estimate path's offset in build_ntp_response_()
+  /// (recv_task_()) -- so an A/B is meaningful regardless of whether post-write T3 patches a
+  /// given reply. Same cross-task volatile-bool pattern as int_edge_t2_/t2_frame_start_ above:
+  /// written only from the main task here.
+  void set_chip_latency(bool enable) { this->chip_latency_ = enable; }
+  /// For the YAML switch's state lambda.
+  bool chip_latency_active() const { return this->chip_latency_; }
+
   /// Design A'' ("W5500 Short Interrupt Wait"): shortens the chip's own INTLEVEL from the
   /// driver's boot default (0xFFFF, ~1.748 ms) to 0x0FFF (~109 us). On by default since
   /// 2026-09-13 (verified interleaved A/B: replies served late > 150 us 0.64 -> 0.19%, for
@@ -200,6 +216,11 @@ class NTPServer : public Component {
     /// on-wire duration. Set only in eth_input_hook_(); recv_task_() copies it into
     /// DiagRecord::flags's DIAG_T2_FRAME_START bit and nowhere else.
     bool t2_from_frame_start{false};
+    /// Design J ("NTP Chip Latency"): true when this request's T2 (the `t` field above) was
+    /// further corrected for the W5500's own measured RX-stamp latency
+    /// (W5500_RX_STAMP_LATE_US). Set only in eth_input_hook_(); recv_task_() copies it into
+    /// DiagRecord::flags's DIAG_CHIP_LATENCY_T2 bit and nowhere else.
+    bool t2_chip_latency{false};
   };
   /// Keyed on the client's transmit timestamp + source IP + source port; see hook_ring.h for why.
   HookRing<HookInfo, 8> hook_ring_;
@@ -301,6 +322,19 @@ class NTPServer : public Component {
   /// code existed; the OFF arm reproduced that day's independent baseline (+8.16 us over 3 runs).
   /// Every block 100 % clean. Composes with design E; both are needed for the full correction.
   volatile bool t2_frame_start_{true};
+
+  /// Design J ("NTP Chip Latency"), **ON by default since 2026-09-21**. Corrects both served
+  /// timestamps by the W5500's own stamping latencies, measured (not fitted) from GPS-referenced
+  /// one-way legs and validated size-independent across 90 B and 500 B requests: T2 is 17 µs late
+  /// (the chip signals reception after the frame ended), T3 is 57 µs early (the reply leaves the
+  /// wire after the SEND write it is stamped from). GPS-referenced A/B: ON +5.30 µs vs OFF
+  /// −14.64 µs, difference **+19.94 µs** against a +19.8 ± 4 µs prediction committed before the
+  /// run -- agreement to 0.14 µs, from constants measured on the probe side. The +5.30 µs that
+  /// remains is the S3's OWN clock error (it reports ≈ +6 µs), which this does not address;
+  /// landing at 0 would have meant something absorbed a term it should not have.
+  /// See set_chip_latency() and W5500_RX_STAMP_LATE_US / W5500_TX_STAMP_EARLY_US in ntp_server.cpp.
+  volatile bool chip_latency_{true};
+
   /// Dedup state for design E: the last INTn edge `seq` (w5500_int_stamp()) already consumed as
   /// a T2 stamp. evaluate_rx_edge() has no sequence de-duplication of its own -- two frames in
   /// one driver read burst would otherwise both see the same edge, back-dating the second
@@ -383,6 +417,12 @@ class NTPServer : public Component {
   /// Design G ("NTP T2 Frame Start"): this reply's T2 was further shifted to the frame's start
   /// by subtracting its on-wire duration (HookInfo::t2_from_frame_start).
   static constexpr uint16_t DIAG_T2_FRAME_START = 0x200;
+  /// Design J ("NTP Chip Latency"): this reply's T2 was further corrected for the W5500's own
+  /// measured RX-stamp latency (HookInfo::t2_chip_latency). The matching T3 correction
+  /// (W5500_TX_STAMP_EARLY_US) is applied by the very same switch to every served reply's T3 --
+  /// see set_chip_latency() -- so this bit alone identifies which arm of the design J A/B a
+  /// record belongs to.
+  static constexpr uint16_t DIAG_CHIP_LATENCY_T2 = 0x400;
   /// 1024 records: 4.3 min at a 4 Hz client, so a whole test run joins without a mid-run dump
   /// (a dump is itself outbound traffic).
   static constexpr uint16_t DIAG_RING_SIZE = 1024;

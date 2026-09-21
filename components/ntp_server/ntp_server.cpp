@@ -117,6 +117,21 @@ static const uint32_t FRAME_START_FCS_BYTES = 4;
 /// corrupt (SPI glitch, truncated read, etc.) -- refuse rather than apply an implausible shift,
 /// the same philosophy as design E's edge-gap bounds.
 static const int32_t FRAME_START_MAX_CORRECTION_US = 130;
+
+/// Design J ("NTP Chip Latency"), pre-registered 2026-09-21: corrects both served timestamps by
+/// the W5500's own measured stamping latencies. Measured on this hardware by a GPS-referenced
+/// one-way-leg method (design I, 2026-09-21) and validated size-independent across a 90-byte and
+/// a 500-byte request (17.53 vs 16.83 us, and 55.93 vs 57.54 us respectively) -- see
+/// docs/superpowers/plans/2026-09-09-p4-ntp-probe.md, "Design I -- RESULT". Values below are the
+/// mean of the two sizes, as design J's own pre-registration specifies.
+///
+/// The chip signals reception (asserts INTn) this long AFTER the frame's last bit actually
+/// arrived on the wire. T2 -- already moved to the frame's first bit by design G -- is still
+/// late by this amount.
+static const int32_t W5500_RX_STAMP_LATE_US = 17;
+/// The reply's first bit leaves the wire this long AFTER the Sn_CR = SEND write that T3 is
+/// stamped from. T3 is early by this amount.
+static const int32_t W5500_TX_STAMP_EARLY_US = 57;
 #endif
 
 /// Encodes an NTPTimestamp into the 8-byte big-endian wire format used for every timestamp
@@ -402,6 +417,8 @@ void NTPServer::recv_task_(void *param) {
         diag.flags |= DIAG_INT_EDGE_T2;
       if (hook_hit && hook.t2_from_frame_start)
         diag.flags |= DIAG_T2_FRAME_START;
+      if (hook_hit && hook.t2_chip_latency)
+        diag.flags |= DIAG_CHIP_LATENCY_T2;
       diag.int_lead_us = hook_hit ? hook.int_lead_us : -1;
       diag.rx_gap_us = hook_hit ? hook.rx_gap_us : -1;
       diag.hook_latency_us = hook_latency_us;
@@ -757,6 +774,21 @@ esp_err_t NTPServer::eth_input_hook_(esp_eth_handle_t eth_handle, uint8_t *buffe
             // Else: length must be corrupt for a real Ethernet frame this size -- fall back by
             // doing nothing, leaving t2 exactly where design E (or the stamps before it) left it.
           }
+
+          // Design J ("NTP Chip Latency"), pre-registered 2026-09-21: applied AFTER design G,
+          // for the same reason design G runs after design E -- each stamp in the chain corrects
+          // a distinct, physically ordered gap, and this one (the W5500's own RX-stamp latency,
+          // W5500_RX_STAMP_LATE_US) is a fixed hardware property of the chip itself, not of the
+          // frame's length or of which earlier stamp t2 currently holds. Unlike design G's
+          // duration correction, there is no additional validity guard beyond the switch itself:
+          // by this point t2 is unconditionally a legitimate "frame received" stamp (every path
+          // above already guarantees that, falling back rather than producing a bad value), so a
+          // constant correction against it is always sane.
+          if (self->chip_latency_) {
+            t2 -= W5500_RX_STAMP_LATE_US;
+            info.t2_chip_latency = true;
+          }
+
           info.t = t2;
           // Raw copies, network byte order, straight off the wire -- these must compare equal
           // to sockaddr_in::sin_addr/sin_port in recv_task_(), which are also network order, so
@@ -856,7 +888,14 @@ bool NTPServer::build_patch_t3_(uint32_t now_us, uint8_t t3_out[8]) {
   const int64_t esp_now_us = esp_timer_get_time();
   const int32_t elapsed_since_patch_us = static_cast<int32_t>(static_cast<uint32_t>(esp_now_us) - now_us);
   const int64_t patch_instant_us = esp_now_us - elapsed_since_patch_us;
-  const int64_t predicted_send_us = patch_instant_us + this->patch_delay_.estimate();
+  int64_t predicted_send_us = patch_instant_us + this->patch_delay_.estimate();
+  // Design J ("NTP Chip Latency"), pre-registered 2026-09-21: predicted_send_us above names the
+  // Sn_CR = SEND write; the reply's first bit actually leaves the wire W5500_TX_STAMP_EARLY_US
+  // later. This is the post-write patch's T3 -- the estimate path's T3 gets the identical
+  // correction in build_ntp_response_(), so every served reply is shifted by the same amount
+  // regardless of which path's T3 the patch ends up overwriting.
+  if (this->chip_latency_)
+    predicted_send_us += W5500_TX_STAMP_EARLY_US;
 
   const NTPTimestamp ts = this->hook_to_ntp_timestamp_(predicted_send_us);
   encode_ntp_timestamp_(ts, t3_out);
@@ -1233,8 +1272,15 @@ void NTPServer::build_ntp_response_(const uint8_t *request, uint8_t *response,
   // overwritten again in the TX buffer itself by the design-B post-write patch, closer still
   // to the instant the packet actually leaves -- see NTPServer::build_patch_t3_().
 #ifdef USE_ESP_IDF
+  int32_t t3_offset_us = this->send_estimator_.estimate();
+  // Design J ("NTP Chip Latency"), pre-registered 2026-09-21: the estimate path's T3 also names
+  // the (predicted) Sn_CR = SEND write; the reply's first bit actually leaves the wire
+  // W5500_TX_STAMP_EARLY_US later. Same correction, same switch, as build_patch_t3_() applies to
+  // the post-write patch's T3 -- see its comment for why both paths must agree.
+  if (this->chip_latency_)
+    t3_offset_us += W5500_TX_STAMP_EARLY_US;
   int64_t t3_clock_read_us = 0;
-  NTPTimestamp transmit_ts = this->get_ntp_timestamp_(this->send_estimator_.estimate(), &t3_clock_read_us);
+  NTPTimestamp transmit_ts = this->get_ntp_timestamp_(t3_offset_us, &t3_clock_read_us);
   // Design C ("T3-computation gap" diagnostic): recv_task_() reads this back against its own t0
   // right after this call returns.
   this->last_t3_clock_read_us_ = t3_clock_read_us;
