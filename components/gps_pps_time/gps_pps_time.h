@@ -116,10 +116,14 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   std::string crash_report_;
   bool crash_report_pending_{false};
 
-  /// TinyGPSCustom objects for per-constellation satellite counts (GSV sentences)
+  /// TinyGPSCustom objects for per-constellation satellite counts (GSV sentences).
+  /// Beidou has two valid NMEA talker IDs: "GB" (the u-blox default) and "BD"
+  /// (CFG-NMEA-BDSTALKERID = 1). Both are registered and whichever updates wins, so
+  /// the sensor works on a stock receiver without any reconfiguration.
   TinyGPSCustom *gp_gsv_sats_{nullptr};
   TinyGPSCustom *gl_gsv_sats_{nullptr};
   TinyGPSCustom *ga_gsv_sats_{nullptr};
+  TinyGPSCustom *gb_gsv_sats_{nullptr};
   TinyGPSCustom *bd_gsv_sats_{nullptr};
 
   /// Last per-constellation satellite counts

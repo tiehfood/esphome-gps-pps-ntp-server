@@ -224,7 +224,7 @@ void GPSPPSTime::apply_pps_correction_() {
   // Use both GGA (satellites in use) and GSV (satellites in view) counts — GGA may
   // not be parsed yet at boot while GSV is already reporting 20+ satellites.
   uint16_t gsv_total = this->last_gps_sat_count_ + this->last_glonass_sat_count_
-                       + this->last_galileo_sat_count_;
+                       + this->last_galileo_sat_count_ + this->last_beidou_sat_count_;
   if (this->last_satellite_count_ == 0 && gsv_total == 0) {
     if (this->pps_synced_) {
       // GPS fix lost while previously synced — treat same as epoch diverged so that
@@ -481,6 +481,8 @@ void GPSPPSTime::on_update(TinyGPSPlus &tiny_gps) {
     this->gp_gsv_sats_ = new TinyGPSCustom(tiny_gps, "GPGSV", 3);
     this->gl_gsv_sats_ = new TinyGPSCustom(tiny_gps, "GLGSV", 3);
     this->ga_gsv_sats_ = new TinyGPSCustom(tiny_gps, "GAGSV", 3);
+    // Beidou answers to either talker ID depending on CFG-NMEA-BDSTALKERID; register both.
+    this->gb_gsv_sats_ = new TinyGPSCustom(tiny_gps, "GBGSV", 3);
     this->bd_gsv_sats_ = new TinyGPSCustom(tiny_gps, "BDGSV", 3);
   }
 
@@ -495,7 +497,10 @@ void GPSPPSTime::on_update(TinyGPSPlus &tiny_gps) {
     this->last_glonass_sat_count_ = atoi(this->gl_gsv_sats_->value());
   if (this->ga_gsv_sats_->isUpdated())
     this->last_galileo_sat_count_ = atoi(this->ga_gsv_sats_->value());
-  if (this->bd_gsv_sats_->isUpdated())
+  // Beidou: take whichever talker ID this receiver actually emits.
+  if (this->gb_gsv_sats_->isUpdated())
+    this->last_beidou_sat_count_ = atoi(this->gb_gsv_sats_->value());
+  else if (this->bd_gsv_sats_->isUpdated())
     this->last_beidou_sat_count_ = atoi(this->bd_gsv_sats_->value());
 
   if (!tiny_gps.time.isValid() || !tiny_gps.date.isValid() ||
@@ -641,7 +646,10 @@ void GPSPPSTime::update() {
   if (this->galileo_satellites_sensor_ != nullptr && this->ga_gsv_sats_ != nullptr && this->ga_gsv_sats_->isValid()) {
     this->galileo_satellites_sensor_->publish_state(this->last_galileo_sat_count_);
   }
-  if (this->beidou_satellites_sensor_ != nullptr && this->bd_gsv_sats_ != nullptr && this->bd_gsv_sats_->isValid()) {
+  // Either Beidou talker ID counts as a valid source.
+  if (this->beidou_satellites_sensor_ != nullptr &&
+      ((this->gb_gsv_sats_ != nullptr && this->gb_gsv_sats_->isValid()) ||
+       (this->bd_gsv_sats_ != nullptr && this->bd_gsv_sats_->isValid()))) {
     this->beidou_satellites_sensor_->publish_state(this->last_beidou_sat_count_);
   }
 
