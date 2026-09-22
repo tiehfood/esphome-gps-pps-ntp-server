@@ -1,0 +1,272 @@
+####################################################################################
+# Production configuration -- the derived one.
+#
+# Every timestamping design that was A/B-tested is now a compiled-in default, so this
+# config declares no switches for them and gets the same behaviour as the research
+# config next to it:
+#
+#   post-write T3, strict RX admission, W5500 short interrupt wait (applied 60 s after
+#   boot), INT-edge T2, T2 frame start, chip-latency correction, PPS anchor serving,
+#   hardware rate term.
+#
+# What is deliberately NOT here, versus zeiss-esp32-s3-eth-poe-02.yaml:
+#   - the nine "NTP ..." A/B switches. Each one's setting is now the firmware default.
+#     Turning any of them OFF is a measurement action, not an operational one; use the
+#     research config for that.
+#   - the per-request instrumentation (hook latency, RX stamp gap, T3 prediction error,
+#     INT lead, ARP primes/waits, refused-stalled, W5500 command counters). These exist
+#     to debug the serving path and each one publishes every 10 s.
+#   - the "NTP Diagnostics" switch and its UDP 12301 dump port.
+#
+# What is kept, and why:
+#   - Clock Offset and PPS Drift: what the clock is actually doing.
+#   - NTP Anchor Prediction Error: the one self-check that needs no second device --
+#     it compares the previous PPS anchor's prediction against the next GPS edge, so it
+#     measures the server against GPS with no network involved. Expect it inside +/-2 us.
+#   - satellite counts, temperatures, heap, uptime, reset reason: ordinary device health.
+####################################################################################
+
+substitutions:
+  name: esp32-s3-eth-poe-02
+  friendly_name: "ESP32 Time"
+  id_prefix: "esp32_s3_02"
+
+preferences:
+  flash_write_interval: never
+
+ota:
+  - platform: esphome
+
+api:
+  reboot_timeout: 0s # do not reboot if hassio connection is lost.
+
+debug:
+  update_interval: 60s
+
+web_server:
+  port: 80
+  version: 3
+  local: True
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: False
+  on_boot:
+    # Trim the NMEA the module emits. ESPHome's gps component drains the whole UART
+    # buffer each loop and calls every listener once per COMPLETE SENTENCE, so sentence
+    # volume -- not byte rate -- is what costs main-loop time. With 25 satellites across
+    # four constellations the GSV burst dominated it (gps loop max 135 ms).
+    # Keep GGA and RMC every fix (time, date, fix quality, satellites-in-use); drop GLL,
+    # GSA and VTG entirely (unused); downrate GSV to every 30th fix, which still feeds
+    # the per-constellation satellite sensors.
+    # Re-applied on every boot deliberately: there is no V_BCKP battery, so the module
+    # loses this configuration on any power cycle.
+    priority: -100
+    then:
+      - delay: 3s
+      - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x01, 0x00, 0xFB, 0x11]
+      - delay: 120ms
+      - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x02, 0x00, 0xFC, 0x13]
+      - delay: 120ms
+      - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x05, 0x00, 0xFF, 0x19]
+      - delay: 120ms
+      - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x03, 0x1E, 0x1B, 0x33]
+      - delay: 120ms
+      - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x00, 0x01, 0xFB, 0x10]
+      - delay: 120ms
+      - uart.write: [0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 0xF0, 0x04, 0x01, 0xFF, 0x18]
+      - logger.log: "NMEA output trimmed: GLL/GSA/VTG off, GSV every 30th fix"
+
+ethernet:
+  id: eth_component
+  type: W5500
+  clk_pin: GPIO13
+  mosi_pin: GPIO11
+  miso_pin: GPIO12
+  cs_pin: GPIO14
+  interrupt_pin: GPIO10
+  reset_pin: GPIO09
+
+esp32:
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+logger:
+  baud_rate: 0
+  level: DEBUG
+  logs:
+    ethernet: INFO
+    gps_pps_time: INFO
+    ntp_server: INFO
+    sensor: INFO
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+one_wire:
+  - platform: gpio
+    id: temperature_bus
+    pin: GPIO3
+
+uart:
+  id: ${id_prefix}_uart
+  rx_pin: GPIO44
+  tx_pin: GPIO43
+  baud_rate: 115200
+
+gps:
+  id: ${id_prefix}_gps
+  uart_id: ${id_prefix}_uart
+
+time:
+  - platform: gps_pps_time
+    id: ${id_prefix}_pps
+    gps_id: ${id_prefix}_gps
+    pps_pin: GPIO1
+    update_interval: 60s
+    satellites:
+      id: ${id_prefix}_total_satellites
+      name: "Satellites"
+      icon: "mdi:satellite-variant"
+      accuracy_decimals: 0
+      state_class: measurement
+    clock_offset:
+      id: ${id_prefix}_clock_offset
+      name: "Clock Offset"
+      icon: "mdi:clock-check-outline"
+      unit_of_measurement: "µs"
+      accuracy_decimals: 0
+      state_class: measurement
+    pps_drift:
+      id: ${id_prefix}_pps_raw_drift
+      name: "PPS Drift"
+      icon: "mdi:clock-alert-outline"
+      unit_of_measurement: "µs"
+      accuracy_decimals: 0
+      state_class: measurement
+    # The server checked against GPS with no network and no second device: the previous
+    # PPS anchor's prediction evaluated at the next edge. Diagnostic only -- never fed
+    # back into the correction loop.
+    anchor_pred_error:
+      id: ${id_prefix}_anchor_pred_error
+      name: "NTP Anchor Prediction Error"
+      icon: "mdi:target-variant"
+      unit_of_measurement: "µs"
+      accuracy_decimals: 1
+      state_class: measurement
+      entity_category: "diagnostic"
+    gps_satellites:
+      id: ${id_prefix}_gps_sat_count
+      name: "GPS Satellites"
+      icon: "mdi:satellite-variant"
+      accuracy_decimals: 0
+      state_class: measurement
+    glonass_satellites:
+      id: ${id_prefix}_glonass_sat_count
+      name: "GLONASS Satellites"
+      icon: "mdi:satellite-variant"
+      accuracy_decimals: 0
+      state_class: measurement
+    galileo_satellites:
+      id: ${id_prefix}_galileo_sat_count
+      name: "Galileo Satellites"
+      icon: "mdi:satellite-variant"
+      accuracy_decimals: 0
+      state_class: measurement
+    beidou_satellites:
+      id: ${id_prefix}_beidou_sat_count
+      name: "Beidou Satellites"
+      icon: "mdi:satellite-variant"
+      accuracy_decimals: 0
+      state_class: measurement
+    crash_info:
+      id: last_crash_info
+      name: "Last Crash Info"
+      icon: "mdi:alert-circle-outline"
+      entity_category: "diagnostic"
+
+# No sensors declared: every diagnostic the ntp_server component can publish is
+# instrumentation for the serving path, and none of it is needed to run the server.
+ntp_server:
+  id: ${id_prefix}_ntp
+  time_id: ${id_prefix}_pps
+
+external_components:
+  - source:
+      type: local
+      path: ./ntp
+    components: [ ntp_server, gps_pps_time, ethernet ]
+
+light:
+  - platform: esp32_rmt_led_strip
+    channel_colors: GRB
+    pin: GPIO21
+    num_leds: 4
+    chipset: ws2812
+    name: "${name} RGB LED"
+    id: ${id_prefix}_rgb
+
+switch:
+  - platform: template
+    name: "${name} RGB LED"
+    id: ${id_prefix}_rgb_led_switch
+    turn_on_action:
+      - light.turn_on: ${id_prefix}_rgb
+    turn_off_action:
+      - light.turn_off: ${id_prefix}_rgb
+
+sensor:
+  - platform: uptime
+    id: ${id_prefix}_uptime
+    name: "Uptime"
+    update_interval: 60s
+    icon: mdi:clock-outline
+    entity_category: "diagnostic"
+  - platform: internal_temperature
+    id: ${id_prefix}_internal_temperature
+    name: "Internal Temperature"
+    entity_category: "diagnostic"
+  - platform: dallas_temp
+    address: 0xab0000007d86de28
+    id: temperature_ntp
+    name: NTP Server
+    update_interval: 600s
+  - platform: debug
+    free:
+      name: "Heap Free"
+      icon: "mdi:memory"
+      entity_category: "diagnostic"
+    psram:
+      name: "Free PSRAM"
+      icon: "mdi:memory"
+      entity_category: "diagnostic"
+    loop_time:
+      name: "Loop Time"
+      icon: "mdi:timer-outline"
+      entity_category: "diagnostic"
+
+text_sensor:
+  - platform: version
+    id: ${id_prefix}_version
+    name: "Version"
+    icon: mdi:cube-outline
+    entity_category: "diagnostic"
+  - platform: debug
+    reset_reason:
+      name: "Reset Reason"
+      icon: "mdi:restart-alert"
+      entity_category: "diagnostic"
+    device:
+      name: "Device Info"
+      entity_category: "diagnostic"
+
+button:
+  - platform: restart
+    id: ${id_prefix}_restart
+    name: Restart
+    icon: mdi:restart
+    entity_category: "diagnostic"

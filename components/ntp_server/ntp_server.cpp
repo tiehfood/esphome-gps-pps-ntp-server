@@ -203,6 +203,13 @@ void NTPServer::setup() {
     ESP_LOGE(TAG, "Ethernet netif unavailable; NTP receive-timestamp hook not installed");
   }
 
+  // Post-write T3 is a shipped default, like strict RX admission and the T2 corrections,
+  // so it is registered here rather than only when a YAML switch turns it on. Without
+  // this a config that omits the switch would serve a T3 ~21 us early at per-sample
+  // sigma 7.14 us instead of 2.83 us, silently and with nothing in the logs to say so.
+  // The switch, where present, still turns it off for A/Bs.
+  this->set_post_write_t3(true);
+
   // RFC 5905 11.1: precision is max(resolution, read cost). Smallest non-zero
   // delta over repeated reads, as chrony does.
   uint32_t best_us = UINT32_MAX;
