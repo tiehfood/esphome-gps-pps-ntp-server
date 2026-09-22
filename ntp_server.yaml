@@ -85,6 +85,12 @@ time:
       icon: "mdi:satellite-variant"
       accuracy_decimals: 0
       state_class: measurement
+    beidou_satellites:
+      id: beidou_sat_count
+      name: "Beidou Satellites"
+      icon: "mdi:satellite-variant"
+      accuracy_decimals: 0
+      state_class: measurement
     nmea_clock_delta:
       id: nmea_clock_delta
       name: "NMEA Clock Delta"

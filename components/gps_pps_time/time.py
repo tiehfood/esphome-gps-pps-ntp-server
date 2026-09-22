@@ -17,6 +17,7 @@ CONF_GPS_TIME = "gps_time"
 CONF_GPS_SATELLITES = "gps_satellites"
 CONF_GLONASS_SATELLITES = "glonass_satellites"
 CONF_GALILEO_SATELLITES = "galileo_satellites"
+CONF_BEIDOU_SATELLITES = "beidou_satellites"
 CONF_CRASH_INFO = "crash_info"
 CONF_NMEA_CLOCK_DELTA = "nmea_clock_delta"
 CONF_ANCHOR_PRED_ERROR = "anchor_pred_error"
@@ -77,6 +78,11 @@ CONFIG_SCHEMA = time_.TIME_SCHEMA.extend(
             state_class=STATE_CLASS_MEASUREMENT,
         ),
         cv.Optional(CONF_GALILEO_SATELLITES): sensor.sensor_schema(
+            icon="mdi:satellite-variant",
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+        cv.Optional(CONF_BEIDOU_SATELLITES): sensor.sensor_schema(
             icon="mdi:satellite-variant",
             accuracy_decimals=0,
             state_class=STATE_CLASS_MEASUREMENT,
@@ -152,3 +158,7 @@ async def to_code(config):
     if anchor_pred_error_config := config.get(CONF_ANCHOR_PRED_ERROR):
         sens = await sensor.new_sensor(anchor_pred_error_config)
         cg.add(var.set_anchor_pred_error_sensor(sens))
+
+    if beidou_sat_config := config.get(CONF_BEIDOU_SATELLITES):
+        sens = await sensor.new_sensor(beidou_sat_config)
+        cg.add(var.set_beidou_satellites_sensor(sens))
