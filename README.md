@@ -16,9 +16,6 @@ actually receives — measures **+5…+7 µs from GPS** against a hardware-times
 on the same network segment. Part of that figure is the reference itself; see Measuring
 against an independent reference.
 
-Earlier versions of this file quoted 60–100 µs and said the limit was the lack of a good
-enough client. That was true until one was built.
-
 ## The gap between clock accuracy and served accuracy
 
 These are not the same number, and the difference was originally 3.3 ms.
@@ -93,18 +90,16 @@ Three checks, none of which depend on the network behaving:
 
 - **Hardware reference.** The W5500 asserts an interrupt when a frame lands, and MCPWM
   capture timestamps that edge in hardware — on the same pin the Ethernet driver already
-  uses, since the pin matrix allows both. The gap to our own stamp is 13–21 µs. Using the
-  hardware edge as T2 first measured +1.4 ± 14 µs — a confidence interval 27 µs wide around
-  a 10 µs effect, so it was left off. Re-measured against a proper reference it is
-  **−5.60 µs**, and it now ships. The instrument was the problem, not the idea.
+  uses, since the pin matrix allows both. The gap to our own stamp is 13–21 µs, and using the
+  hardware edge as T2 is worth **−5.60 µs** against GPS. Measuring it from a routed client
+  gave +1.4 ± 14 µs — an interval 27 µs wide around a 10 µs effect, which resolves nothing.
 - **Packet-size sweep.** From 48 to 1400 byte requests, offset grows 90 ns/byte. Two
   store-and-forward hops of wire time predict 80 ns/byte; SPI payload time leaking into T2
   would give 240 or more.
 - **T3 prediction error** sits on zero.
 
-What remains is unattributed, and honestly so. Moving the server onto the client's own
-network segment cut round-trip delay from 674 µs to 129 µs and left the measured offset
-unchanged — so the residual is not mainly path asymmetry, as this section previously claimed.
+Network path asymmetry is not the main term: moving the server onto the client's own segment
+cut round-trip delay from 674 µs to 129 µs and left the measured offset unchanged.
 
 ## Measuring against an independent reference
 
@@ -130,12 +125,12 @@ What it found, in order:
   drift. What is left is asymmetry between the two boards' physical layers, which no
   firmware change can remove.
 
-**One measurement error is worth recording**, because every absolute figure above was wrong
-by ~20 µs until it was found. The reference reports its clock error once per second while
-drifting 34 µs/s, so each sample was up to a second stale; the analysis used it as if it were
-current. It surfaced because the answer changed by +4.6 µs when only the sampling interval
-changed — a measurement that depends on how you sample it is measuring the instrument. The
-same bug had been masquerading as an unexplained 2–3 µs wander for four days.
+**A stale-value trap, if you reproduce this.** The reference reports its own clock error once
+per second while drifting 34 µs/s, so any sample of it is up to a second old. Treating that
+value as current biases every absolute figure by ~20 µs, and shows up as an unexplained 2–3 µs
+run-to-run wander. The tell is that the answer moves when only the sampling interval changes:
+a measurement that depends on how you sample it is measuring the instrument. Correct each
+sample by the drift accumulated since the edge it came from.
 
 ## Accuracy budget
 
