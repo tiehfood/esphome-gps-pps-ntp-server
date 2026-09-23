@@ -117,6 +117,42 @@ uart:
   rx_pin: GPIO44
   tx_pin: GPIO43
   baud_rate: 115200
+  # TEMPORARY (2026-09-23 incident): dump UBX replies so the module can be interrogated
+  # without new firmware. dummy_receiver stays false so the gps component still gets every
+  # byte. Remove this block once the timepulse question is settled -- it logs on every
+  # UBX frame.
+  debug:
+    direction: RX
+    dummy_receiver: false
+    after:
+      timeout: 40ms
+    sequence:
+      - lambda: |-
+          const size_t n = bytes.size();
+          // UBX reply anywhere in the chunk: B5 62 <class> <id> ...
+          for (size_t i = 0; i + 4 < n; i++) {
+            if (bytes[i] == 0xB5 && bytes[i + 1] == 0x62) {
+              std::string hex;
+              for (size_t j = i; j < n && j < i + 44; j++) {
+                char b[4];
+                sprintf(b, "%02X ", bytes[j]);
+                hex += b;
+              }
+              ESP_LOGW("ubx", "cls=%02X id=%02X %s", bytes[i + 2], bytes[i + 3], hex.c_str());
+              break;
+            }
+          }
+          // RMC carries the module's own time and, in field 2, its fix status: A = valid,
+          // V = void. A module coasting without a fix still emits RMC, with V.
+          for (size_t i = 0; i + 5 < n; i++) {
+            if (bytes[i] == '$' && bytes[i + 3] == 'R' && bytes[i + 4] == 'M' && bytes[i + 5] == 'C') {
+              std::string line;
+              for (size_t j = i; j < n && bytes[j] != '\r' && bytes[j] != '\n'; j++)
+                line += (char) bytes[j];
+              ESP_LOGW("nmea", "%s", line.c_str());
+              break;
+            }
+          }
 
 gps:
   id: ${id_prefix}_gps
@@ -148,6 +184,21 @@ time:
       unit_of_measurement: "µs"
       accuracy_decimals: 0
       state_class: measurement
+    # NOT optional, despite being a diagnostic. This is the only sensor that measures the
+    # GPS pulse itself rather than the clock disciplined from it, so it is the only one
+    # that can distinguish "our clock is wrong" from "the reference is wrong". It was
+    # dropped from this config on 2026-09-22 as a solved-problem diagnostic; the next day a
+    # module emitted a 1.054 s pulse and the fault took an investigation to find instead of
+    # being visible at a glance. Healthy is a few thousand ppb (the crystal); the fault read
+    # ~54,000,000.
+    pps_interval_ppb:
+      id: ${id_prefix}_pps_interval_ppb
+      name: "PPS Interval Error"
+      icon: "mdi:sine-wave"
+      unit_of_measurement: "ppb"
+      accuracy_decimals: 0
+      state_class: measurement
+      entity_category: "diagnostic"
     # The server checked against GPS with no network and no second device: the previous
     # PPS anchor's prediction evaluated at the next edge. Diagnostic only -- never fed
     # back into the correction loop.
@@ -270,3 +321,21 @@ button:
     name: Restart
     icon: mdi:restart
     entity_category: "diagnostic"
+
+  # TEMPORARY (2026-09-23 incident): UBX polls. Frame = B5 62 <class> <id> 00 00 <ck_a> <ck_b>,
+  # Fletcher-8 over class..end-of-payload. A wrong checksum is silently ignored by the module
+  # and looks exactly like "the poll had no effect", so these were verified by hand.
+  - platform: template
+    name: "GPS Poll NAV-PVT"
+    icon: "mdi:satellite-uplink"
+    entity_category: "diagnostic"
+    on_press:
+      # fixType / gnssFixOK: is the module actually locked, or coasting?
+      - uart.write: [0xB5, 0x62, 0x01, 0x07, 0x00, 0x00, 0x08, 0x19]
+  - platform: template
+    name: "GPS Poll CFG-TP5"
+    icon: "mdi:pulse"
+    entity_category: "diagnostic"
+    on_press:
+      # timepulse period/frequency: is the 1 Hz configuration still intact?
+      - uart.write: [0xB5, 0x62, 0x06, 0x31, 0x00, 0x00, 0x37, 0xAB]

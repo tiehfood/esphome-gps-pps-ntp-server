@@ -286,6 +286,40 @@ void GPSPPSTime::apply_pps_correction_() {
   }
   this->prev_pps_micros_ = pps_micros;
 
+  // Pulse-period sanity. The epoch advances exactly one second per accepted edge, so a
+  // pulse that is not a whole number of seconds long makes the served clock wrong at
+  // precisely the rate of its period error -- and NOTHING else here catches it. The
+  // missed-pulse detector rounds to the nearest second and so reads a 5 % error as a
+  // normal second; the NMEA cross-check compares the clock against the same module that
+  // produced the bad pulse, so it agrees; the epoch-diverged reset needs 2 s of drift.
+  //
+  // Measured 2026-09-23: a module coasting without lock emitted a ~1.054 s pulse. The
+  // server lost 5 % of real time, drifted 8 minutes out over three hours, and served it
+  // the whole way as stratum 1 with 92 us root dispersion. Refusing is the only correct
+  // answer: a client with no other source is better served by no reply than by a lie.
+  const int32_t period_residual_us =
+      static_cast<int32_t>(pps_interval_us) - (extra_epochs + 1) * 1000000;
+  const bool period_in_spec = extra_epochs >= 0 && period_residual_us <= PPS_PERIOD_TOLERANCE_US &&
+                              period_residual_us >= -PPS_PERIOD_TOLERANCE_US;
+  if (!period_in_spec) {
+    this->pps_period_good_streak_ = 0;
+    if (this->pps_period_bad_streak_ < PPS_PERIOD_BAD_STREAK)
+      this->pps_period_bad_streak_++;
+    if (this->pps_period_bad_streak_ >= PPS_PERIOD_BAD_STREAK && this->pps_period_healthy_) {
+      this->pps_period_healthy_ = false;
+      ESP_LOGE(TAG, "PPS period out of spec (%u us, %+d us from a whole second): refusing to serve",
+               pps_interval_us, period_residual_us);
+    }
+  } else {
+    this->pps_period_bad_streak_ = 0;
+    if (this->pps_period_good_streak_ < PPS_PERIOD_GOOD_STREAK)
+      this->pps_period_good_streak_++;
+    if (this->pps_period_good_streak_ >= PPS_PERIOD_GOOD_STREAK && !this->pps_period_healthy_) {
+      this->pps_period_healthy_ = true;
+      ESP_LOGW(TAG, "PPS period back in spec (%u us): serving again", pps_interval_us);
+    }
+  }
+
   // PPS marks the start of the next second after the last GPS epoch.
   // extra_epochs compensates for any missed intermediate pulses.
   time_t corrected_epoch = this->last_gps_epoch_ + 1 + extra_epochs;
@@ -695,6 +729,11 @@ void GPSPPSTime::update() {
 
 bool GPSPPSTime::is_synchronized() const {
   if (!this->pps_synced_)
+    return false;
+  // A pulse that is not 1 Hz disciplines the clock to the wrong rate. Serving from it is
+  // worse than not serving: the error is invisible to clients, which see a healthy
+  // stratum-1 header. See the period check in apply_pps_correction_().
+  if (!this->pps_period_healthy_)
     return false;
   return (millis() - this->last_pps_millis_) < PPS_TIMEOUT_MS;
 }

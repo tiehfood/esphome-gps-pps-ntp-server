@@ -238,6 +238,29 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   /// PPS timeout threshold in milliseconds
   static const uint32_t PPS_TIMEOUT_MS = 10000;
 
+  /// How far an accepted pulse period may sit from a whole second before the pulse is
+  /// treated as unusable. Legitimate causes top out around 10 ms (the documented PPS
+  /// interrupt latency, which the ISR-latency branch above already handles up to 10 ms),
+  /// so 20 ms admits every healthy pulse while catching a mis-rated one long before it
+  /// matters: at this threshold the served clock can never be wrong by more than 2 %.
+  static const int32_t PPS_PERIOD_TOLERANCE_US = 20000;
+  /// Consecutive out-of-spec periods before refusing to serve. More than one, so a single
+  /// delayed interrupt cannot take the server off the air.
+  static const uint8_t PPS_PERIOD_BAD_STREAK = 3;
+  /// Consecutive in-spec periods before serving again. Deliberately longer than the bad
+  /// streak: coming back is the dangerous direction, and an intermittently bad pulse
+  /// should not flap the server in and out of service.
+  static const uint8_t PPS_PERIOD_GOOD_STREAK = 10;
+
+  /// False while the pulse period is out of spec; gates is_synchronized(), which is what
+  /// the NTP server consults before answering at all.
+  /// volatile for the same reason as pps_synced_: written by loop() on core 0, read by
+  /// NTPServer::recv_task_() on core 1. A single bool is atomic on Xtensa, so this only
+  /// stops the compiler caching it across the serving loop.
+  volatile bool pps_period_healthy_{true};
+  uint8_t pps_period_bad_streak_{0};
+  uint8_t pps_period_good_streak_{0};
+
   static void IRAM_ATTR pps_isr(GPSPPSTime *self);
 };
 
