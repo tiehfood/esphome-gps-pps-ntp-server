@@ -163,6 +163,19 @@ time:
       accuracy_decimals: 0
       state_class: measurement
       entity_category: "diagnostic"
+    # How late the PPS interrupt ran, above the fastest edge seen. The discipline loop
+    # measures drift from the interrupt's micros() stamp, so a shift here lands 1:1 in
+    # Clock Offset; the hardware capture of the same edge is the reference, so this is
+    # another measurement of an INPUT rather than of the clock. Added 2026-09-26 to test
+    # whether the multi-hour steps in Clock Offset are interrupt latency.
+    pps_isr_latency:
+      id: ${id_prefix}_pps_isr_latency
+      name: "PPS ISR Latency"
+      icon: "mdi:timer-alert-outline"
+      unit_of_measurement: "µs"
+      accuracy_decimals: 2
+      state_class: measurement
+      entity_category: "diagnostic"
     # The server checked against GPS with no network and no second device: the previous
     # PPS anchor's prediction evaluated at the next edge. Diagnostic only -- never fed
     # back into the correction loop.

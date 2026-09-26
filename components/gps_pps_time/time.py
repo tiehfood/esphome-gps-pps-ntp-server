@@ -11,6 +11,7 @@ from esphome.const import (
 CONF_GPS_ID = "gps_id"
 CONF_PPS_PIN = "pps_pin"
 CONF_PPS_INTERVAL_PPB = "pps_interval_ppb"
+CONF_PPS_ISR_LATENCY = "pps_isr_latency"
 CONF_CLOCK_OFFSET = "clock_offset"
 CONF_PPS_DRIFT = "pps_drift"
 CONF_GPS_TIME = "gps_time"
@@ -56,6 +57,15 @@ CONFIG_SCHEMA = time_.TIME_SCHEMA.extend(
             unit_of_measurement="ppb",
             icon="mdi:sine-wave",
             accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+        # PPS interrupt latency above the fastest edge seen, from pairing the GPIO ISR's
+        # micros() stamp with the MCPWM hardware capture of the same edge. Changes are exact;
+        # the absolute level is not (the two counters have unrelated zero points).
+        cv.Optional(CONF_PPS_ISR_LATENCY): sensor.sensor_schema(
+            unit_of_measurement="µs",
+            icon="mdi:timer-alert-outline",
+            accuracy_decimals=2,
             state_class=STATE_CLASS_MEASUREMENT,
         ),
         cv.Optional(CONF_GPS_TIME): text_sensor.text_sensor_schema(
@@ -126,6 +136,10 @@ async def to_code(config):
     if ppb_config := config.get(CONF_PPS_INTERVAL_PPB):
         sens = await sensor.new_sensor(ppb_config)
         cg.add(var.set_pps_interval_sensor(sens))
+
+    if isr_latency_config := config.get(CONF_PPS_ISR_LATENCY):
+        sens = await sensor.new_sensor(isr_latency_config)
+        cg.add(var.set_pps_isr_latency_sensor(sens))
 
     if drift_config := config.get(CONF_PPS_DRIFT):
         sens = await sensor.new_sensor(drift_config)

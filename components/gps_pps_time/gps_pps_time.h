@@ -168,8 +168,22 @@ class GPSPPSTime : public time::RealTimeClock, public gps::GPSListener {
   bool pps_cap_started_{false};
   bool pps_interval_pending_{false};
 
+  // PPS interrupt-latency diagnostic; see track_isr_latency_(). All in 12.5 ns capture ticks.
+  static constexpr int64_t LAT_PAIR_LIMIT_TICKS = 400000;  ///< 5 ms: beyond any real latency
+  bool lat_paired_{false};
+  uint32_t lat_prev_isr_us_{0};
+  uint32_t lat_prev_cap_{0};
+  uint32_t lat_prev_cap_count_{0};
+  int64_t lat_level_ticks_{0};  ///< latency relative to where pairing (re)started
+  int64_t lat_min_ticks_{0};    ///< fastest edge since then
+  int64_t lat_sum_ticks_{0};    ///< for the per-update mean
+  uint32_t lat_n_{0};
+  sensor::Sensor *pps_isr_latency_sensor_{nullptr};
+  void track_isr_latency_(uint32_t isr_us, bool clean);
+
  public:
   void set_pps_interval_sensor(sensor::Sensor *s) { this->pps_interval_sensor_ = s; }
+  void set_pps_isr_latency_sensor(sensor::Sensor *s) { this->pps_isr_latency_sensor_ = s; }
   /// Crystal error in ppb, from the hardware-captured PPS interval. The GPS second is the
   /// reference, so any deviation from PPS_CAPTURE_HZ ticks is our oscillator, measured to
   /// ~12.5 ns in 1 s = 0.0125 ppm resolution -- about 80x finer than the ISR can manage.
