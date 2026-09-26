@@ -173,4 +173,4 @@ esphome compile ntp_server.yaml
 |---|---|
 | `gps_pps_time` | PPS-disciplined time source. The ISR only reads `micros()`; wall-clock time is reconstructed in the main loop and corrected with `adjtime()` each second. Detects and corrects whole-second errors against NMEA. |
 | `ntp_server` | RFC 5905 server on a dedicated core-1 task. Stamps T2 in the Ethernet driver's receive path, pre-corrects T3 from the measured transmit trigger, keeps client ARP entries warm, and drops requests while unsynchronised rather than serve a wrong time. |
-| `ethernet` | Fork of ESPHome's Ethernet component. Supplies the custom W5500 SPI driver that the T2/T3 timestamping depends on, and captures the W5500 interrupt edge in hardware via MCPWM. |
+| `ethernet` | Fork of ESPHome's Ethernet component. Supplies the custom W5500 SPI driver that the T2/T3 timestamping depends on, and captures the W5500 interrupt edge in hardware via MCPWM. **W5500 only:** the hooks assume the W5500's registers and interrupt behaviour, and `ntp_server` calls into them directly, so other Ethernet chips — or ESPHome's stock `ethernet:` component — will not work without changes. |

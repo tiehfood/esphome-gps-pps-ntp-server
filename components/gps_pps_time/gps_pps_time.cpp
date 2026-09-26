@@ -159,6 +159,54 @@ void GPSPPSTime::loop() {
 #endif
 }
 
+/// PPS interrupt-latency diagnostic. The GPIO ISR stamps each edge with micros(); MCPWM
+/// latches the same edge in hardware to one 12.5 ns tick. Both counters are derived from
+/// the one 40 MHz crystal, so between two edges their spans agree to the tick unless the
+/// ISR ran late -- and the running sum of (ISR span - capture span) is therefore the ISR's
+/// latency relative to where the pairing started. The counters have unrelated zero points,
+/// so the absolute latency is not recoverable this way; its CHANGES are exact, which is
+/// what matters, because the discipline loop measures drift from the ISR stamp and any
+/// shift in latency lands 1:1 in clock_offset.
+///
+/// Diagnostic only: nothing reads it back. Pairing is strict -- exactly one new capture per
+/// accepted ISR edge -- because the capture sees every edge and the ISR's 900 ms guard does
+/// not, so a noise edge would otherwise pair an ISR stamp with the wrong capture.
+void GPSPPSTime::track_isr_latency_(uint32_t isr_us, bool clean) {
+  const uint32_t cap = this->pps_cap_prev_;
+  const uint32_t cap_count = this->pps_cap_count_;
+  if (!clean || cap_count == 0) {
+    this->lat_paired_ = false;
+    return;
+  }
+  if (this->lat_paired_ && cap_count == this->lat_prev_cap_count_ + 1) {
+    const int64_t isr_ticks =
+        static_cast<int64_t>(isr_us - this->lat_prev_isr_us_) * (PPS_CAPTURE_HZ / 1000000);
+    const int64_t cap_ticks = static_cast<uint32_t>(cap - this->lat_prev_cap_);  // wrap-safe < 53 s
+    const int64_t diff = isr_ticks - cap_ticks;
+    if (diff > LAT_PAIR_LIMIT_TICKS || diff < -LAT_PAIR_LIMIT_TICKS) {
+      // Spans disagree by more than any real latency: the two stamps are different edges.
+      ESP_LOGD(TAG, "ISR/capture spans disagree by %lld ticks; restarting latency pairing",
+               (long long) diff);
+      this->lat_level_ticks_ = 0;
+      this->lat_min_ticks_ = 0;
+    } else {
+      this->lat_level_ticks_ += diff;
+      if (this->lat_level_ticks_ < this->lat_min_ticks_)
+        this->lat_min_ticks_ = this->lat_level_ticks_;
+      this->lat_sum_ticks_ += this->lat_level_ticks_;
+      this->lat_n_++;
+    }
+  } else {
+    // (Re)start: this edge becomes the reference. Level and floor are both zero here.
+    this->lat_level_ticks_ = 0;
+    this->lat_min_ticks_ = 0;
+  }
+  this->lat_prev_isr_us_ = isr_us;
+  this->lat_prev_cap_ = cap;
+  this->lat_prev_cap_count_ = cap_count;
+  this->lat_paired_ = true;
+}
+
 void GPSPPSTime::set_pps_time_(time_t epoch, uint32_t pps_micros, int32_t compensation_us) {
   // Account for time elapsed since PPS edge using the snapshot captured before loop()
   // delay, minus drift pre-compensation. Using the passed pps_micros (not the volatile
@@ -319,6 +367,10 @@ void GPSPPSTime::apply_pps_correction_() {
       ESP_LOGW(TAG, "PPS period back in spec (%u us): serving again", pps_interval_us);
     }
   }
+
+  // Only a clean single-second interval can be paired edge-for-edge with the hardware
+  // capture; anything else restarts the pairing.
+  this->track_isr_latency_(pps_micros, period_in_spec && extra_epochs == 0);
 
   // PPS marks the start of the next second after the last GPS epoch.
   // extra_epochs compensates for any missed intermediate pulses.
@@ -657,6 +709,17 @@ void GPSPPSTime::update() {
   // over 1 s = 0.0125 ppm, versus ~1 ppm for the micros() read in the GPIO ISR.
   if (this->pps_interval_sensor_ != nullptr && this->pps_cap_interval_ != 0)
     this->pps_interval_sensor_->publish_state(this->pps_capture_ppb());
+
+  // Mean PPS interrupt latency over this update period, above the fastest edge seen since
+  // the pairing started. Averaging ~60 edges resolves well below the 1 us micros() step.
+  if (this->pps_isr_latency_sensor_ != nullptr && this->lat_n_ > 0) {
+    const double mean_ticks = static_cast<double>(this->lat_sum_ticks_) / this->lat_n_;
+    const double above_floor_us =
+        (mean_ticks - static_cast<double>(this->lat_min_ticks_)) / (PPS_CAPTURE_HZ / 1000000.0);
+    this->pps_isr_latency_sensor_->publish_state(static_cast<float>(above_floor_us));
+    this->lat_sum_ticks_ = 0;
+    this->lat_n_ = 0;
+  }
 
   // Publish crash report from previous boot (once, after HA connection is ready)
   if (this->crash_report_pending_ && this->crash_info_sensor_ != nullptr) {
