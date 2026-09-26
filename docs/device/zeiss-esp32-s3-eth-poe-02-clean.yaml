@@ -117,42 +117,6 @@ uart:
   rx_pin: GPIO44
   tx_pin: GPIO43
   baud_rate: 115200
-  # TEMPORARY (2026-09-23 incident): dump UBX replies so the module can be interrogated
-  # without new firmware. dummy_receiver stays false so the gps component still gets every
-  # byte. Remove this block once the timepulse question is settled -- it logs on every
-  # UBX frame.
-  debug:
-    direction: RX
-    dummy_receiver: false
-    after:
-      timeout: 40ms
-    sequence:
-      - lambda: |-
-          const size_t n = bytes.size();
-          // UBX reply anywhere in the chunk: B5 62 <class> <id> ...
-          for (size_t i = 0; i + 4 < n; i++) {
-            if (bytes[i] == 0xB5 && bytes[i + 1] == 0x62) {
-              std::string hex;
-              for (size_t j = i; j < n && j < i + 44; j++) {
-                char b[4];
-                sprintf(b, "%02X ", bytes[j]);
-                hex += b;
-              }
-              ESP_LOGW("ubx", "cls=%02X id=%02X %s", bytes[i + 2], bytes[i + 3], hex.c_str());
-              break;
-            }
-          }
-          // RMC carries the module's own time and, in field 2, its fix status: A = valid,
-          // V = void. A module coasting without a fix still emits RMC, with V.
-          for (size_t i = 0; i + 5 < n; i++) {
-            if (bytes[i] == '$' && bytes[i + 3] == 'R' && bytes[i + 4] == 'M' && bytes[i + 5] == 'C') {
-              std::string line;
-              for (size_t j = i; j < n && bytes[j] != '\r' && bytes[j] != '\n'; j++)
-                line += (char) bytes[j];
-              ESP_LOGW("nmea", "%s", line.c_str());
-              break;
-            }
-          }
 
 gps:
   id: ${id_prefix}_gps
@@ -321,21 +285,3 @@ button:
     name: Restart
     icon: mdi:restart
     entity_category: "diagnostic"
-
-  # TEMPORARY (2026-09-23 incident): UBX polls. Frame = B5 62 <class> <id> 00 00 <ck_a> <ck_b>,
-  # Fletcher-8 over class..end-of-payload. A wrong checksum is silently ignored by the module
-  # and looks exactly like "the poll had no effect", so these were verified by hand.
-  - platform: template
-    name: "GPS Poll NAV-PVT"
-    icon: "mdi:satellite-uplink"
-    entity_category: "diagnostic"
-    on_press:
-      # fixType / gnssFixOK: is the module actually locked, or coasting?
-      - uart.write: [0xB5, 0x62, 0x01, 0x07, 0x00, 0x00, 0x08, 0x19]
-  - platform: template
-    name: "GPS Poll CFG-TP5"
-    icon: "mdi:pulse"
-    entity_category: "diagnostic"
-    on_press:
-      # timepulse period/frequency: is the 1 Hz configuration still intact?
-      - uart.write: [0xB5, 0x62, 0x06, 0x31, 0x00, 0x00, 0x37, 0xAB]
